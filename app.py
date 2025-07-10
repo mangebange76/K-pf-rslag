@@ -1,18 +1,13 @@
 import streamlit as st
 import pandas as pd
 import gspread
-from google.oauth2 import service_account
+from google.oauth2.service_account import Credentials
 
-# === Autentisering ===
-import toml
+# === Autentisering via Streamlit Secrets (för Cloud) ===
+SHEET_URL = st.secrets["SHEET_URL"]
+credentials_dict = st.secrets["GOOGLE_CREDENTIALS"]
 
-with open("secrets.toml", "r") as f:
-    secrets = toml.load(f)
-
-SHEET_URL = secrets["SHEET_URL"]
-credentials_dict = secrets["GOOGLE_CREDENTIALS"]
-
-credentials = service_account.Credentials.from_service_account_info(
+credentials = Credentials.from_service_account_info(
     credentials_dict,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
@@ -130,7 +125,7 @@ def berakna_allt(df):
                 df.at[i, "Riktkurs idag"] = round((row["Omsättning Y1"] * ps_snitt) / row["Utestående aktier"], 2)
                 df.at[i, "Riktkurs Y1"] = round((row["Omsättning Y2"] * ps_snitt) / row["Utestående aktier"], 2)
                 df.at[i, "Riktkurs Y2"] = round((row["Omsättning Y3"] * ps_snitt) / row["Utestående aktier"], 2)
-                df.at[i, "Riktkurs Y3"] = df.at[i, "Riktkurs Y2"]  # Om inget längre fram anges
+                df.at[i, "Riktkurs Y3"] = df.at[i, "Riktkurs Y2"]
             else:
                 df.at[i, "Riktkurs idag"] = 0
                 df.at[i, "Riktkurs Y1"] = 0
@@ -177,7 +172,6 @@ def investeringsrad(df):
         st.info("Inga bolag att analysera.")
         return
 
-    # Sortera på högst undervärdering
     df = df.copy()
     df["Undervärdering (%)"] = ((df["Riktkurs idag"] - df["Aktuell kurs"]) / df["Aktuell kurs"]) * 100
     df = df[df["Aktuell kurs"] > 0].sort_values(by="Undervärdering (%)", ascending=False)
@@ -220,21 +214,22 @@ def investeringsrad(df):
 def main():
     st.title("📈 Aktieanalys & Investeringsråd")
 
+    # Läs in data från Google Sheets
     df = load_data()
 
-    # Visa formulär för att lägga till/redigera bolag
+    # Formulär för att lägga till/redigera bolag
     df = lagg_till_bolag(df)
 
-    # Kör beräkningar
+    # Kör alla beräkningar
     df = berakna_allt(df)
 
     # Visa portföljen
     df = visa_portfolj(df)
 
-    # Investeringsråd
+    # Visa investeringsråd
     investeringsrad(df)
 
-    # Spara tillbaka till Google Sheet
+    # Spara uppdaterad data
     save_data(df)
 
 if __name__ == "__main__":

@@ -200,7 +200,8 @@ def lagg_till_bolag(df):
             "Omsättning Y2": oms_y2,
             "Omsättning Y3": oms_y3
         }
-        df = df.append(ny_rad, ignore_index=True)
+
+        df = pd.concat([df, pd.DataFrame([ny_rad])], ignore_index=True)
         df = berakna_allt(df)
         save_data(df)
         st.success(f"{ticker} tillagt!")

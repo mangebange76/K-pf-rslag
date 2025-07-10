@@ -21,33 +21,33 @@ ALL_COLUMNS = [
     "Kommentar", "Senast uppdaterad"
 ]
 
+import streamlit as st
+import gspread
+import pandas as pd
+from google.oauth2 import service_account
+
+# --- Skapa koppling till Google Sheets ---
 def skapa_koppling():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_service_account_info(
+    creds = service_account.Credentials.from_service_account_info(
         st.secrets["GOOGLE_CREDENTIALS"], scopes=scope
     )
     client = gspread.authorize(creds)
-    sheet = client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
+    sheet = client.open_by_url(st.secrets["SHEET_URL"]).worksheet("Blad1")
     return sheet
 
+# --- Hämta data från Google Sheet ---
 def hamta_data():
     sheet = skapa_koppling()
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
-    df = konvertera_till_ratt_typ(df)
     return df
 
-def konvertera_till_ratt_typ(df):
-    numeriska_kolumner = [
-        "Aktuell kurs", "Valutakurs", "Utestående aktier (miljoner)", "Omsättning idag (milj USD)",
-        "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning nästa år", "Omsättning om två år", "Omsättning om tre år",
-        "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027"
-    ]
-    for kolumn in numeriska_kolumner:
-        if kolumn in df.columns:
-            df[kolumn] = pd.to_numeric(df[kolumn], errors="coerce")
-    return df
+# --- Spara DataFrame till Google Sheet ---
+def spara_data(df):
+    sheet = skapa_koppling()
+    sheet.clear()
+    sheet.update([df.columns.values.tolist()] + df.values.tolist())
 
 def berakna_riktkurser(df):
     def snitt_ps(row):

@@ -1,6 +1,9 @@
 streamlit
-pandas
 gspread
 google-auth
-toml
+google-auth-oauthlib
+oauth2client
 yfinance
+pandas
+numpy
+requests

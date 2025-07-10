@@ -231,36 +231,40 @@ def visa_investeringsförslag(df):
     else:
         st.warning("Inget bolag kunde köpas för det tillgängliga kapitalet.")
 
-# ====== Huvudfunktion och meny ======
+def konvertera_till_ratt_typ(df):
+    kolumner_float = [
+        "Aktuell kurs", "Valutakurs", "Omsättning idag", "Omsättning nästa år",
+        "Omsättning om 2 år", "Omsättning om 3 år", "Utestående aktier",
+        "P/S", "PS Q1", "PS Q2", "PS Q3", "PS Q4", "P/S snitt",
+        "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Undervärdering (%)", "Innehav SEK"
+    ]
+    for kol in kolumner_float:
+        if kol in df.columns:
+            df[kol] = pd.to_numeric(df[kol], errors='coerce')
+    return df
+
 
 def main():
-    st.set_page_config(page_title="Aktieanalys", layout="wide")
-    st.title("📊 Aktieanalys & Investeringsförslag")
+    st.title("📊 Aktieanalys och köpförslag")
 
-    sheet = client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
-    data = sheet.get_all_records()
-    df = pd.DataFrame(data)
+    df = hamta_data()
+    df = konvertera_till_ratt_typ(df)
 
-    if not df.empty:
-        df = konvertera_till_ratt_typ(df)
-        df = uppdatera_beräkningar(df)
-        spara_dataframe(sheet, df)
+    visa_statistik(df)
+    visa_bolagsdata(df)
 
-    meny = st.sidebar.radio("Navigera", [
-        "📋 Översikt",
-        "➕ Lägg till bolag",
-        "📊 Investeringsförslag"
-    ])
-
-    if meny == "📋 Översikt":
-        visa_översikt(df)
-    elif meny == "➕ Lägg till bolag":
+    with st.expander("➕ Lägg till nytt bolag"):
         df = lagg_till_bolag(df)
-        spara_dataframe(sheet, df)
-        st.success("Bolag tillagt!")
-        st.rerun()
-    elif meny == "📊 Investeringsförslag":
-        visa_investeringsförslag(df)
+
+    st.markdown("---")
+    with st.expander("📌 Uppdatera kurser och nyckeltal"):
+        if st.button("🔁 Hämta aktuella kurser och räkna om allt"):
+            df = uppdatera_kurser_och_berakningar(df)
+            st.success("Kurser och beräkningar uppdaterade.")
+
+    st.markdown("---")
+    st.markdown("✅ **Data uppdaterad automatiskt i Google Sheets.**")
+
 
 if __name__ == "__main__":
     main()

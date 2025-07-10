@@ -231,40 +231,52 @@ def visa_investeringsförslag(df):
     else:
         st.warning("Inget bolag kunde köpas för det tillgängliga kapitalet.")
 
-def konvertera_till_ratt_typ(df):
-    kolumner_float = [
-        "Aktuell kurs", "Valutakurs", "Omsättning idag", "Omsättning nästa år",
-        "Omsättning om 2 år", "Omsättning om 3 år", "Utestående aktier",
-        "P/S", "PS Q1", "PS Q2", "PS Q3", "PS Q4", "P/S snitt",
-        "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Undervärdering (%)", "Innehav SEK"
-    ]
-    for kol in kolumner_float:
-        if kol in df.columns:
-            df[kol] = pd.to_numeric(df[kol], errors='coerce')
+# 🟩 DEL 7 – Fortsättning med hamta_data och main()
+
+def hamta_data():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_url(st.secrets["SHEET_URL"]).worksheet(st.secrets["SHEET_NAME"])
+    data = sheet.get_all_records()
+    df = pd.DataFrame(data)
     return df
 
+# ----------------------------------------------
+# 🔁 Main-funktion
+# ----------------------------------------------
 
 def main():
-    st.title("📊 Aktieanalys och köpförslag")
-
+    st.title("📊 Aktieanalys & Portföljförslag")
+    
+    # 🟡 Hämta data
     df = hamta_data()
+
+    # 🟡 Säkerställ kolumner och rätt format
+    df = ensure_all_columns_exist(df)
     df = konvertera_till_ratt_typ(df)
 
-    visa_statistik(df)
+    # 🟡 Uppdatera aktuell kurs
+    df, manuella_kurser = uppdatera_aktuell_kurs(df)
+
+    # 🟡 Spara tillbaka kurser som angavs manuellt
+    if manuella_kurser:
+        st.warning("Kurser kunde inte hämtas för följande bolag. Ange dem manuellt:")
+        for ticker, namn in manuella_kurser:
+            ny_kurs = st.number_input(f"{namn} ({ticker}) – Ange kurs manuellt", min_value=0.01, value=0.0, step=0.01)
+            df.loc[df["Ticker"] == ticker, "Aktuell kurs"] = ny_kurs
+
+    # 🟡 Gör beräkningar
+    df = berakna_varderingar(df)
+
+    # 🟡 Visa formulär
+    visa_lagg_till_bolag_form(df)
+
+    # 🟡 Visa datatabell
     visa_bolagsdata(df)
 
-    with st.expander("➕ Lägg till nytt bolag"):
-        df = lagg_till_bolag(df)
-
-    st.markdown("---")
-    with st.expander("📌 Uppdatera kurser och nyckeltal"):
-        if st.button("🔁 Hämta aktuella kurser och räkna om allt"):
-            df = uppdatera_kurser_och_berakningar(df)
-            st.success("Kurser och beräkningar uppdaterade.")
-
-    st.markdown("---")
-    st.markdown("✅ **Data uppdaterad automatiskt i Google Sheets.**")
-
+    # 🟡 Visa portföljförslag
+    visa_portfoljforslag(df)
 
 if __name__ == "__main__":
     main()

@@ -43,45 +43,50 @@ def saknade_kolumner(df):
             df[kolumn] = ""
     return df
 
-# Funktion: konvertera kolumner till rätt datatyper
-def konvertera_till_ratt_typ(df):
-    kolumner_float = [
-        "Aktuell kurs", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om två år", "Omsättning om tre år",
-        "Utestående aktier", "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027"
-    ]
-    for kolumn in kolumner_float:
-        df[kolumn] = pd.to_numeric(df[kolumn], errors="coerce")
+import streamlit as st
+import pandas as pd
+import gspread
+from google.oauth2 import service_account
+
+# Skapa koppling till Google Sheet
+def skapa_koppling():
+    scope = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["GOOGLE_CREDENTIALS"],
+        scopes=scope
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open_by_url(st.secrets["SHEET_URL"]).worksheet("Blad1")
+    return sheet
+
+# Läs in data från Google Sheet till DataFrame
+def hamta_data():
+    sheet = skapa_koppling()
+    data = sheet.get_all_records()
+    df = pd.DataFrame(data)
     return df
 
-# Funktion: hämta aktuell USD/SEK växelkurs
-@st.cache_data(ttl=3600)
-def hamta_valutakurs():
-    try:
-        response = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=SEK")
-        data = response.json()
-        return data["rates"]["SEK"]
-    except:
-        return None
+# Skriv DataFrame till Google Sheet
+def spara_data(df):
+    sheet = skapa_koppling()
+    sheet.clear()
+    sheet.update([df.columns.values.tolist()] + df.values.tolist())
 
-# Funktion: visa växelkurs i appen
-def visa_valutakurs():
-    kurs = hamta_valutakurs()
-    if kurs:
-        st.info(f"**USD/SEK växelkurs:** {kurs:.2f}")
-    else:
-        st.warning("Kunde inte hämta valutakurs.")
+# Kontrollera att alla nödvändiga kolumner finns
+def saknade_kolumner(df, obligatoriska):
+    return [col for col in obligatoriska if col not in df.columns]
 
-# Funktion: hämta aktuell aktiekurs från Yahoo Finance
-def hamta_aktiekurs(ticker):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        response = requests.get(url)
-        data = response.json()
-        kurs = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        return round(float(kurs), 2)
-    except:
-        return None
+def konvertera_till_ratt_typ(df):
+    numeriska_kolumner = [
+        "Aktuell kurs", "Valutakurs", "Utestående aktier", "Omsättning idag",
+        "Omsättning 2025", "Omsättning 2026", "Omsättning 2027",
+        "P/S nu", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
+        "Riktkurs nu", "Riktkurs 2026", "Riktkurs 2027"
+    ]
+    for kolumn in numeriska_kolumner:
+        if kolumn in df.columns:
+            df[kolumn] = pd.to_numeric(df[kolumn], errors="coerce")
+    return df
 
 # Funktion: räkna fram P/S-snitt (exkludera nollor)
 def berakna_ps_snitt(rad):

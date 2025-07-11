@@ -293,27 +293,7 @@ def main():
         st.success("✅ Alla kurser och värderingar har uppdaterats!")
 
     elif menyval == "💼 Investeringsråd":
-        visa_investeringsrad(df)
+        visa_investeringsrad(df, valutakurs)  # ✅ fixad här
 
     elif menyval == "📦 Portfölj":
         visa_portfolj(df, valutakurs)
-
-# ---------------------------------------
-# STARTA APPEN
-# ---------------------------------------
-
-if __name__ == "__main__":
-    main()
-
-# ---------------------------------------
-# SLUTKONTROLL – FÖR ATT UNDVIKA DUBLETTER
-# ---------------------------------------
-
-# Säkerställ att endast EN version av varje funktion finns
-# och att inga dubbletter av uppdatera_aktuell_kurs eller säkerställ_kolumner ligger kvar
-
-# Inga extrafunktioner som export, grafer eller gammal logik inkluderas
-# Alla funktioner som används är definierade och anropade i main()
-
-# Om ytterligare verktyg krävs i framtiden (t.ex. filtrering, sökning, sortering)
-# måste de först godkännas av användaren

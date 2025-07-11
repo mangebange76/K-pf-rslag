@@ -1,13 +1,13 @@
+# ---------------------------------------
+# DEL 1: IMPORTER OCH GOOGLE SHEETS-KOPPLING
+# ---------------------------------------
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
-
-# ---------------------------------------
-# KONFIGURATION OCH GOOGLE SHEETS-KOPPLING
-# ---------------------------------------
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
@@ -53,7 +53,7 @@ def hamta_valutakurs():
         return None
 
 # ---------------------------------------
-# BERÄKNINGAR
+# DEL 2: BERÄKNINGAR OCH KOLUMNHANTERING
 # ---------------------------------------
 
 def uppdatera_berakningar(df):
@@ -83,7 +83,7 @@ def säkerställ_kolumner(df):
         "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
         "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
         "P/S-snitt", "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028",
-        "Antal aktier", "Kommentar"
+        "Antal aktier"
     ]
     for kolumn in kolumner:
         if kolumn not in df.columns:
@@ -107,7 +107,7 @@ def uppdatera_aktuell_kurs(df):
     return df
 
 # ---------------------------------------
-# FORMULÄR: LÄGG TILL / UPPDATERA BOLAG
+# DEL 3: FORMULÄR – LÄGG TILL / UPPDATERA BOLAG
 # ---------------------------------------
 
 def lagg_till_eller_uppdatera(df):
@@ -115,7 +115,7 @@ def lagg_till_eller_uppdatera(df):
     with st.form("bolagsformulär"):
         ticker = st.text_input("Ticker").upper()
         namn = st.text_input("Bolagsnamn")
-        kurs = st.number_input("Aktuell kurs (USD)", value=0.0)
+        kurs = st.number_input("Aktuell kurs (om automatisk hämtning ej fungerar)", value=0.0)
         aktier = st.number_input("Utestående aktier (miljoner)", value=0.0)
         ps_idag = st.number_input("P/S idag", value=0.0)
         ps1 = st.number_input("P/S Q1", value=0.0)
@@ -129,7 +129,6 @@ def lagg_till_eller_uppdatera(df):
         oms_3 = st.number_input("Omsättning om 3 år", value=0.0)
 
         antal_aktier = st.number_input("Antal aktier du äger", value=0.0)
-        kommentar = st.text_input("Kommentar")
 
         sparaknapp = st.form_submit_button("💾 Spara bolag")
 
@@ -148,8 +147,7 @@ def lagg_till_eller_uppdatera(df):
             "Omsättning nästa år": oms_1,
             "Omsättning om 2 år": oms_2,
             "Omsättning om 3 år": oms_3,
-            "Antal aktier": antal_aktier,
-            "Kommentar": kommentar
+            "Antal aktier": antal_aktier
         }
 
         if ticker in df["Ticker"].values:
@@ -161,13 +159,13 @@ def lagg_till_eller_uppdatera(df):
     return df
 
 # ---------------------------------------
-# INVESTERINGSFÖRSLAG
+# DEL 4: INVESTERINGSFÖRSLAG
 # ---------------------------------------
 
 if "hoppade_over" not in st.session_state:
     st.session_state.hoppade_over = []
 
-def investeringsforslag(df, kapital):
+def investeringsforslag(df, kapital_sek, valutakurs):
     df = df.copy()
     df = df[df["Riktkurs 2026"] > df["Aktuell kurs"]]
     df = df[~df["Ticker"].isin(st.session_state.hoppade_over)]
@@ -175,7 +173,8 @@ def investeringsforslag(df, kapital):
     df = df.sort_values(by="Potential", ascending=False)
 
     forslag = []
-    kapital_kvar = kapital
+    kapital_usd = kapital_sek / valutakurs
+    kapital_kvar = kapital_usd
 
     for _, rad in df.iterrows():
         pris = rad["Aktuell kurs"]
@@ -184,27 +183,32 @@ def investeringsforslag(df, kapital):
 
         antal = int(kapital_kvar // pris)
         if antal > 0:
+            total_usd = antal * pris
+            total_sek = round(total_usd * valutakurs, 2)
             forslag.append({
                 "Ticker": rad["Ticker"],
                 "Köp antal": antal,
-                "Pris per aktie": pris,
-                "Totalt": round(antal * pris, 2)
+                "Pris per aktie (USD)": pris,
+                "Totalt (SEK)": total_sek
             })
-            break
+            kapital_kvar -= total_usd
+            break  # Visa bara ett förslag i taget
 
-    return forslag, kapital_kvar
+    return forslag, kapital_kvar * valutakurs
 
-def visa_investeringsrad(df):
+def visa_investeringsrad(df, valutakurs):
     st.subheader("💡 Investeringsförslag")
-    kapital = st.number_input("💰 Tillgängligt kapital (USD)", min_value=0.0, value=1000.0, step=100.0)
+    kapital_sek = st.number_input("💰 Tillgängligt kapital (SEK)", min_value=0.0, value=10000.0, step=500.0)
 
     df = uppdatera_berakningar(df)
-    forslag, rest = investeringsforslag(df, kapital)
+    forslag, rest_sek = investeringsforslag(df, kapital_sek, valutakurs)
 
     if forslag:
         f = forslag[0]
-        st.markdown(f"**Förslag:** Köp `{f['Köp antal']}` st `{f['Ticker']}` à `{f['Pris per aktie']}` USD – Totalt `{f['Totalt']} USD`")
-        st.markdown(f"💵 Kvarvarande kapital: `{round(rest, 2)} USD`")
+        st.markdown(
+            f"**Förslag:** Köp `{f['Köp antal']}` st `{f['Ticker']}` à `{f['Pris per aktie (USD)']}` USD – Totalt `{f['Totalt (SEK)']} SEK`"
+        )
+        st.markdown(f"💵 Kvarvarande kapital: `{round(rest_sek, 2)} SEK`")
 
         if st.button("⏭️ Nästa förslag"):
             st.session_state.hoppade_over.append(f["Ticker"])
@@ -213,7 +217,7 @@ def visa_investeringsrad(df):
         st.info("🚫 Inga fler bolag uppfyller kriterierna just nu.")
 
 # ---------------------------------------
-# PORTFÖLJVY
+# DEL 5: PORTFÖLJVY
 # ---------------------------------------
 
 def visa_portfolj(df, valutakurs):
@@ -234,16 +238,12 @@ def visa_portfolj(df, valutakurs):
     st.markdown(f"💼 **Totalt portföljvärde:** `{round(totalvärde, 2)} SEK`")
 
 # ---------------------------------------
-# ANALYS-TABELL
+# DEL 6: ANALYS-TABELL & VALUTAKURS
 # ---------------------------------------
 
 def visa_tabell(df):
     st.subheader("📈 Datatabell")
     st.dataframe(df, use_container_width=True)
-
-# ---------------------------------------
-# VISUALISERING AV VALUTAKURS
-# ---------------------------------------
 
 def visa_valutakurs():
     try:
@@ -257,14 +257,13 @@ def visa_valutakurs():
         return 0.0
 
 # ---------------------------------------
-# HUVUDFUNKTION – MAIN
+# DEL 7: HUVUDFUNKTION – MAIN
 # ---------------------------------------
 
 def main():
     st.set_page_config(page_title="📈 Aktieanalys", layout="wide")
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    sheet = skapa_koppling()
     df = hamta_data()
     df = säkerställ_kolumner(df)
     df = konvertera_till_ratt_typ(df)

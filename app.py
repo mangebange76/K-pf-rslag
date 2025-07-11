@@ -1,8 +1,3 @@
-
-# ---------------------------------------
-# DEL 1: IMPORTER OCH GOOGLE SHEETS-KOPPLING
-# ---------------------------------------
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -52,10 +47,6 @@ def hamta_valutakurs():
         return float(response["rates"]["SEK"])
     except:
         return None
-
-# ---------------------------------------
-# DEL 2: BERÄKNINGAR OCH KOLUMNHANTERING
-# ---------------------------------------
 
 def uppdatera_berakningar(df):
     ps_kvartal = ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]
@@ -107,11 +98,62 @@ def uppdatera_aktuell_kurs(df):
             st.warning(f"⚠️ Kursen kunde inte hämtas för {ticker}. Ange den manuellt om du vill uppdatera.")
     return df
 
-# ---------------------------------------
-# DEL 3: INVESTERINGSRAD
-# ---------------------------------------
+def lagg_till_eller_uppdatera(df):
+    st.subheader("➕ Lägg till / uppdatera bolag")
+    with st.form("bolagsformulär"):
+        ticker = st.text_input("Ticker").upper()
+        namn = st.text_input("Bolagsnamn")
+        kurs = st.number_input("Aktuell kurs (om automatisk hämtning ej fungerar)", value=0.0)
+        aktier = st.number_input("Utestående aktier (miljoner)", value=0.0)
+        ps_idag = st.number_input("P/S idag", value=0.0)
+        ps1 = st.number_input("P/S Q1", value=0.0)
+        ps2 = st.number_input("P/S Q2", value=0.0)
+        ps3 = st.number_input("P/S Q3", value=0.0)
+        ps4 = st.number_input("P/S Q4", value=0.0)
+
+        oms_idag = st.number_input("Omsättning idag (miljoner USD)", value=0.0)
+        oms_1 = st.number_input("Omsättning nästa år", value=0.0)
+        oms_2 = st.number_input("Omsättning om 2 år", value=0.0)
+        oms_3 = st.number_input("Omsättning om 3 år", value=0.0)
+
+        antal_aktier = st.number_input("Antal aktier du äger", value=0.0)
+
+        sparaknapp = st.form_submit_button("💾 Spara bolag")
+
+    if sparaknapp and ticker:
+        ny_rad = {
+            "Ticker": ticker,
+            "Bolagsnamn": namn,
+            "Aktuell kurs": kurs,
+            "Utestående aktier": aktier,
+            "P/S": ps_idag,
+            "P/S Q1": ps1,
+            "P/S Q2": ps2,
+            "P/S Q3": ps3,
+            "P/S Q4": ps4,
+            "Omsättning idag": oms_idag,
+            "Omsättning nästa år": oms_1,
+            "Omsättning om 2 år": oms_2,
+            "Omsättning om 3 år": oms_3,
+            "Antal aktier": antal_aktier
+        }
+
+        if ticker in df["Ticker"].values:
+            df.loc[df["Ticker"] == ticker, ny_rad.keys()] = ny_rad.values()
+            st.success(f"{ticker} har uppdaterats.")
+        else:
+            df = pd.concat([df, pd.DataFrame([ny_rad])], ignore_index=True)
+            st.success(f"{ticker} har lagts till.")
+    return df
+
+if "hoppade_over" not in st.session_state:
+    st.session_state.hoppade_over = []
 
 def investeringsforslag(df, kapital_sek, valutakurs):
+    if valutakurs == 0:
+        st.error("❌ Valutakursen är 0. Kan inte räkna om SEK till USD.")
+        return [], kapital_sek
+
     df = df.copy()
     df = df[df["Riktkurs 2026"] > df["Aktuell kurs"]]
     df = df[~df["Ticker"].isin(st.session_state.hoppade_over)]
@@ -138,7 +180,7 @@ def investeringsforslag(df, kapital_sek, valutakurs):
                 "Totalt (SEK)": total_sek
             })
             kapital_kvar -= total_usd
-            break
+            break  # Visa bara ett förslag i taget
 
     return forslag, kapital_kvar * valutakurs
 
@@ -162,14 +204,6 @@ def visa_investeringsrad(df, valutakurs):
     else:
         st.info("🚫 Inga fler bolag uppfyller kriterierna just nu.")
 
-# ---------------------------------------
-# DEL 4: MAIN
-# ---------------------------------------
-
-def visa_tabell(df):
-    st.subheader("📈 Datatabell")
-    st.dataframe(df, use_container_width=True)
-
 def visa_portfolj(df, valutakurs):
     st.subheader("📦 Min portfölj")
     df["Antal aktier"] = df["Antal aktier"].fillna(0.0)
@@ -187,6 +221,10 @@ def visa_portfolj(df, valutakurs):
     st.dataframe(visa_df, use_container_width=True)
     st.markdown(f"💼 **Totalt portföljvärde:** `{round(totalvärde, 2)} SEK`")
 
+def visa_tabell(df):
+    st.subheader("📈 Datatabell")
+    st.dataframe(df, use_container_width=True)
+
 def visa_valutakurs():
     try:
         r = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=SEK")
@@ -198,35 +236,46 @@ def visa_valutakurs():
         st.sidebar.warning("⚠️ Kunde inte hämta valutakurs.")
         return 0.0
 
+# ---------------------------------------
+# DEL 7: HUVUDFUNKTION – MAIN OCH START
+# ---------------------------------------
+
 def main():
     st.set_page_config(page_title="📈 Aktieanalys", layout="wide")
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    if "hoppade_over" not in st.session_state:
-        st.session_state.hoppade_over = []
-
+    # 1) Hämta och förbered data
     df = hamta_data()
     df = säkerställ_kolumner(df)
     df = konvertera_till_ratt_typ(df)
 
+    # 2) Hämta valutakurs
     valutakurs = visa_valutakurs()
 
+    # 3) Menyval
     menyval = st.sidebar.radio("📁 Meny", [
         "📊 Analys",
+        "➕ Lägg till/uppdatera bolag",
         "🔁 Uppdatera värderingar",
         "💼 Investeringsråd",
         "📦 Portfölj"
     ])
 
+    # 4) Rutin för varje vy
     if menyval == "📊 Analys":
         df = uppdatera_berakningar(df)
         visa_tabell(df)
+
+    elif menyval == "➕ Lägg till/uppdatera bolag":
+        df = lagg_till_eller_uppdatera(df)
+        spara_data(df)
+        st.success("✅ Bolagsdatabasen är uppdaterad!")
 
     elif menyval == "🔁 Uppdatera värderingar":
         df = uppdatera_aktuell_kurs(df)
         df = uppdatera_berakningar(df)
         spara_data(df)
-        st.success("✅ Alla kurser och värderingar har uppdaterats!")
+        st.success("✅ Kurser och riktkurser uppdaterade!")
 
     elif menyval == "💼 Investeringsråd":
         visa_investeringsrad(df, valutakurs)
@@ -234,5 +283,6 @@ def main():
     elif menyval == "📦 Portfölj":
         visa_portfolj(df, valutakurs)
 
+# Kör appen
 if __name__ == "__main__":
     main()

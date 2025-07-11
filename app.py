@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 import yfinance as yf
 import requests
 from io import BytesIO
@@ -14,8 +14,8 @@ SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 
 def skapa_koppling():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_service_account_info(
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(
         st.secrets["GOOGLE_CREDENTIALS"], scopes=scope
     )
     client = gspread.authorize(creds)
@@ -130,10 +130,10 @@ def uppdatera_beräkningar(df):
     return df
 
 # --------------------------
-# DEL 4 – Investeringsråd och formulär
+# DEL 4 – Investeringsförslag och logik för att hoppa över bolag
 # --------------------------
 
-# Initiera lista över överhoppade tickers om den inte finns
+# Initiera lista över överhoppade tickers
 if "hoppade_over" not in st.session_state:
     st.session_state.hoppade_over = []
 
@@ -188,30 +188,11 @@ def visa_investeringsrad(df):
         st.info("🚫 Inga fler förslag just nu. Starta om sidan för att återställa listan.")
 
 # --------------------------
-# DEL 5 – Tabellvisning, Portfölj och Export
+# DEL 5 – Portfölj, valutakurs och export
 # --------------------------
 
-def visa_tabell(df):
-    st.subheader("📋 Bolagsdata")
-    df_vy = df.copy()
-    df_vy = df_vy.sort_values(by="Undervärdering 2026", ascending=False)
-    st.dataframe(df_vy, use_container_width=True)
-
-def exportera_excel(df):
-    buffer = BytesIO()
-    df.to_excel(buffer, index=False)
-    st.download_button("📥 Ladda ner Excel", buffer.getvalue(), file_name="aktiedata.xlsx")
-
-def visa_valutakurs():
-    try:
-        r = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=SEK")
-        data = r.json()
-        kurs = data["rates"]["SEK"]
-        st.sidebar.markdown(f"💱 **USD/SEK:** {round(kurs, 2)}")
-        return kurs
-    except:
-        st.sidebar.warning("Kunde inte hämta valutakurs.")
-        return 0.0
+from io import BytesIO
+import requests
 
 def visa_portfolj(df, valutakurs):
     st.subheader("📦 Min portfölj")
@@ -235,8 +216,82 @@ def visa_portfolj(df, valutakurs):
 
     st.markdown(f"💼 **Totalt portföljvärde:** {round(totalvärde, 2)} SEK")
 
+def visa_valutakurs():
+    try:
+        r = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=SEK")
+        data = r.json()
+        kurs = data["rates"]["SEK"]
+        st.sidebar.markdown(f"💱 **USD/SEK:** {round(kurs, 2)}")
+        return kurs
+    except:
+        st.sidebar.warning("Kunde inte hämta valutakurs.")
+        return 0.0
+
+def exportera_excel(df):
+    buffer = BytesIO()
+    df.to_excel(buffer, index=False)
+    st.download_button("📥 Ladda ner Excel", buffer.getvalue(), file_name="aktiedata.xlsx")
+
 # --------------------------
-# DEL 6 – Huvudfunktion: Streamlit-applikation
+# DEL 6 – Investeringsråd med hoppa över-funktion
+# --------------------------
+
+# Initiera global lista i session state
+if "hoppade_over" not in st.session_state:
+    st.session_state.hoppade_over = []
+
+def investeringsforslag(df, kapital):
+    df = df[df["Riktkurs 2026"] > df["Aktuell kurs"]]
+    df = df[~df["Ticker"].isin(st.session_state.hoppade_over)]
+    df = df.copy()
+    df["Potential"] = df["Riktkurs 2026"] - df["Aktuell kurs"]
+    df = df.sort_values(by="Potential", ascending=False)
+
+    forslag = []
+    kapital_kvar = kapital
+
+    for i, rad in df.iterrows():
+        ticker = rad["Ticker"]
+        pris = rad["Aktuell kurs"]
+
+        if pris <= 0 or kapital_kvar < pris:
+            continue
+
+        antal = int(kapital_kvar // pris)
+        if antal > 0:
+            totalpris = round(antal * pris, 2)
+            forslag.append({
+                "Ticker": ticker,
+                "Köp antal": antal,
+                "Pris per aktie": pris,
+                "Totalt": totalpris
+            })
+            break  # Endast ett förslag i taget
+
+    return forslag, kapital_kvar
+
+def visa_investeringsrad(df):
+    st.subheader("📌 Investeringsförslag")
+
+    kapital = st.number_input("💰 Tillgängligt kapital (USD)", min_value=0.0, value=1000.0, step=100.0)
+    df = uppdatera_beräkningar(df)
+    forslag, rest = investeringsforslag(df, kapital)
+
+    if forslag:
+        f = forslag[0]
+        st.markdown(
+            f"- **{f['Ticker']}**: Köp {f['Köp antal']} st à {f['Pris per aktie']} USD (Totalt {f['Totalt']} USD)"
+        )
+        st.markdown(f"💵 **Kvarvarande kapital:** {round(rest, 2)} USD")
+
+        if st.button("⏭️ Nästa förslag"):
+            st.session_state.hoppade_over.append(f["Ticker"])
+            st.experimental_rerun()
+    else:
+        st.info("🚫 Inga fler förslag just nu. Starta om sidan för att återställa listan.")
+
+# --------------------------
+# DEL 7 – Streamlit-huvudfunktion
 # --------------------------
 
 def main():
@@ -274,7 +329,6 @@ def main():
         st.success("✅ Alla kurser och värderingar har uppdaterats!")
 
     elif menyval == "💼 Investeringsråd":
-        df = uppdatera_beräkningar(df)
         visa_investeringsrad(df)
 
     elif menyval == "📦 Portfölj":
@@ -285,81 +339,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# --------------------------
-# DEL 7 – Investeringslogik och portfölj
-# --------------------------
-
-# Global session-lista för överhoppade tickers
-if "hoppade_over" not in st.session_state:
-    st.session_state.hoppade_over = []
-
-def investeringsforslag(df, kapital):
-    df = df[df["Riktkurs 2026"] > df["Aktuell kurs"]]
-    df["Potential"] = df["Riktkurs 2026"] - df["Aktuell kurs"]
-    df = df.sort_values(by="Potential", ascending=False)
-
-    forslag = []
-    kapital_kvar = kapital
-
-    for i, rad in df.iterrows():
-        ticker = rad["Ticker"]
-        pris = rad["Aktuell kurs"]
-
-        if ticker in st.session_state.hoppade_over or pris <= 0:
-            continue
-
-        antal = int(kapital_kvar // pris)
-        if antal > 0:
-            totalpris = round(antal * pris, 2)
-            forslag.append({
-                "Ticker": ticker,
-                "Köp antal": antal,
-                "Pris per aktie": pris,
-                "Totalt": totalpris
-            })
-            kapital_kvar -= totalpris
-            break  # Endast ett förslag åt gången
-
-    return forslag, kapital_kvar
-
-def visa_investeringsrad(df):
-    kapital = st.number_input("💰 Tillgängligt kapital (USD)", min_value=0.0, value=1000.0, step=100.0)
-    forslag, rest = investeringsforslag(df, kapital)
-
-    st.subheader("📌 Investeringsförslag")
-
-    if forslag:
-        for f in forslag:
-            st.markdown(
-                f"- **{f['Ticker']}**: Köp {f['Köp antal']} st à {f['Pris per aktie']} USD (Totalt {f['Totalt']} USD)"
-            )
-        if st.button("⏭️ Nästa förslag"):
-            st.session_state.hoppade_over.append(forslag[0]["Ticker"])
-            st.experimental_rerun()
-    else:
-        st.info("🚫 Inga fler förslag just nu. Starta om sidan för att återställa listan.")
-
-    st.markdown(f"💵 **Kvarvarande kapital:** {round(rest, 2)} USD")
-
-def visa_portfolj(df, valutakurs):
-    st.subheader("📦 Min portfölj")
-
-    if "Antal aktier" not in df.columns:
-        df["Antal aktier"] = 0.0
-
-    portfolj = df[df["Antal aktier"] > 0].copy()
-
-    if portfolj.empty:
-        st.info("Du äger inga aktier just nu.")
-        return
-
-    portfolj["Värde i SEK"] = portfolj["Antal aktier"] * portfolj["Aktuell kurs"] * valutakurs
-    totalvärde = portfolj["Värde i SEK"].sum()
-
-    portfolj["Andel (%)"] = (portfolj["Värde i SEK"] / totalvärde * 100).round(2)
-
-    visa_df = portfolj[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde i SEK", "Andel (%)"]]
-    st.dataframe(visa_df, use_container_width=True)
-
-    st.markdown(f"💼 **Totalt portföljvärde:** {round(totalvärde, 2)} SEK")

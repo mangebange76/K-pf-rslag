@@ -10,7 +10,7 @@ SHEET_NAME = "Blad1"
 SETTINGS_SHEET = "Inställningar"
 
 def load_credentials():
-    credentials_dict = st.secrets["norremt"]
+    credentials_dict = st.secrets["GOOGLE_CREDENTIALS"]
     credentials = Credentials.from_service_account_info(credentials_dict)
     client = gspread.authorize(credentials)
     return client
@@ -155,6 +155,13 @@ def visa_investeringsrad(df, valutakurs, settings):
     except Exception as e:
         st.error(f"Fel vid generering av förslag: {e}")
 
+def visa_databas(df):
+    st.header("📋 Bolagsdatabas")
+    if not df.empty:
+        st.dataframe(df)
+    else:
+        st.info("Databasen är tom.")
+
 def lagg_till_eller_uppdatera_bolag(df):
     st.header("➕ Lägg till eller uppdatera ett bolag")
 
@@ -210,7 +217,6 @@ def main():
     st.set_page_config(page_title="Investeringsanalys", layout="wide")
     st.title("📊 Aktieanalys & Investeringsförslag")
 
-    # Läs inställningar och konvertera
     inställningar = load_settings()
     max_andel = inställningar.get("Max portföljandel (%)", 20)
     max_högrisk = inställningar.get("Max högriskandel (%)", 2)
@@ -230,8 +236,8 @@ def main():
         })
         st.sidebar.success("Inställningar sparade.")
 
-    # Läs datan från Google Sheets
-    df = hamta_data()
+    # Läs datan
+    df = load_data()
     df = konvertera_till_ratt_typ(df)
 
     # Menyval
@@ -242,7 +248,10 @@ def main():
 
     # Visa vald vy
     if menyval == "📈 Investeringsförslag":
-        visa_investeringsrad(df, valutakurs)
+        visa_investeringsrad(df, valutakurs, {
+            "Max portföljandel (%)": max_andel,
+            "Max högriskandel (%)": max_högrisk
+        })
     elif menyval == "🧮 Lägg till / uppdatera bolag":
         lagg_till_eller_uppdatera_bolag(df)
     elif menyval == "📋 Databasen":

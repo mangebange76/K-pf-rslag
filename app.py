@@ -7,10 +7,6 @@ from datetime import datetime
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
-# ---------------------------------------
-# KONFIGURATION OCH GOOGLE SHEETS-KOPPLING
-# ---------------------------------------
-
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 SETTINGS_SHEET_NAME = "Inställningar"
@@ -34,8 +30,8 @@ def spara_data(df):
 
 def konvertera_typer(df):
     kolumner = [
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-        "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "Omsättning idag", "Omsättning om 1 år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "Utestående aktier", "P/S idag", "P/S om 1 år", "P/S om 2 år", "P/S om 3 år",
         "Aktuell kurs", "Antal aktier"
     ]
     for kol in kolumner:
@@ -45,8 +41,8 @@ def konvertera_typer(df):
 
 def säkerställ_kolumner(df):
     nödvändiga = [
-        "Ticker", "Bolagsnamn", "Aktuell kurs", "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "Ticker", "Bolagsnamn", "Aktuell kurs", "Utestående aktier", "P/S idag", "P/S om 1 år", "P/S om 2 år", "P/S om 3 år",
+        "Omsättning idag", "Omsättning om 1 år", "Omsättning om 2 år", "Omsättning om 3 år",
         "P/S-snitt", "Riktkurs nu", "Riktkurs om 1 år", "Riktkurs om 2 år", "Antal aktier"
     ]
     for kol in nödvändiga:
@@ -54,17 +50,15 @@ def säkerställ_kolumner(df):
             df[kol] = 0.0 if any(x in kol.lower() for x in ["kurs", "omsättning", "p/s"]) else ""
     return df
 
-def load_settings():
+def las_inställningar():
     try:
         sheet = skapa_koppling(SETTINGS_SHEET_NAME)
         data = sheet.get_all_values()
         df = pd.DataFrame(data[1:], columns=data[0])
         inst = dict(zip(df["Inställning"], df["Värde"]))
-
         valutakurs = float(str(inst.get("Valutakurs", "0")).replace(",", "."))
         max_portf = float(str(inst.get("Max portföljandel", "100")).replace(",", "."))
         max_risk = float(str(inst.get("Max högriskandel", "100")).replace(",", "."))
-
         return {
             "Valutakurs": valutakurs,
             "Max portföljandel": max_portf,
@@ -74,6 +68,10 @@ def load_settings():
     except Exception as e:
         st.error(f"Fel vid läsning av inställningar: {e}")
         return {"Valutakurs": 10.0, "Max portföljandel": 100, "Max högriskandel": 100, "Senast ändrad": ""}
+
+# ---------------------------------------
+# SIDOPANEL – Inställningar
+# ---------------------------------------
 
 def skriv_sidopanel(inställningar):
     st.sidebar.header("Inställningar")
@@ -92,15 +90,33 @@ def skriv_sidopanel(inställningar):
         except Exception as e:
             st.sidebar.error(f"Fel vid uppdatering av inställningar: {e}")
 
+# ---------------------------------------
+# BERÄKNINGAR
+# ---------------------------------------
+
 def uppdatera_berakningar(df):
-    df["P/S-snitt"] = df[["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]].replace(0, np.nan).mean(axis=1).fillna(0)
+    for i, row in df.iterrows():
+        ps_values = [row["P/S idag"], row["P/S om 1 år"], row["P/S om 2 år"], row["P/S om 3 år"]]
+        ps_values = [ps for ps in ps_values if ps > 0]
+        ps_snitt = round(np.mean(ps_values), 2) if ps_values else 0.0
+        df.at[i, "P/S-snitt"] = ps_snitt
 
-    df["Riktkurs nu"] = round((df["Omsättning idag"] / df["Utestående aktier"]) * df["P/S-snitt"], 2)
-    df["Riktkurs om 1 år"] = round((df["Omsättning nästa år"] / df["Utestående aktier"]) * df["P/S-snitt"], 2)
-    df["Riktkurs om 2 år"] = round((df["Omsättning om 2 år"] / df["Utestående aktier"]) * df["P/S-snitt"], 2)
+        if row["Utestående aktier"] > 0:
+            riktkurser = []
+            for j, oms_kolumn in enumerate(["Omsättning idag", "Omsättning om 1 år", "Omsättning om 2 år"]):
+                riktkurs_kol = ["Riktkurs nu", "Riktkurs om 1 år", "Riktkurs om 2 år"][j]
+                oms = row[oms_kolumn]
+                df.at[i, riktkurs_kol] = round((oms / row["Utestående aktier"]) * ps_snitt, 2) if ps_snitt > 0 else 0.0
 
-    df["Uppsidepotential (%)"] = round(((df["Riktkurs nu"] - df["Aktuell kurs"]) / df["Aktuell kurs"]) * 100, 2)
+        if row["Aktuell kurs"] > 0:
+            df.at[i, "Uppsidepotential (%)"] = round(((df.at[i, "Riktkurs om 1 år"] - row["Aktuell kurs"]) / row["Aktuell kurs"]) * 100, 2)
+        else:
+            df.at[i, "Uppsidepotential (%)"] = 0.0
     return df
+
+# ---------------------------------------
+# INVESTERINGSFÖRSLAG & OMBALANSERING
+# ---------------------------------------
 
 def visa_investeringsforslag(df, valutakurs, max_portfoljandel, max_hogriskandel):
     st.subheader("📈 Investeringsförslag")
@@ -158,6 +174,28 @@ def visa_investeringsforslag(df, valutakurs, max_portfoljandel, max_hogriskandel
     else:
         st.info("Inga fler förslag. Starta om för att se från början.")
 
+# ---------------------------------------
+# SIDOPANEL FÖR MANUELL ÄNDRING AV INSTÄLLNINGAR
+# ---------------------------------------
+
+def visa_sidopanel(df, inställningar):
+    st.sidebar.subheader("⚙️ Inställningar")
+
+    valutakurs = st.sidebar.number_input("USD/SEK", value=inställningar["Valutakurs"], step=0.01)
+    max_andel = st.sidebar.number_input("Max portföljandel (%)", value=inställningar["Max portföljandel"], step=0.1)
+    max_risk = st.sidebar.number_input("Max högriskandel (%)", value=inställningar["Max högriskandel"], step=0.1)
+
+    if st.sidebar.button("💾 Spara inställningar"):
+        skriv_sidopanel({
+            "Valutakurs": valutakurs,
+            "Max portföljandel": max_andel,
+            "Max högriskandel": max_risk
+        })
+
+# ---------------------------------------
+# LÄGG TILL / UPPDATERA BOLAG
+# ---------------------------------------
+
 def lagg_till_bolag(df):
     st.subheader("➕ Lägg till eller uppdatera bolag")
 
@@ -170,8 +208,9 @@ def lagg_till_bolag(df):
         befintlig = {}
 
     kolumner = [
-        "Ticker", "Bolagsnamn", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "Ticker", "Bolagsnamn",
+        "P/S idag", "P/S om 1 år", "P/S om 2 år", "P/S om 3 år",
+        "Omsättning idag", "Omsättning om 1 år", "Omsättning om 2 år", "Omsättning om 3 år",
         "Aktuell kurs", "Antal aktier"
     ]
     indata = {}
@@ -192,30 +231,18 @@ def lagg_till_bolag(df):
         st.success(f"{ny_rad['Ticker']} sparad.")
     return df
 
-def visa_sidopanel(df, inställningar):
-    st.sidebar.subheader("⚙️ Inställningar")
-
-    valutakurs = st.sidebar.number_input("USD/SEK", value=inställningar["Valutakurs"], step=0.01)
-    max_andel = st.sidebar.number_input("Max portföljandel (%)", value=inställningar["Max portföljandel"], step=0.1)
-    max_risk = st.sidebar.number_input("Max högriskandel (%)", value=inställningar["Max högriskandel"], step=0.1)
-
-    if st.sidebar.button("💾 Spara inställningar"):
-        try:
-            sheet = skapa_koppling("Inställningar")
-            sheet.update("B2", [[str(valutakurs).replace(".", ",")]])
-            sheet.update("B3", [[str(max_andel).replace(".", ",")]])
-            sheet.update("B4", [[str(max_risk).replace(".", ",")]])
-            sheet.update("B5", [[datetime.today().strftime("%Y-%m-%d")]])
-            st.sidebar.success("Inställningar uppdaterade.")
-        except Exception as e:
-            st.sidebar.error(f"Fel vid uppdatering av inställningar: {e}")
+# ---------------------------------------
+# PORTFÖLJVY
+# ---------------------------------------
 
 def visa_portfolj(df, valutakurs):
-    st.subheader("💼 Portföljöversikt")
+    st.subheader("📊 Portföljöversikt")
     df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
-    totalvarde = df["Värde (SEK)"].sum()
-    df["Portföljandel (%)"] = round((df["Värde (SEK)"] / totalvarde) * 100, 2)
-    st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Portföljandel (%)"]])
+    st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)"]])
+
+# ---------------------------------------
+# MAIN
+# ---------------------------------------
 
 def main():
     st.title("📈 Aktieanalys & investeringsförslag – Manuell valutakurs och aktiekurs")

@@ -124,7 +124,6 @@ def visa_portfolj(df, valutakurs):
     df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
     df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
     st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
-
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
     df = hamta_data()

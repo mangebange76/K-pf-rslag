@@ -115,59 +115,6 @@ def lagg_till_eller_uppdatera(df):
             st.success(f"{ticker} tillagt.")
     return df
 
-def visa_investeringsforslag(df, valutakurs):
-    st.subheader("💡 Investeringsförslag")
-    kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=10000.0, step=500.0)
-
-    df = df[df["Riktkurs 2026"] > df["Aktuell kurs"]].copy()
-    df["Potential"] = df["Riktkurs 2026"] - df["Aktuell kurs"]
-    df = df.sort_values(by="Potential", ascending=False).reset_index(drop=True)
-
-    if valutakurs == 0:
-        st.warning("Valutakursen får inte vara 0.")
-        return
-
-    kapital_usd = kapital_sek / valutakurs
-
-    if 'forslags_index' not in st.session_state:
-        st.session_state.forslags_index = 0
-
-    if df.empty:
-        st.info("Inga bolag matchar kriterierna just nu.")
-        return
-
-    index = st.session_state.forslags_index
-    if index >= len(df):
-        st.info("Inga fler förslag att visa.")
-        return
-
-    rad = df.iloc[index]
-    if rad["Aktuell kurs"] <= 0:
-        st.warning("Felaktig aktiekurs – kan inte visa förslag.")
-        return
-
-    antal = int(kapital_usd // rad["Aktuell kurs"])
-    total_sek = antal * rad["Aktuell kurs"] * valutakurs
-
-    df_portfolj = df[df["Antal aktier"] > 0].copy()
-    df_portfolj["Värde (SEK)"] = df_portfolj["Antal aktier"] * df_portfolj["Aktuell kurs"] * valutakurs
-    portfoljvarde = df_portfolj["Värde (SEK)"].sum()
-    andel_procent = round((total_sek / portfoljvarde) * 100, 2) if portfoljvarde > 0 else 0
-
-    st.markdown(f"""
-        ### 💰 Förslag {index+1} av {len(df)}
-        - **Bolag:** {rad['Bolagsnamn']} ({rad['Ticker']})
-        - **Aktuell kurs:** {round(rad['Aktuell kurs'], 2)} USD
-        - **Riktkurs 2026:** {round(rad['Riktkurs 2026'], 2)} USD
-        - **Potential:** {round(rad['Potential'], 2)} USD
-        - **Antal att köpa:** {antal} st
-        - **Beräknad investering:** {round(total_sek, 2)} SEK
-        - **Andel av nuvarande portföljvärde:** {andel_procent}%
-    """)
-
-    if st.button("➡️ Nästa förslag"):
-        st.session_state.forslags_index += 1
-
 def visa_portfolj(df, valutakurs):
     st.subheader("📦 Min portfölj")
     df = df[df["Antal aktier"] > 0].copy()

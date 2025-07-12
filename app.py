@@ -134,17 +134,19 @@ def main():
     valutakurs = st.sidebar.number_input("Valutakurs USD → SEK", value=10.0, step=0.1)
 
     meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
+
     if meny == "Analys":
         df = uppdatera_berakningar(df)
         st.dataframe(df, use_container_width=True)
+
     elif meny == "Lägg till / uppdatera bolag":
         df = lagg_till_eller_uppdatera(df)
         spara_data(df)
-    elif meny == "Investeringsförslag":
-        df = uppdatera_berakningar(df)
-        visa_investeringsforslag(df, valutakurs)
-    elif meny == "Portfölj":
-        visa_portfolj(df, valutakurs)
 
-if __name__ == "__main__":
-    main()
+    elif meny == "Investeringsförslag":
+        df = uppdatera_berakningar(df)  # ✅ Viktigt!
+        visa_investeringsforslag(df, valutakurs)
+
+    elif meny == "Portfölj":
+        df = uppdatera_berakningar(df)
+        visa_portfolj(df, valutakurs)

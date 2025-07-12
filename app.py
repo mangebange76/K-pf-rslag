@@ -150,3 +150,6 @@ def main():
     elif meny == "Portfölj":
         df = uppdatera_berakningar(df)
         visa_portfolj(df, valutakurs)
+
+if __name__ == "__main__":
+    main()

@@ -1,264 +1,174 @@
+# ---------------------------------------
+# Aktieanalys & investeringsförslag – Manuell valutakurs och aktiekurs
+# ---------------------------------------
+
 import streamlit as st
 import pandas as pd
+import numpy as np
 import gspread
-from datetime import datetime
 from google.oauth2.service_account import Credentials
 
-# Google Sheets inställningar
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1-5JSJpqBB0j7sm3cgEGZmnFoBL_oJDPMpLdleggL0HQ/edit?usp=drivesdk"
+st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
+
+# ---------------------------------------
+# KONFIGURATION OCH KOPPLING TILL GOOGLE SHEETS
+# ---------------------------------------
+
+SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
-SETTINGS_SHEET = "Inställningar"
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
+client = gspread.authorize(credentials)
 
-def load_credentials():
-    credentials_dict = st.secrets["GOOGLE_CREDENTIALS"]
-    credentials = Credentials.from_service_account_info(credentials_dict)
-    client = gspread.authorize(credentials)
-    return client
-
-def load_data():
-    client = load_credentials()
+def skapa_koppling():
     sheet = client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
+    return sheet
+
+def hamta_data():
+    sheet = skapa_koppling()
     data = sheet.get_all_records()
     return pd.DataFrame(data)
 
-def save_data(df):
-    df = df.fillna("")
-    df = df.astype(str)
-    client = load_credentials()
-    sheet = client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
+def spara_data(df):
+    sheet = skapa_koppling()
     sheet.clear()
-    sheet.update([df.columns.tolist()] + df.values.tolist())
+    sheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
 
-def skapa_inställningsblad():
-    client = load_credentials()
-    sheet = client.open_by_url(SHEET_URL)
-    try:
-        sheet.worksheet(SETTINGS_SHEET)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=SETTINGS_SHEET, rows="10", cols="3")
-        ws.update("A1:C1", [["Inställning", "Värde", "Senast ändrad"]])
-        ws.append_row(["Valutakurs", "10", str(datetime.today().date())])
-        ws.append_row(["Max portföljandel (%)", "20", str(datetime.today().date())])
-        ws.append_row(["Max högriskandel (%)", "2", str(datetime.today().date())])
-
-def load_settings():
-    skapa_inställningsblad()
-    client = load_credentials()
-    sheet = client.open_by_url(SHEET_URL).worksheet(SETTINGS_SHEET)
-    rows = sheet.get_all_records()
-    return {row["Inställning"]: float(row["Värde"]) for row in rows if row["Värde"] != ""}
-
-def save_settings(settings_dict):
-    client = load_credentials()
-    sheet = client.open_by_url(SHEET_URL).worksheet(SETTINGS_SHEET)
-    existing = sheet.get_all_records()
-    existing_dict = {row["Inställning"]: i + 2 for i, row in enumerate(existing)}
-
-    for key, value in settings_dict.items():
-        rad = existing_dict.get(key)
-        if rad:
-            sheet.update_cell(rad, 2, str(value))
-            sheet.update_cell(rad, 3, str(datetime.today().date()))
-        else:
-            sheet.append_row([key, str(value), str(datetime.today().date())])
-
-def konvertera_till_ratt_typ(df):
-    numeriska_kolumner = [
-        "Aktuell kurs", "Målkurs 2025", "Målkurs 2026", "P/S Q1", "P/S rullande",
-        "Omsättning (miljoner USD)", "Andel av portfölj (%)"
+def konvertera_typer(df):
+    kolumner = [
+        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "Aktuell kurs", "Antal aktier"
     ]
-    for kolumn in numeriska_kolumner:
-        if kolumn in df.columns:
-            df[kolumn] = pd.to_numeric(df[kolumn], errors="coerce")
+    for kol in kolumner:
+        if kol in df.columns:
+            df[kol] = pd.to_numeric(df[kol], errors="coerce").fillna(0.0)
     return df
 
-def investeringsforslag(df, kapital_sek, valutakurs, settings):
-    kapital_usd = kapital_sek / valutakurs
-    max_andel = settings.get("Max portföljandel (%)", 20)
-    max_risk = settings.get("Max högriskandel (%)", 2)
+def säkerställ_kolumner(df):
+    nödvändiga = [
+        "Ticker", "Bolagsnamn", "Aktuell kurs", "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "P/S-snitt", "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028", "Antal aktier"
+    ]
+    for kol in nödvändiga:
+        if kol not in df.columns:
+            df[kol] = 0.0 if "kurs" in kol.lower() or "omsättning" in kol.lower() or "p/s" in kol.lower() else ""
+    return df
 
-    forslag = []
-    högrisk_df = pd.DataFrame()
-    minska_df = df[df["Andel av portfölj (%)"] > max_andel]
+def uppdatera_berakningar(df):
+    for i, rad in df.iterrows():
+        ps = [rad["P/S Q1"], rad["P/S Q2"], rad["P/S Q3"], rad["P/S Q4"]]
+        ps = [x for x in ps if x > 0]
+        ps_snitt = round(np.mean(ps), 2) if ps else 0
+        df.at[i, "P/S-snitt"] = ps_snitt
 
-    kandidater = df[
-        (df["Andel av portfölj (%)"] < max_andel) &
-        (df["Målkurs 2025"] > df["Aktuell kurs"])
-    ].copy()
+        if rad["Utestående aktier"] > 0:
+            df.at[i, "Riktkurs idag"] = round((rad["Omsättning idag"] * ps_snitt) / rad["Utestående aktier"], 2)
+            df.at[i, "Riktkurs 2026"] = round((rad["Omsättning nästa år"] * ps_snitt) / rad["Utestående aktier"], 2)
+            df.at[i, "Riktkurs 2027"] = round((rad["Omsättning om 2 år"] * ps_snitt) / rad["Utestående aktier"], 2)
+            df.at[i, "Riktkurs 2028"] = round((rad["Omsättning om 3 år"] * ps_snitt) / rad["Utestående aktier"], 2)
+    return df
 
-    kandidater["Potential (%)"] = round(((kandidater["Målkurs 2025"] - kandidater["Aktuell kurs"]) / kandidater["Aktuell kurs"]) * 100, 1)
-    kandidater = kandidater.sort_values(by="Potential (%)", ascending=False)
+def lagg_till_eller_uppdatera(df):
+    st.subheader("➕ Lägg till / uppdatera bolag")
+    tickers = df["Ticker"].tolist()
+    valt = st.selectbox("Välj existerande bolag att uppdatera (eller lämna tom för nytt)", [""] + tickers)
 
-    for _, row in kandidater.iterrows():
-        ticker = row["Ticker"]
-        kurs = row["Aktuell kurs"]
-        omsättning = row["Omsättning (miljoner USD)"]
-        andel = row["Andel av portfölj (%)"]
-
-        belopp = kapital_usd
-        antal = int(belopp // kurs)
-
-        if antal > 0:
-            investering_usd = antal * kurs
-            investering_sek = investering_usd * valutakurs
-            ny_andel = andel + ((investering_usd / (kapital_usd + 1e-6)) * 100)
-
-            högrisk = omsättning < 1000 and andel >= max_risk
-            if högrisk:
-                högrisk_df = pd.concat([högrisk_df, pd.DataFrame([row])])
-
-            forslag.append({
-                "Ticker": ticker,
-                "Antal": antal,
-                "Kurs (USD)": round(kurs, 2),
-                "Investering (SEK)": round(investering_sek, 2),
-                "Potential (%)": row["Potential (%)"]
-            })
-
-            kapital_usd -= antal * kurs
-
-    return forslag, kapital_usd * valutakurs, minska_df, högrisk_df
-
-def visa_investeringsrad(df, valutakurs, settings):
-    st.header("📈 Investeringsförslag")
-
-    kapital_sek = st.number_input("Tillgängligt kapital (SEK)", min_value=0, value=1000)
-    if valutakurs == 0:
-        st.error("Valutakurs kan inte vara 0.")
-        return
-
-    try:
-        forslag, rest_sek, minska_df, högrisk_df = investeringsforslag(df, kapital_sek, valutakurs, settings)
-
-        st.subheader("🔻 Bolag att minska i")
-        if not minska_df.empty:
-            st.dataframe(minska_df[["Ticker", "Andel av portfölj (%)"]])
-        else:
-            st.write("Inga överexponerade innehav.")
-
-        st.subheader("🔼 Bolag att öka i")
-        if forslag:
-            st.table(forslag)
-            if rest_sek < kapital_sek:
-                st.success(f"Restkapital: {round(rest_sek)} SEK")
-            else:
-                st.warning("Kapitalet räcker inte för något förslag. Öka beloppet för att se investeringar.")
-        else:
-            st.info("Inga köpförslag baserat på kriterierna och tillgängligt kapital.")
-
-        st.subheader("⚠️ Högriskvarningar")
-        if not högrisk_df.empty:
-            st.dataframe(högrisk_df[["Ticker", "Omsättning (miljoner USD)", "Andel av portfölj (%)"]])
-        else:
-            st.write("Inga högriskvarningar.")
-
-    except Exception as e:
-        st.error(f"Fel vid generering av förslag: {e}")
-
-def visa_databas(df):
-    st.header("📋 Bolagsdatabas")
-    if not df.empty:
-        st.dataframe(df)
+    if valt:
+        befintlig = df[df["Ticker"] == valt].iloc[0]
     else:
-        st.info("Databasen är tom.")
+        befintlig = {}
 
-def lagg_till_eller_uppdatera_bolag(df):
-    st.header("➕ Lägg till eller uppdatera ett bolag")
+    with st.form("form"):
+        ticker = st.text_input("Ticker", value=befintlig.get("Ticker", "")).upper()
+        namn = st.text_input("Bolagsnamn", value=befintlig.get("Bolagsnamn", ""))
+        kurs = st.number_input("Aktuell kurs (USD)", value=float(befintlig.get("Aktuell kurs", 0.0)))
+        aktier = st.number_input("Utestående aktier (miljoner)", value=float(befintlig.get("Utestående aktier", 0.0)))
+        antal_aktier = st.number_input("Antal aktier du äger", value=float(befintlig.get("Antal aktier", 0.0)))
 
-    alla_bolag = df["Ticker"].tolist()
-    valt_bolag = st.selectbox("Välj bolag att uppdatera (eller lämna tom för nytt):", [""] + sorted(alla_bolag))
+        ps_idag = st.number_input("P/S idag", value=float(befintlig.get("P/S", 0.0)))
+        ps1 = st.number_input("P/S Q1", value=float(befintlig.get("P/S Q1", 0.0)))
+        ps2 = st.number_input("P/S Q2", value=float(befintlig.get("P/S Q2", 0.0)))
+        ps3 = st.number_input("P/S Q3", value=float(befintlig.get("P/S Q3", 0.0)))
+        ps4 = st.number_input("P/S Q4", value=float(befintlig.get("P/S Q4", 0.0)))
 
-    if valt_bolag and valt_bolag in df["Ticker"].values:
-        bolagsdata = df[df["Ticker"] == valt_bolag].iloc[0]
-    else:
-        bolagsdata = {}
+        oms_idag = st.number_input("Omsättning idag (miljoner USD)", value=float(befintlig.get("Omsättning idag", 0.0)))
+        oms_1 = st.number_input("Omsättning nästa år", value=float(befintlig.get("Omsättning nästa år", 0.0)))
+        oms_2 = st.number_input("Omsättning om 2 år", value=float(befintlig.get("Omsättning om 2 år", 0.0)))
+        oms_3 = st.number_input("Omsättning om 3 år", value=float(befintlig.get("Omsättning om 3 år", 0.0)))
 
-    with st.form("lägg_till_form"):
-        ticker = st.text_input("Ticker", value=bolagsdata.get("Ticker", ""))
-        namn = st.text_input("Bolagsnamn", value=bolagsdata.get("Bolagsnamn", ""))
-        aktuell_kurs = st.number_input("Aktuell kurs (USD)", value=float(bolagsdata.get("Aktuell kurs", 0)), step=0.01, format="%.2f")
-        mål_2025 = st.number_input("Målkurs 2025", value=float(bolagsdata.get("Målkurs 2025", 0)), step=0.01)
-        mål_2026 = st.number_input("Målkurs 2026", value=float(bolagsdata.get("Målkurs 2026", 0)), step=0.01)
-        p_s_q1 = st.number_input("P/S Q1", value=float(bolagsdata.get("P/S Q1", 0)), step=0.01)
-        p_s_rullande = st.number_input("P/S rullande", value=float(bolagsdata.get("P/S rullande", 0)), step=0.01)
-        omsättning = st.number_input("Omsättning (miljoner USD)", value=float(bolagsdata.get("Omsättning (miljoner USD)", 0)), step=0.01)
-        portföljandel = st.number_input("Andel av portfölj (%)", value=float(bolagsdata.get("Andel av portfölj (%)", 0)), step=0.01)
-        senast_uppdaterad = datetime.today().strftime("%Y-%m-%d")
+        sparaknapp = st.form_submit_button("💾 Spara")
 
-        submitted = st.form_submit_button("Spara")
-
-    if submitted:
+    if sparaknapp and ticker:
         ny_rad = {
-            "Ticker": ticker,
-            "Bolagsnamn": namn,
-            "Aktuell kurs": aktuell_kurs,
-            "Målkurs 2025": mål_2025,
-            "Målkurs 2026": mål_2026,
-            "P/S Q1": p_s_q1,
-            "P/S rullande": p_s_rullande,
-            "Omsättning (miljoner USD)": omsättning,
-            "Andel av portfölj (%)": portföljandel,
-            "Senast uppdaterad": senast_uppdaterad
+            "Ticker": ticker, "Bolagsnamn": namn, "Aktuell kurs": kurs, "Utestående aktier": aktier, "Antal aktier": antal_aktier,
+            "P/S": ps_idag, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
+            "Omsättning idag": oms_idag, "Omsättning nästa år": oms_1, "Omsättning om 2 år": oms_2, "Omsättning om 3 år": oms_3
         }
 
-        df = df[df["Ticker"] != ticker]
-        df = pd.concat([df, pd.DataFrame([ny_rad])], ignore_index=True)
-        save_data(df)
-        st.success(f"{ticker} har sparats.")
+        if ticker in df["Ticker"].values:
+            df.loc[df["Ticker"] == ticker, ny_rad.keys()] = ny_rad.values()
+            st.success(f"{ticker} uppdaterat.")
+        else:
+            df = pd.concat([df, pd.DataFrame([ny_rad])], ignore_index=True)
+            st.success(f"{ticker} tillagt.")
+    return df
 
-def visa_databas(df):
-    st.header("📋 Bolagsdatabas")
-    if not df.empty:
-        st.dataframe(df)
+def visa_investeringsforslag(df, valutakurs):
+    st.subheader("💡 Investeringsförslag")
+    kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=10000.0, step=500.0)
+
+    df = df[df["Riktkurs 2026"] > df["Aktuell kurs"]]
+    df["Potential"] = df["Riktkurs 2026"] - df["Aktuell kurs"]
+    df = df.sort_values(by="Potential", ascending=False)
+
+    if valutakurs == 0:
+        st.warning("Valutakursen får inte vara 0.")
+        return
+
+    kapital_usd = kapital_sek / valutakurs
+    for _, rad in df.iterrows():
+        if rad["Aktuell kurs"] <= 0:
+            continue
+        antal = int(kapital_usd // rad["Aktuell kurs"])
+        if antal > 0:
+            total_sek = antal * rad["Aktuell kurs"] * valutakurs
+            st.markdown(f"Köp **{antal} st {rad['Ticker']}** för ca **{round(total_sek,2)} SEK**")
+            break
     else:
-        st.info("Databasen är tom.")
+        st.info("Inga bolag matchar kriterierna just nu.")
+
+def visa_portfolj(df, valutakurs):
+    st.subheader("📦 Min portfölj")
+    df = df[df["Antal aktier"] > 0].copy()
+    if df.empty:
+        st.info("Du äger inga aktier.")
+        return
+    df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
+    df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
+    st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
 
 def main():
-    st.set_page_config(page_title="Investeringsanalys", layout="wide")
-    st.title("📊 Aktieanalys & Investeringsförslag")
+    st.title("📊 Aktieanalys och investeringsförslag")
+    df = hamta_data()
+    df = säkerställ_kolumner(df)
+    df = konvertera_typer(df)
 
-    inställningar = load_settings()
-    max_andel = inställningar.get("Max portföljandel (%)", 20)
-    max_högrisk = inställningar.get("Max högriskandel (%)", 2)
-    valutakurs = inställningar.get("Valutakurs", 10)
+    valutakurs = st.sidebar.number_input("Valutakurs USD → SEK", value=10.0, step=0.1)
 
-    # Sidopanel – justerbara inställningar
-    st.sidebar.header("⚙️ Inställningar")
-    valutakurs = st.sidebar.number_input("Valutakurs (USD → SEK)", value=valutakurs, step=0.01)
-    max_andel = st.sidebar.number_input("Max portföljandel (%)", value=max_andel, step=1)
-    max_högrisk = st.sidebar.number_input("Max högriskandel (%)", value=max_högrisk, step=0.1)
-
-    if st.sidebar.button("💾 Spara inställningar"):
-        save_settings({
-            "Valutakurs": valutakurs,
-            "Max portföljandel (%)": max_andel,
-            "Max högriskandel (%)": max_högrisk,
-        })
-        st.sidebar.success("Inställningar sparade.")
-
-    # Läs datan
-    df = load_data()
-    df = konvertera_till_ratt_typ(df)
-
-    # Menyval
-    menyval = st.sidebar.radio(
-        "Välj vy",
-        ["📈 Investeringsförslag", "🧮 Lägg till / uppdatera bolag", "📋 Databasen", "⚙️ Inställningar"]
-    )
-
-    # Visa vald vy
-    if menyval == "📈 Investeringsförslag":
-        visa_investeringsrad(df, valutakurs, {
-            "Max portföljandel (%)": max_andel,
-            "Max högriskandel (%)": max_högrisk
-        })
-    elif menyval == "🧮 Lägg till / uppdatera bolag":
-        lagg_till_eller_uppdatera_bolag(df)
-    elif menyval == "📋 Databasen":
-        visa_databas(df)
-    elif menyval == "⚙️ Inställningar":
-        st.subheader("⚙️ Nuvarande inställningar")
-        st.write(pd.DataFrame.from_dict(inställningar, orient="index", columns=["Värde"]))
+    meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
+    if meny == "Analys":
+        df = uppdatera_berakningar(df)
+        st.dataframe(df, use_container_width=True)
+    elif meny == "Lägg till / uppdatera bolag":
+        df = lagg_till_eller_uppdatera(df)
+        spara_data(df)
+    elif meny == "Investeringsförslag":
+        df = uppdatera_berakningar(df)
+        visa_investeringsforslag(df, valutakurs)
+    elif meny == "Portfölj":
+        visa_portfolj(df, valutakurs)
 
 if __name__ == "__main__":
     main()

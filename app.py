@@ -226,7 +226,7 @@ def main():
     df = konvertera_typer(df)
 
     inställningar = las_inställningar()
-    visa_sidopanel(df, inställningar)
+    skriv_sidopanel(inställningar)  # FIX: använd rätt funktion
 
     meny = st.sidebar.radio("Navigera", [
         "Analys",

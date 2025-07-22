@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import gspread
-from google.oauth2.service_account import Credentials
 import yfinance as yf
+import time
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
@@ -14,12 +15,10 @@ credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIA
 client = gspread.authorize(credentials)
 
 def skapa_koppling():
-    sheet = client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
-    return sheet
+    return client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
 
 def hamta_data():
-    sheet = skapa_koppling()
-    data = sheet.get_all_records()
+    data = skapa_koppling().get_all_records()
     return pd.DataFrame(data)
 
 def spara_data(df):
@@ -65,24 +64,19 @@ def uppdatera_berakningar(df):
 
 def hamta_kurs_och_valuta(ticker):
     try:
-        data = yf.Ticker(ticker)
-        info = data.info
-        pris = info.get("currentPrice") or info.get("regularMarketPrice")
-        valuta = info.get("currency", "USD")
-        if pris is None:
-            return None, None
-        return pris, valuta
+        info = yf.Ticker(ticker).info
+        return info.get("regularMarketPrice", None), info.get("currency", "USD")
     except Exception:
-        return None, None
+        return None, "USD"
 
-def hamta_valutakurs(fran_valuta):
-    try:
-        if fran_valuta == "USD":
-            return 1.0
-        valutapar = f"{fran_valuta}USD=X"
-        kursinfo = yf.Ticker(valutapar).info
-        return kursinfo.get("regularMarketPrice", 1.0)
-    except Exception:
+def hamta_valutakurs(valuta):
+    if valuta == "USD":
+        return 1.0
+    elif valuta == "NOK":
+        return 0.093
+    elif valuta == "CAD":
+        return 0.74
+    else:
         return 1.0
 
 def lagg_till_eller_uppdatera(df):
@@ -165,10 +159,10 @@ def lagg_till_eller_uppdatera(df):
             st.success(f"{ticker} tillagt.")
     return df
 
+
 def visa_investeringsforslag(df, valutakurs):
     st.subheader("💡 Investeringsförslag")
     kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=10000.0, step=500.0)
-
     riktkurs_val = st.selectbox("Välj riktkurs att basera förslagen på:", ["Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028"])
 
     df_portfolj = df[df["Antal aktier"] > 0].copy()
@@ -234,6 +228,8 @@ def visa_portfolj(df, valutakurs):
     st.markdown(f"### 💰 Totalt portföljvärde: {totalt:,.2f} SEK")
     st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
 
+import time
+
 def analysvy(df):
     st.subheader("📈 Analysläge")
     df = uppdatera_berakningar(df)
@@ -241,22 +237,30 @@ def analysvy(df):
     if st.button("🔄 Uppdatera alla aktuella kurser från Yahoo"):
         misslyckade = []
         uppdaterade = 0
+        total = len(df)
+        status = st.empty()
 
-        for i, rad in df.iterrows():
-            ticker = str(rad["Ticker"]).strip().upper()
-            try:
-                pris, valuta = hamta_kurs_och_valuta(ticker)
-                if pris is None:
+        with st.spinner("Uppdaterar kurser..."):
+            for i, row in df.iterrows():
+                ticker = str(row["Ticker"]).strip().upper()
+                status.text(f"🔄 Uppdaterar {i+1} av {total} tickers... ({ticker})")
+
+                try:
+                    pris, valuta = hamta_kurs_och_valuta(ticker)
+                    if pris is None:
+                        misslyckade.append(ticker)
+                        continue
+                    växelkurs = hamta_valutakurs(valuta)
+                    kurs_usd = pris * växelkurs
+                    df.at[i, "Aktuell kurs"] = round(kurs_usd, 2)
+                    uppdaterade += 1
+                except Exception:
                     misslyckade.append(ticker)
-                    continue
-                växelkurs = hamta_valutakurs(valuta)
-                kurs_usd = pris * växelkurs
-                df.at[i, "Aktuell kurs"] = round(kurs_usd, 2)
-                uppdaterade += 1
-            except Exception:
-                misslyckade.append(ticker)
+
+                time.sleep(2)  # Paus mellan varje anrop
 
         spara_data(df)
+        status.text("✅ Uppdatering slutförd.")
         st.success(f"{uppdaterade} tickers uppdaterade.")
         if misslyckade:
             st.warning("Kunde inte uppdatera följande tickers:\n" + ", ".join(misslyckade))
@@ -284,6 +288,7 @@ def main():
     elif meny == "Portfölj":
         df = uppdatera_berakningar(df)
         visa_portfolj(df, valutakurs)
+
 
 if __name__ == "__main__":
     main()

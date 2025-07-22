@@ -7,10 +7,6 @@ import yfinance as yf
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
-# ---------------------------------------
-# KONFIGURATION OCH GOOGLE SHEETS
-# ---------------------------------------
-
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -91,13 +87,33 @@ def hamta_valutakurs(fran_valuta):
 
 def lagg_till_eller_uppdatera(df):
     st.subheader("➕ Lägg till / uppdatera bolag")
-    tickers = df["Ticker"].astype(str).str.upper().str.strip().tolist()
-    valt = st.selectbox("Välj existerande bolag att uppdatera (eller lämna tom för nytt)", [""] + tickers)
+
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    df["Bolagsnamn"] = df["Bolagsnamn"].astype(str).str.strip()
+    alternativ = sorted([f"{namn} ({ticker})" for namn, ticker in zip(df["Bolagsnamn"], df["Ticker"])])
+
+    valt = st.selectbox("Välj existerande bolag att uppdatera (eller lämna tom för nytt)", [""] + alternativ)
 
     if valt:
-        befintlig = df[df["Ticker"].str.upper().str.strip() == valt].iloc[0]
+        ticker_vald = valt.split("(")[-1].replace(")", "").strip()
+        befintlig = df[df["Ticker"] == ticker_vald].iloc[0]
     else:
-        befintlig = {}
+        befintlig = {
+            "Ticker": "",
+            "Bolagsnamn": "",
+            "Aktuell kurs": 0.0,
+            "Utestående aktier": 0.0,
+            "Antal aktier": 0.0,
+            "P/S": 0.0,
+            "P/S Q1": 0.0,
+            "P/S Q2": 0.0,
+            "P/S Q3": 0.0,
+            "P/S Q4": 0.0,
+            "Omsättning idag": 0.0,
+            "Omsättning nästa år": 0.0,
+            "Omsättning om 2 år": 0.0,
+            "Omsättning om 3 år": 0.0
+        }
 
     with st.form("form"):
         ticker = st.text_input("Ticker (Yahoo Finance-format)", value=befintlig.get("Ticker", "")).upper()
@@ -204,6 +220,7 @@ def visa_investeringsforslag(df, valutakurs):
     if st.button("➡️ Nästa förslag"):
         st.session_state.forslags_index += 1
 
+
 def visa_portfolj(df, valutakurs):
     st.subheader("📦 Min portfölj")
     df = df[df["Antal aktier"] > 0].copy()
@@ -211,8 +228,41 @@ def visa_portfolj(df, valutakurs):
         st.info("Du äger inga aktier.")
         return
     df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
-    df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
+    totalt = df["Värde (SEK)"].sum()
+    df["Andel (%)"] = round(df["Värde (SEK)"] / totalt * 100, 2)
+
+    st.markdown(f"### 💰 Totalt portföljvärde: {totalt:,.2f} SEK")
     st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
+
+def analysvy(df):
+    st.subheader("📈 Analysläge")
+    df = uppdatera_berakningar(df)
+
+    if st.button("🔄 Uppdatera alla aktuella kurser från Yahoo"):
+        misslyckade = []
+        uppdaterade = 0
+
+        for i, rad in df.iterrows():
+            ticker = str(rad["Ticker"]).strip().upper()
+            try:
+                pris, valuta = hamta_kurs_och_valuta(ticker)
+                if pris is None:
+                    misslyckade.append(ticker)
+                    continue
+                växelkurs = hamta_valutakurs(valuta)
+                kurs_usd = pris * växelkurs
+                df.at[i, "Aktuell kurs"] = round(kurs_usd, 2)
+                uppdaterade += 1
+            except Exception:
+                misslyckade.append(ticker)
+
+        spara_data(df)
+        st.success(f"{uppdaterade} tickers uppdaterade.")
+        if misslyckade:
+            st.warning("Kunde inte uppdatera följande tickers:\n" + ", ".join(misslyckade))
+
+    st.dataframe(df, use_container_width=True)
+
 
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
@@ -224,8 +274,7 @@ def main():
     meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
 
     if meny == "Analys":
-        df = uppdatera_berakningar(df)
-        st.dataframe(df, use_container_width=True)
+        analysvy(df)
     elif meny == "Lägg till / uppdatera bolag":
         df = lagg_till_eller_uppdatera(df)
         spara_data(df)

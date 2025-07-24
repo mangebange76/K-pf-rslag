@@ -89,25 +89,25 @@ def lagg_till_eller_uppdatera(df):
         ticker_vald = namn_map[valt]
         befintlig = df[df["Ticker"] == ticker_vald].iloc[0]
     else:
-        befintlig = {}
+        befintlig = pd.Series(dtype=object)
 
     with st.form("form"):
-        ticker = st.text_input("Ticker", value=befintlig.get("Ticker", "") if befintlig else "").upper()
-        namn = st.text_input("Bolagsnamn", value=befintlig.get("Bolagsnamn", "") if befintlig else "")
-        kurs = st.number_input("Aktuell kurs (USD)", value=float(befintlig.get("Aktuell kurs", 0.0)) if befintlig else 0.0)
-        aktier = st.number_input("Utestående aktier (miljoner)", value=float(befintlig.get("Utestående aktier", 0.0)) if befintlig else 0.0)
-        antal_aktier = st.number_input("Antal aktier du äger", value=float(befintlig.get("Antal aktier", 0.0)) if befintlig else 0.0)
+        ticker = st.text_input("Ticker", value=befintlig.get("Ticker", "") if not befintlig.empty else "").upper()
+        namn = st.text_input("Bolagsnamn", value=befintlig.get("Bolagsnamn", "") if not befintlig.empty else "")
+        kurs = st.number_input("Aktuell kurs (USD)", value=float(befintlig.get("Aktuell kurs", 0.0)) if not befintlig.empty else 0.0)
+        aktier = st.number_input("Utestående aktier (miljoner)", value=float(befintlig.get("Utestående aktier", 0.0)) if not befintlig.empty else 0.0)
+        antal_aktier = st.number_input("Antal aktier du äger", value=float(befintlig.get("Antal aktier", 0.0)) if not befintlig.empty else 0.0)
 
-        ps_idag = st.number_input("P/S idag", value=float(befintlig.get("P/S", 0.0)) if befintlig else 0.0)
-        ps1 = st.number_input("P/S Q1", value=float(befintlig.get("P/S Q1", 0.0)) if befintlig else 0.0)
-        ps2 = st.number_input("P/S Q2", value=float(befintlig.get("P/S Q2", 0.0)) if befintlig else 0.0)
-        ps3 = st.number_input("P/S Q3", value=float(befintlig.get("P/S Q3", 0.0)) if befintlig else 0.0)
-        ps4 = st.number_input("P/S Q4", value=float(befintlig.get("P/S Q4", 0.0)) if befintlig else 0.0)
+        ps_idag = st.number_input("P/S idag", value=float(befintlig.get("P/S", 0.0)) if not befintlig.empty else 0.0)
+        ps1 = st.number_input("P/S Q1", value=float(befintlig.get("P/S Q1", 0.0)) if not befintlig.empty else 0.0)
+        ps2 = st.number_input("P/S Q2", value=float(befintlig.get("P/S Q2", 0.0)) if not befintlig.empty else 0.0)
+        ps3 = st.number_input("P/S Q3", value=float(befintlig.get("P/S Q3", 0.0)) if not befintlig.empty else 0.0)
+        ps4 = st.number_input("P/S Q4", value=float(befintlig.get("P/S Q4", 0.0)) if not befintlig.empty else 0.0)
 
-        oms_idag = st.number_input("Omsättning idag (miljoner USD)", value=float(befintlig.get("Omsättning idag", 0.0)) if befintlig else 0.0)
-        oms_1 = st.number_input("Omsättning nästa år", value=float(befintlig.get("Omsättning nästa år", 0.0)) if befintlig else 0.0)
-        oms_2 = st.number_input("Omsättning om 2 år", value=float(befintlig.get("Omsättning om 2 år", 0.0)) if befintlig else 0.0)
-        oms_3 = st.number_input("Omsättning om 3 år", value=float(befintlig.get("Omsättning om 3 år", 0.0)) if befintlig else 0.0)
+        oms_idag = st.number_input("Omsättning idag (miljoner USD)", value=float(befintlig.get("Omsättning idag", 0.0)) if not befintlig.empty else 0.0)
+        oms_1 = st.number_input("Omsättning nästa år", value=float(befintlig.get("Omsättning nästa år", 0.0)) if not befintlig.empty else 0.0)
+        oms_2 = st.number_input("Omsättning om 2 år", value=float(befintlig.get("Omsättning om 2 år", 0.0)) if not befintlig.empty else 0.0)
+        oms_3 = st.number_input("Omsättning om 3 år", value=float(befintlig.get("Omsättning om 3 år", 0.0)) if not befintlig.empty else 0.0)
 
         sparaknapp = st.form_submit_button("💾 Spara")
 

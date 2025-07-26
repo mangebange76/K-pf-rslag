@@ -81,9 +81,8 @@ def hamta_valutakurs(valuta):
 
 def lagg_till_eller_uppdatera(df):
     st.subheader("➕ Lägg till / uppdatera bolag")
-    tickers = df["Ticker"].tolist()
-    namn_map = {f"{row['Bolagsnamn']} ({row['Ticker']})": row['Ticker'] for _, row in df.iterrows()}
-    valt = st.selectbox("Välj existerande bolag att uppdatera (eller lämna tom för nytt)", [""] + list(namn_map.keys()))
+    namn_map = {f"{rad['Bolagsnamn']} ({rad['Ticker']})": rad['Ticker'] for _, rad in df.iterrows()}
+    valt = st.selectbox("Välj bolag att uppdatera (eller lämna tom för nytt)", [""] + sorted(namn_map.keys()))
 
     if valt:
         ticker_vald = namn_map[valt]
@@ -126,66 +125,68 @@ def lagg_till_eller_uppdatera(df):
             st.success(f"{ticker} tillagt.")
     return df
 
-
 def visa_investeringsforslag(df, valutakurs):
     st.subheader("💡 Investeringsförslag")
-    kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=10000.0, step=500.0)
+    kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=500.0, step=500.0)
+    filterval = st.radio("Visa förslag för:", ["Alla bolag", "Endast portföljen"])
 
-    visningsläge = st.radio("Visa förslag från:", ["Alla bolag", "Endast portföljens innehav"])
+    df_portfolj = df[df["Antal aktier"] > 0].copy()
+    df_portfolj["Värde (SEK)"] = df_portfolj["Antal aktier"] * df_portfolj["Aktuell kurs"] * valutakurs
+    portfoljvarde = df_portfolj["Värde (SEK)"].sum()
 
-    df = df.copy()
-    df["Potential (%)"] = ((df["Riktkurs 2026"] - df["Aktuell kurs"]) / df["Aktuell kurs"]) * 100
-    df = df[df["Potential (%)"] > 0]
-    df = df.sort_values(by="Potential (%)", ascending=False).reset_index(drop=True)
+    if filterval == "Endast portföljen":
+        df_forslag = df_portfolj[df_portfolj["Riktkurs 2026"] > df_portfolj["Aktuell kurs"]].copy()
+    else:
+        df_forslag = df[df["Riktkurs 2026"] > df["Aktuell kurs"]].copy()
 
-    if visningsläge == "Endast portföljens innehav":
-        df = df[df["Antal aktier"] > 0].copy()
+    df_forslag["Potential (%)"] = ((df_forslag["Riktkurs 2026"] - df_forslag["Aktuell kurs"]) / df_forslag["Aktuell kurs"]) * 100
+    df_forslag = df_forslag.sort_values(by="Potential (%)", ascending=False).reset_index(drop=True)
 
     if valutakurs == 0:
         st.warning("Valutakursen får inte vara 0.")
         return
 
-    if df.empty:
-        st.info("Inga bolag matchar kriterierna.")
-        return
+    kapital_usd = kapital_sek / valutakurs
 
     if 'forslags_index' not in st.session_state:
         st.session_state.forslags_index = 0
 
+    if df_forslag.empty:
+        st.info("Inga bolag matchar kriterierna just nu.")
+        return
+
     index = st.session_state.forslags_index
-    if index >= len(df):
+    if index >= len(df_forslag):
         st.info("Inga fler förslag att visa.")
         return
 
-    rad = df.iloc[index]
-    kapital_usd = kapital_sek / valutakurs
-
+    rad = df_forslag.iloc[index]
     if rad["Aktuell kurs"] <= 0:
-        st.warning(f"Felaktig aktiekurs för {rad['Ticker']} – kan inte visa förslag.")
+        st.warning("Felaktig aktiekurs – kan inte visa förslag.")
         return
 
     antal = int(kapital_usd // rad["Aktuell kurs"])
-    total_sek = antal * rad["Aktuell kurs"] * valutakurs
+    investering_sek = antal * rad["Aktuell kurs"] * valutakurs
 
-    df_portfolj = df[df["Antal aktier"] > 0].copy()
-    df_portfolj["Värde (SEK)"] = df_portfolj["Antal aktier"] * df_portfolj["Aktuell kurs"] * valutakurs
-    portfoljvarde = df_portfolj["Värde (SEK)"].sum()
-    andel_procent = round((total_sek / portfoljvarde) * 100, 2) if portfoljvarde > 0 else 0
+    nuvarande_innehav = df_portfolj[df_portfolj["Ticker"] == rad["Ticker"]]["Värde (SEK)"].sum()
+    ny_total = nuvarande_innehav + investering_sek
+    nuvarande_andel = round((nuvarande_innehav / portfoljvarde) * 100, 2) if portfoljvarde > 0 else 0
+    ny_andel = round((ny_total / portfoljvarde) * 100, 2) if portfoljvarde > 0 else 0
 
     st.markdown(f"""
-        ### 💰 Förslag {index+1} av {len(df)}
+        ### 💰 Förslag {index+1} av {len(df_forslag)}
         - **Bolag:** {rad['Bolagsnamn']} ({rad['Ticker']})
         - **Aktuell kurs:** {round(rad['Aktuell kurs'], 2)} USD
         - **Riktkurs 2026:** {round(rad['Riktkurs 2026'], 2)} USD
         - **Potential:** {round(rad['Potential (%)'], 2)}%
         - **Antal att köpa:** {antal} st
-        - **Beräknad investering:** {round(total_sek, 2)} SEK
-        - **Andel av nuvarande portföljvärde:** {andel_procent}%
+        - **Beräknad investering:** {round(investering_sek, 2)} SEK
+        - **Nuvarande andel i portföljen:** {nuvarande_andel}%
+        - **Andel efter köp:** {ny_andel}%
     """)
 
     if st.button("➡️ Nästa förslag"):
         st.session_state.forslags_index += 1
-
 
 def visa_portfolj(df, valutakurs):
     st.subheader("📦 Min portfölj")
@@ -195,8 +196,9 @@ def visa_portfolj(df, valutakurs):
         return
     df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
     df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
+    total = df["Värde (SEK)"].sum()
+    st.markdown(f"**Totalt portföljvärde:** {round(total, 2)} SEK")
     st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
-    st.markdown(f"**Totalt portföljvärde:** {round(df['Värde (SEK)'].sum(), 2)} SEK")
 
 import time
 

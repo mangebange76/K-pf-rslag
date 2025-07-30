@@ -202,10 +202,17 @@ def visa_portfolj(df, valutakurser):
         return
 
     df["Valuta"] = df["Valuta"].fillna("USD")
-    df["Växelkurs"] = df["Valuta"].apply(lambda x: valutakurser.get(x, 1.0))
+    df["Växelkurs"] = df["Valuta"].map(valutakurser).fillna(1.0)
     df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * df["Växelkurs"]
     df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
     total = df["Värde (SEK)"].sum()
+
+    # Utdelning
+    if "Årlig utdelning" in df.columns:
+        df["Årlig utdelning (SEK)"] = df["Årlig utdelning"] * df["Antal aktier"] * df["Växelkurs"]
+        total_utdelning = df["Årlig utdelning (SEK)"].sum()
+        st.markdown(f"**Total årlig utdelning:** {round(total_utdelning, 2)} SEK")
+        st.markdown(f"**Förväntad månadsutdelning (snitt):** {round(total_utdelning/12, 2)} SEK")
 
     st.markdown(f"**Totalt portföljvärde:** {round(total, 2)} SEK")
     st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Valuta", "Värde (SEK)", "Andel (%)"]], use_container_width=True)

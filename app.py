@@ -254,6 +254,41 @@ def visa_portfolj(df, valutakurser):
     st.success(f"**Förväntad årlig utdelning:** {round(total_utdelning, 2)} SEK  \n**Månadsutdelning (snitt):** {round(månadsutdelning, 2)} SEK")
 
     st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Valuta", "Värde (SEK)", "Årlig utdelning (SEK)", "Andel (%)"]], use_container_width=True)
+   import time
+import yfinance as yf
+
+def uppdatera_kurser(df):
+    st.subheader("🔄 Uppdatera aktiekurser automatiskt")
+    
+    yahoo_tickers = df["Yahoo-ticker"].fillna("")
+    tickers_att_använda = [
+        yt if yt.strip() else df.loc[i, "Ticker"]
+        for i, yt in enumerate(yahoo_tickers)
+    ]
+
+    misslyckade = []
+    total = len(tickers_att_använda)
+
+    with st.spinner("Hämtar kurser..."):
+        for i, (idx, ticker) in enumerate(zip(df.index, tickers_att_använda)):
+            try:
+                aktie = yf.Ticker(ticker)
+                pris = aktie.info.get("currentPrice", None)
+                if pris is None or not isinstance(pris, (int, float)):
+                    misslyckade.append(ticker)
+                    continue
+                df.at[idx, "Aktuell kurs"] = pris
+            except Exception:
+                misslyckade.append(ticker)
+                continue
+            time.sleep(2)
+            st.progress((i+1)/total)
+
+    st.success("✅ Kurser uppdaterade.")
+    if misslyckade:
+        st.warning(f"Kunde inte uppdatera {len(misslyckade)} tickers: {', '.join(misslyckade)}")
+    
+    return df 
 
 # -------------------------------------
 # MAIN-KÖRNING

@@ -39,13 +39,18 @@ def konvertera_typer(df):
 
 def säkerställ_kolumner(df):
     nödvändiga = [
-        "Ticker", "Bolagsnamn", "Aktuell kurs", "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "Ticker", "Bolagsnamn", "Valuta", "Aktuell kurs", "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
         "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
         "P/S-snitt", "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028", "Antal aktier"
     ]
     for kol in nödvändiga:
         if kol not in df.columns:
-            df[kol] = 0.0 if "kurs" in kol.lower() or "omsättning" in kol.lower() or "p/s" in kol.lower() else ""
+            if kol == "Valuta":
+                df[kol] = "USD"
+            elif kol in ["Ticker", "Bolagsnamn"]:
+                df[kol] = ""
+            else:
+                df[kol] = 0.0
     return df
 
 def uppdatera_berakningar(df):
@@ -69,15 +74,8 @@ def hamta_kurs_och_valuta(ticker):
     except Exception:
         return None, "USD"
 
-def hamta_valutakurs(valuta):
-    if valuta == "USD":
-        return 1.0
-    elif valuta == "NOK":
-        return 0.093
-    elif valuta == "CAD":
-        return 0.74
-    else:
-        return 1.0
+def hamta_valutakurs(valuta, valutakurser):
+    return valutakurser.get(valuta, 1.0)
 
 def lagg_till_eller_uppdatera(df):
     st.subheader("➕ Lägg till / uppdatera bolag")
@@ -93,7 +91,10 @@ def lagg_till_eller_uppdatera(df):
     with st.form("form"):
         ticker = st.text_input("Ticker", value=befintlig.get("Ticker", "") if not befintlig.empty else "").upper()
         namn = st.text_input("Bolagsnamn", value=befintlig.get("Bolagsnamn", "") if not befintlig.empty else "")
-        kurs = st.number_input("Aktuell kurs (USD)", value=float(befintlig.get("Aktuell kurs", 0.0)) if not befintlig.empty else 0.0)
+        valuta = st.selectbox("Valuta (där aktien handlas)", ["USD", "NOK", "CAD", "SEK", "EUR"], 
+                              index=0 if befintlig.empty else ["USD", "NOK", "CAD", "SEK", "EUR"].index(befintlig.get("Valuta", "USD")))
+
+        kurs = st.number_input("Aktuell kurs (i lokal valuta)", value=float(befintlig.get("Aktuell kurs", 0.0)) if not befintlig.empty else 0.0)
         aktier = st.number_input("Utestående aktier (miljoner)", value=float(befintlig.get("Utestående aktier", 0.0)) if not befintlig.empty else 0.0)
         antal_aktier = st.number_input("Antal aktier du äger", value=float(befintlig.get("Antal aktier", 0.0)) if not befintlig.empty else 0.0)
 
@@ -112,7 +113,7 @@ def lagg_till_eller_uppdatera(df):
 
     if sparaknapp and ticker:
         ny_rad = {
-            "Ticker": ticker, "Bolagsnamn": namn, "Aktuell kurs": kurs, "Utestående aktier": aktier, "Antal aktier": antal_aktier,
+            "Ticker": ticker, "Bolagsnamn": namn, "Valuta": valuta, "Aktuell kurs": kurs, "Utestående aktier": aktier, "Antal aktier": antal_aktier,
             "P/S": ps_idag, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
             "Omsättning idag": oms_idag, "Omsättning nästa år": oms_1, "Omsättning om 2 år": oms_2, "Omsättning om 3 år": oms_3
         }
@@ -125,7 +126,91 @@ def lagg_till_eller_uppdatera(df):
             st.success(f"{ticker} tillagt.")
     return df
 
-def visa_investeringsforslag(df, valutakurs):
+def analysvy(df, valutakurser):
+    st.subheader("📈 Analysläge")
+    df = uppdatera_berakningar(df)
+
+    if st.button("🔄 Uppdatera alla aktuella kurser från Yahoo"):
+        misslyckade = []
+        uppdaterade = 0
+        total = len(df)
+        status = st.empty()
+        progress = st.progress(0)
+
+        with st.spinner("Uppdaterar kurser..."):
+            for i, row in df.iterrows():
+                ticker = str(row["Ticker"]).strip().upper()
+                status.text(f"🔄 {i + 1}/{total} — {ticker}")
+                try:
+                    pris, valuta = hamta_kurs_och_valuta(ticker)
+                    if pris is None:
+                        misslyckade.append(ticker)
+                        continue
+                    df.at[i, "Aktuell kurs"] = round(pris, 2)
+                    df.at[i, "Valuta"] = valuta
+                    uppdaterade += 1
+                except Exception:
+                    misslyckade.append(ticker)
+
+                progress.progress((i + 1) / total)
+                time.sleep(2)  # för att undvika blockering
+
+        spara_data(df)
+        status.text("✅ Uppdatering slutförd.")
+        st.success(f"{uppdaterade} tickers uppdaterade.")
+        if misslyckade:
+            st.warning("Kunde inte uppdatera följande tickers:\n" + ", ".join(misslyckade))
+
+    st.dataframe(df, use_container_width=True)
+
+def main():
+    st.title("📊 Aktieanalys och investeringsförslag")
+    df = hamta_data()
+    df = säkerställ_kolumner(df)
+    df = konvertera_typer(df)
+
+    st.sidebar.header("📉 Växelkurser (till SEK)")
+    valutakurser = {
+        "USD": st.sidebar.number_input("USD → SEK", value=10.0, step=0.1),
+        "NOK": st.sidebar.number_input("NOK → SEK", value=0.93, step=0.01),
+        "CAD": st.sidebar.number_input("CAD → SEK", value=7.4, step=0.1),
+        "EUR": st.sidebar.number_input("EUR → SEK", value=11.0, step=0.1)
+    }
+
+    meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
+
+    if meny == "Analys":
+        analysvy(df, valutakurser)
+    elif meny == "Lägg till / uppdatera bolag":
+        df = lagg_till_eller_uppdatera(df)
+        spara_data(df)
+    elif meny == "Investeringsförslag":
+        df = uppdatera_berakningar(df)
+        visa_investeringsforslag(df, valutakurser)
+    elif meny == "Portfölj":
+        df = uppdatera_berakningar(df)
+        visa_portfolj(df, valutakurser)
+
+if __name__ == "__main__":
+    main()
+
+def visa_portfolj(df, valutakurser):
+    st.subheader("📦 Min portfölj")
+    df = df[df["Antal aktier"] > 0].copy()
+    if df.empty:
+        st.info("Du äger inga aktier.")
+        return
+
+    df["Valuta"] = df["Valuta"].fillna("USD")
+    df["Växelkurs"] = df["Valuta"].apply(lambda x: valutakurser.get(x, 1.0))
+    df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * df["Växelkurs"]
+    df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
+    total = df["Värde (SEK)"].sum()
+
+    st.markdown(f"**Totalt portföljvärde:** {round(total, 2)} SEK")
+    st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Valuta", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
+
+def visa_investeringsforslag(df, valutakurser):
     st.subheader("💡 Investeringsförslag")
     kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=500.0, step=500.0)
 
@@ -137,8 +222,11 @@ def visa_investeringsforslag(df, valutakurs):
 
     filterval = st.radio("Visa förslag för:", ["Alla bolag", "Endast portföljen"])
 
+    df["Valuta"] = df["Valuta"].fillna("USD")
+    df["Växelkurs"] = df["Valuta"].apply(lambda x: valutakurser.get(x, 1.0))
+
     df_portfolj = df[df["Antal aktier"] > 0].copy()
-    df_portfolj["Värde (SEK)"] = df_portfolj["Antal aktier"] * df_portfolj["Aktuell kurs"] * valutakurs
+    df_portfolj["Värde (SEK)"] = df_portfolj["Antal aktier"] * df_portfolj["Aktuell kurs"] * df_portfolj["Växelkurs"]
     portfoljvarde = df_portfolj["Värde (SEK)"].sum()
 
     if filterval == "Endast portföljen":
@@ -149,18 +237,12 @@ def visa_investeringsforslag(df, valutakurs):
     df_forslag["Potential (%)"] = ((df_forslag[riktkurs_val] - df_forslag["Aktuell kurs"]) / df_forslag["Aktuell kurs"]) * 100
     df_forslag = df_forslag.sort_values(by="Potential (%)", ascending=False).reset_index(drop=True)
 
-    if valutakurs == 0:
-        st.warning("Valutakursen får inte vara 0.")
-        return
-
-    kapital_usd = kapital_sek / valutakurs
-
-    if 'forslags_index' not in st.session_state:
-        st.session_state.forslags_index = 0
-
     if df_forslag.empty:
         st.info("Inga bolag matchar kriterierna just nu.")
         return
+
+    if 'forslags_index' not in st.session_state:
+        st.session_state.forslags_index = 0
 
     index = st.session_state.forslags_index
     if index >= len(df_forslag):
@@ -168,12 +250,15 @@ def visa_investeringsforslag(df, valutakurs):
         return
 
     rad = df_forslag.iloc[index]
+    växelkurs = rad["Växelkurs"]
+    kapital_usd = kapital_sek / växelkurs
+
     if rad["Aktuell kurs"] <= 0:
         st.warning("Felaktig aktiekurs – kan inte visa förslag.")
         return
 
     antal = int(kapital_usd // rad["Aktuell kurs"])
-    investering_sek = antal * rad["Aktuell kurs"] * valutakurs
+    investering_sek = antal * rad["Aktuell kurs"] * växelkurs
 
     nuvarande_innehav = df_portfolj[df_portfolj["Ticker"] == rad["Ticker"]]["Värde (SEK)"].sum()
     ny_total = nuvarande_innehav + investering_sek
@@ -183,8 +268,8 @@ def visa_investeringsforslag(df, valutakurs):
     st.markdown(f"""
         ### 💰 Förslag {index+1} av {len(df_forslag)}
         - **Bolag:** {rad['Bolagsnamn']} ({rad['Ticker']})
-        - **Aktuell kurs:** {round(rad['Aktuell kurs'], 2)} USD
-        - **{riktkurs_val}:** {round(rad[riktkurs_val], 2)} USD
+        - **Aktuell kurs:** {round(rad['Aktuell kurs'], 2)} {rad['Valuta']}
+        - **{riktkurs_val}:** {round(rad[riktkurs_val], 2)} {rad['Valuta']}
         - **Potential:** {round(rad['Potential (%)'], 2)}%
         - **Antal att köpa:** {antal} st
         - **Beräknad investering:** {round(investering_sek, 2)} SEK
@@ -194,80 +279,3 @@ def visa_investeringsforslag(df, valutakurs):
 
     if st.button("➡️ Nästa förslag"):
         st.session_state.forslags_index += 1
-
-def visa_portfolj(df, valutakurs):
-    st.subheader("📦 Min portfölj")
-    df = df[df["Antal aktier"] > 0].copy()
-    if df.empty:
-        st.info("Du äger inga aktier.")
-        return
-    df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
-    df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
-    total = df["Värde (SEK)"].sum()
-    st.markdown(f"**Totalt portföljvärde:** {round(total, 2)} SEK")
-    st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
-
-import time
-
-def analysvy(df):
-    st.subheader("📈 Analysläge")
-    df = uppdatera_berakningar(df)
-
-    if st.button("🔄 Uppdatera alla aktuella kurser från Yahoo"):
-        misslyckade = []
-        uppdaterade = 0
-        total = len(df)
-        status = st.empty()
-
-        with st.spinner("Uppdaterar kurser..."):
-            for i, row in df.iterrows():
-                ticker = str(row["Ticker"]).strip().upper()
-                status.text(f"🔄 Uppdaterar {i+1} av {total} tickers... ({ticker})")
-
-                try:
-                    pris, valuta = hamta_kurs_och_valuta(ticker)
-                    if pris is None:
-                        misslyckade.append(ticker)
-                        continue
-                    växelkurs = hamta_valutakurs(valuta)
-                    kurs_usd = pris * växelkurs
-                    df.at[i, "Aktuell kurs"] = round(kurs_usd, 2)
-                    uppdaterade += 1
-                except Exception:
-                    misslyckade.append(ticker)
-
-                time.sleep(2)  # Paus mellan varje anrop
-
-        spara_data(df)
-        status.text("✅ Uppdatering slutförd.")
-        st.success(f"{uppdaterade} tickers uppdaterade.")
-        if misslyckade:
-            st.warning("Kunde inte uppdatera följande tickers:\n" + ", ".join(misslyckade))
-
-    st.dataframe(df, use_container_width=True)
-
-
-def main():
-    st.title("📊 Aktieanalys och investeringsförslag")
-    df = hamta_data()
-    df = säkerställ_kolumner(df)
-    df = konvertera_typer(df)
-
-    valutakurs = st.sidebar.number_input("Valutakurs USD → SEK", value=10.0, step=0.1)
-    meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
-
-    if meny == "Analys":
-        analysvy(df)
-    elif meny == "Lägg till / uppdatera bolag":
-        df = lagg_till_eller_uppdatera(df)
-        spara_data(df)
-    elif meny == "Investeringsförslag":
-        df = uppdatera_berakningar(df)
-        visa_investeringsforslag(df, valutakurs)
-    elif meny == "Portfölj":
-        df = uppdatera_berakningar(df)
-        visa_portfolj(df, valutakurs)
-
-
-if __name__ == "__main__":
-    main()

@@ -8,7 +8,8 @@ from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Tillväxtaktieverktyg", layout="wide")
 
-SHEET_URL = st.secrets["GOOGLE_CREDENTIALS"]["SHEET_URL"]
+# ---- AUTHENTISERING ----
+SHEET_URL = st.secrets["SHEET_URL"]
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 credentials = Credentials.from_service_account_info(
@@ -16,244 +17,221 @@ credentials = Credentials.from_service_account_info(
 )
 client = gspread.authorize(credentials)
 
-@st.cache_data(ttl=60)
-def load_data():
-    sheet = client.open_by_url(SHEET_URL).sheet1
-    data = sheet.get_all_records()
-    return pd.DataFrame(data)
+# ---- HÄMTA & SPARA DATA ----
+def connect_to_gsheet(url):
+    return client.open_by_url(url).sheet1
 
-def save_data(df):
-    sheet = client.open_by_url(SHEET_URL).sheet1
+def get_database(sheet):
+    data = sheet.get_all_records()
+    df = pd.DataFrame(data)
+
+    for col in ["Aktuell kurs", "Antal aktier", "Årlig utdelning", "Max andel", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+                "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+                "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028"]:
+        df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0)
+
+    for col in ["Bolag", "Ticker", "Yahoo-ticker", "Valuta"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df
+
+def spara_df(sheet, df):
     sheet.clear()
-    sheet.update([df.columns.values.tolist()] + df.values.tolist())
+    sheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
 
 def lagg_till_eller_uppdatera(df):
     st.header("➕ Lägg till / uppdatera bolag")
-    bolagsnamn_lista = df["Bolag"].dropna().unique().tolist()
-    valt_bolag = st.selectbox("Välj bolag att uppdatera (eller lämna tomt för nytt)", [""] + bolagsnamn_lista)
 
-    befintlig = df[df["Bolag"] == valt_bolag].iloc[0] if valt_bolag else {}
+    val = st.selectbox("Välj bolag att uppdatera", [""] + sorted(df["Bolag"].unique()))
+    bef = df[df["Bolag"] == val].iloc[0] if val else {}
 
-    with st.form("bolagsformulär"):
-        kol1, kol2 = st.columns(2)
+    with st.form("form"):
+        bolag = st.text_input("Bolagsnamn", value=bef.get("Bolag", ""))
+        ticker = st.text_input("Ticker", value=bef.get("Ticker", "")).upper()
+        yahoo = st.text_input("Yahoo-ticker", value=bef.get("Yahoo-ticker", ""))
+        valuta = st.selectbox("Valuta", ["USD", "NOK", "CAD", "SEK", "EUR"],
+                              index=0 if not bef else ["USD", "NOK", "CAD", "SEK", "EUR"].index(bef.get("Valuta", "USD")))
+        kurs = st.number_input("Aktuell kurs", value=float(bef.get("Aktuell kurs", 0.0)))
+        antal = st.number_input("Antal aktier", value=float(bef.get("Antal aktier", 0.0)))
+        utdelning = st.number_input("Årlig utdelning per aktie", value=float(bef.get("Årlig utdelning", 0.0)))
+        maxandel = st.number_input("Max andel av portfölj (%)", value=float(bef.get("Max andel", 0.0)))
 
-        with kol1:
-            bolag = st.text_input("Bolagsnamn", value=befintlig.get("Bolag", ""))
-            ticker = st.text_input("Ticker", value=befintlig.get("Ticker", ""))
-            yahoo = st.text_input("Yahoo-ticker", value=befintlig.get("Yahoo-ticker", ""))
-            valuta = st.selectbox("Valuta", ["USD", "NOK", "CAD", "SEK", "EUR"],
-                                  index=["USD", "NOK", "CAD", "SEK", "EUR"].index(befintlig.get("Valuta", "USD")) if befintlig else 0)
-            max_andel = st.number_input("Max andel av portfölj (%)", min_value=0.0, value=befintlig.get("Max andel", 0.0), step=0.1)
-            antal = st.number_input("Antal aktier", min_value=0, value=int(befintlig.get("Antal aktier", 0)), step=1)
-            aktuell_kurs = st.number_input("Aktuell kurs", min_value=0.0, value=befintlig.get("Aktuell kurs", 0.0), step=0.01)
-            utdelning = st.number_input("Årlig utdelning", min_value=0.0, value=befintlig.get("Årlig utdelning", 0.0), step=0.01)
+        ps = st.number_input("P/S", value=float(bef.get("P/S", 0.0)))
+        ps1 = st.number_input("P/S Q1", value=float(bef.get("P/S Q1", 0.0)))
+        ps2 = st.number_input("P/S Q2", value=float(bef.get("P/S Q2", 0.0)))
+        ps3 = st.number_input("P/S Q3", value=float(bef.get("P/S Q3", 0.0)))
+        ps4 = st.number_input("P/S Q4", value=float(bef.get("P/S Q4", 0.0)))
+        oms_idag = st.number_input("Omsättning idag", value=float(bef.get("Omsättning idag", 0.0)))
+        oms1 = st.number_input("Omsättning nästa år", value=float(bef.get("Omsättning nästa år", 0.0)))
+        oms2 = st.number_input("Omsättning om 2 år", value=float(bef.get("Omsättning om 2 år", 0.0)))
+        oms3 = st.number_input("Omsättning om 3 år", value=float(bef.get("Omsättning om 3 år", 0.0)))
+        rikt1 = st.number_input("Riktkurs idag", value=float(bef.get("Riktkurs idag", 0.0)))
+        rikt2 = st.number_input("Riktkurs 2026", value=float(bef.get("Riktkurs 2026", 0.0)))
+        rikt3 = st.number_input("Riktkurs 2027", value=float(bef.get("Riktkurs 2027", 0.0)))
+        rikt4 = st.number_input("Riktkurs 2028", value=float(bef.get("Riktkurs 2028", 0.0)))
 
-        with kol2:
-            rikt_idag = st.number_input("Riktkurs idag", value=befintlig.get("Riktkurs idag", 0.0), step=0.1)
-            rikt_2026 = st.number_input("Riktkurs 2026", value=befintlig.get("Riktkurs 2026", 0.0), step=0.1)
-            rikt_2027 = st.number_input("Riktkurs 2027", value=befintlig.get("Riktkurs 2027", 0.0), step=0.1)
-            rikt_2028 = st.number_input("Riktkurs 2028", value=befintlig.get("Riktkurs 2028", 0.0), step=0.1)
-            ps1 = st.number_input("P/S 1", value=befintlig.get("P/S 1", 0.0), step=0.1)
-            ps2 = st.number_input("P/S 2", value=befintlig.get("P/S 2", 0.0), step=0.1)
-            ps3 = st.number_input("P/S 3", value=befintlig.get("P/S 3", 0.0), step=0.1)
-            oms1 = st.number_input("Omsättning 1", value=befintlig.get("Omsättning 1", 0.0), step=0.01)
-            oms2 = st.number_input("Omsättning 2", value=befintlig.get("Omsättning 2", 0.0), step=0.01)
-            oms3 = st.number_input("Omsättning 3", value=befintlig.get("Omsättning 3", 0.0), step=0.01)
+        sparaknapp = st.form_submit_button("💾 Spara")
 
-        spara = st.form_submit_button("💾 Spara")
-
-    if spara:
-        ny_rad = {
-            "Bolag": bolag,
-            "Ticker": ticker,
-            "Yahoo-ticker": yahoo,
-            "Valuta": valuta,
-            "Max andel": max_andel,
-            "Antal aktier": antal,
-            "Aktuell kurs": aktuell_kurs,
-            "Årlig utdelning": utdelning,
-            "Riktkurs idag": rikt_idag,
-            "Riktkurs 2026": rikt_2026,
-            "Riktkurs 2027": rikt_2027,
-            "Riktkurs 2028": rikt_2028,
-            "P/S 1": ps1,
-            "P/S 2": ps2,
-            "P/S 3": ps3,
-            "Omsättning 1": oms1,
-            "Omsättning 2": oms2,
-            "Omsättning 3": oms3
+    if sparaknapp:
+        ny = {
+            "Bolag": bolag, "Ticker": ticker, "Yahoo-ticker": yahoo, "Valuta": valuta,
+            "Aktuell kurs": kurs, "Antal aktier": antal, "Årlig utdelning": utdelning, "Max andel": maxandel,
+            "P/S": ps, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
+            "Omsättning idag": oms_idag, "Omsättning nästa år": oms1, "Omsättning om 2 år": oms2, "Omsättning om 3 år": oms3,
+            "Riktkurs idag": rikt1, "Riktkurs 2026": rikt2, "Riktkurs 2027": rikt3, "Riktkurs 2028": rikt4
         }
-
-        df = df[df["Bolag"] != bolag]
-        df = pd.concat([df, pd.DataFrame([ny_rad])], ignore_index=True)
-        save_data(df)
-        st.success(f"{bolag} sparad / uppdaterad!")
-
+        if bolag in df["Bolag"].values:
+            df.loc[df["Bolag"] == bolag, ny.keys()] = ny.values()
+            st.success("Bolaget uppdaterat.")
+        else:
+            df = pd.concat([df, pd.DataFrame([ny])], ignore_index=True)
+            st.success("Bolaget tillagt.")
     return df
 
-def portfoljvy(df):
-    st.header("📊 Portfölj")
-
-    usd_sek = st.number_input("Valutakurs USD → SEK", value=10.0, step=0.01)
-    nok_usd = st.number_input("Valutakurs NOK → USD", value=0.095, step=0.001)
-    cad_usd = st.number_input("Valutakurs CAD → USD", value=0.73, step=0.001)
-    sek_usd = st.number_input("Valutakurs SEK → USD", value=0.094, step=0.001)
-    eur_usd = st.number_input("Valutakurs EUR → USD", value=1.1, step=0.001)
-
-    valuta_map = {
-        "USD": 1,
-        "NOK": nok_usd,
-        "CAD": cad_usd,
-        "SEK": sek_usd,
-        "EUR": eur_usd
+def hamta_valutakurser():
+    return {
+        "USD": 1.0,
+        "NOK": st.sidebar.number_input("Valutakurs NOK→USD", value=0.094),
+        "CAD": st.sidebar.number_input("Valutakurs CAD→USD", value=0.73),
+        "SEK": st.sidebar.number_input("Valutakurs SEK→USD", value=0.095),
+        "EUR": st.sidebar.number_input("Valutakurs EUR→USD", value=1.10),
     }
-
-    df["Valuta"] = df["Valuta"].fillna("USD")
-    df["Växelkurs"] = df["Valuta"].map(valuta_map)
-    df["USD-kurs"] = df["Aktuell kurs"] * df["Växelkurs"]
-    df["Värde (USD)"] = df["Antal aktier"] * df["USD-kurs"]
-
-    total_portfolio_value = df["Värde (USD)"].sum()
-    df["Andel av portfölj (%)"] = df["Värde (USD)"] / total_portfolio_value * 100
-
-    df["Total utdelning (USD)"] = df["Årlig utdelning"] * df["Antal aktier"]
-    df["Total utdelning (SEK)"] = df["Total utdelning (USD)"] * usd_sek
-    total_utdelning = df["Total utdelning (SEK)"].sum()
-    utdelning_per_manad = total_utdelning / 12
-
-    st.metric("📦 Totalt portföljvärde (USD)", f"{total_portfolio_value:,.0f} USD")
-    st.metric("📈 Förväntad årlig utdelning (SEK)", f"{total_utdelning:,.0f} SEK")
-    st.metric("📅 Månadsutdelning (snitt, SEK)", f"{utdelning_per_manad:,.0f} SEK")
-
-    st.dataframe(df[[
-        "Bolag", "Antal aktier", "Aktuell kurs", "Valuta", "Värde (USD)",
-        "Andel av portfölj (%)", "Årlig utdelning", "Total utdelning (SEK)"
-    ]].sort_values(by="Andel av portfölj (%)", ascending=False), use_container_width=True)
-
-def investeringsforslag(df):
-    st.header("💡 Investeringsförslag")
-
-    kapital = st.number_input("Tillgängligt kapital (SEK)", value=500, step=100)
-
-    riktkursval = st.selectbox("Använd riktkurs från:", ["Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028"])
-    visa_endast_portfolj = st.checkbox("Visa endast innehav i portföljen", value=False)
-
-    usd_sek = st.number_input("Valutakurs USD → SEK (för konvertering)", value=10.0, step=0.01)
-
-    valuta_map = {
-        "USD": 1,
-        "NOK": st.session_state.get("nok_usd", 0.095),
-        "CAD": st.session_state.get("cad_usd", 0.73),
-        "SEK": st.session_state.get("sek_usd", 0.094),
-        "EUR": st.session_state.get("eur_usd", 1.1)
-    }
-
-    df["Valuta"] = df["Valuta"].fillna("USD")
-    df["Växelkurs"] = df["Valuta"].map(valuta_map)
-    df["USD-kurs"] = df["Aktuell kurs"] * df["Växelkurs"]
-    df["Värde (USD)"] = df["Antal aktier"] * df["USD-kurs"]
-    total_portfolio_value = df["Värde (USD)"].sum()
-
-    df["Riktkurs"] = df[riktkursval]
-    df["Potential (%)"] = (df["Riktkurs"] - df["Aktuell kurs"]) / df["Aktuell kurs"] * 100
-    df["Max andel"] = df["Max andel"].fillna(0)
-
-    df = df[df["Riktkurs"] > 0]
-    if visa_endast_portfolj:
-        df = df[df["Antal aktier"] > 0]
-
-    forslag = []
-    for _, row in df.iterrows():
-        nuvarande_andel = (row["Värde (USD)"] / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
-        max_andel = row["Max andel"]
-        usd_kurs = row["USD-kurs"]
-        riktkurs = row["Riktkurs"]
-
-        # Filtrera bort om innehavet redan överstiger max
-        if max_andel > 0 and nuvarande_andel >= max_andel:
-            continue
-
-        # Beräkna hur många man kan köpa för att nå max
-        max_varde_usd = (max_andel / 100) * total_portfolio_value
-        diff_usd = max_varde_usd - row["Värde (USD)"]
-        pris_per_aktie_usd = usd_kurs
-        antal_kop = int((kapital / usd_sek) // pris_per_aktie_usd)
-
-        if max_andel > 0 and diff_usd < kapital / usd_sek:
-            antal_kop = int(diff_usd // pris_per_aktie_usd)
-
-        if antal_kop <= 0:
-            continue
-
-        nytt_varde = row["Värde (USD)"] + antal_kop * pris_per_aktie_usd
-        ny_andel = nytt_varde / total_portfolio_value * 100 if total_portfolio_value > 0 else 0
-
-        forslag.append({
-            "Bolag": row["Bolag"],
-            "Aktuell kurs": row["Aktuell kurs"],
-            "Valuta": row["Valuta"],
-            "Riktkurs": riktkurs,
-            "Potential (%)": round(row["Potential (%)"], 1),
-            "Nuvarande andel (%)": round(nuvarande_andel, 2),
-            "Efter köp (%)": round(ny_andel, 2),
-            "Köp antal": antal_kop
-        })
-
-    st.subheader("📌 Förslag")
-    if not forslag:
-        st.info("Inga förslag matchar kriterierna.")
-    else:
-        df_forslag = pd.DataFrame(forslag).sort_values(by="Potential (%)", ascending=False)
-        st.dataframe(df_forslag, use_container_width=True)
 
 def uppdatera_kurser(df):
-    st.header("🔄 Uppdatera kurser från Yahoo Finance")
-
-    tickers = df["Yahoo-ticker"].fillna(df["Ticker"]).tolist()
+    st.subheader("🔄 Uppdatera aktiekurser")
+    valutakurser = hamta_valutakurser()
+    tickers = df["Yahoo-ticker"].fillna("").tolist()
     total = len(tickers)
-    status = st.empty()
+
     bar = st.progress(0)
+    uppdaterade = 0
 
-    nya_kurser = []
     for i, (index, rad) in enumerate(df.iterrows()):
-        ticker = rad["Yahoo-ticker"] if pd.notna(rad["Yahoo-ticker"]) else rad["Ticker"]
+        yahoo = rad.get("Yahoo-ticker", "")
+        valuta = rad.get("Valuta", "USD")
+        if not yahoo:
+            continue
         try:
-            aktie = yf.Ticker(ticker)
-            kurs = aktie.history(period="1d")["Close"].iloc[-1]
-            nya_kurser.append(kurs)
-        except:
-            nya_kurser.append(rad["Aktuell kurs"])  # behåll tidigare om fel
-        procent = int((i + 1) / total * 100)
-        status.text(f"{procent}% klart ({i + 1}/{total})")
-        bar.progress(procent)
-        time.sleep(2)
+            data = yf.Ticker(yahoo).history(period="1d")
+            kurs = round(data["Close"].iloc[-1], 2)
+            df.at[index, "Aktuell kurs"] = kurs * valutakurser.get(valuta, 1)
+            uppdaterade += 1
+        except Exception:
+            pass
+        bar.progress((i + 1) / total)
 
-    df["Aktuell kurs"] = nya_kurser
-    st.success("Kurserna är uppdaterade!")
+        time.sleep(2)  # paus mellan varje anrop
+
+    st.success(f"{uppdaterade} av {total} bolag uppdaterades.")
     return df
 
+def visa_investeringsforslag(df, valutakurs):
+    st.header("💡 Investeringsförslag")
+    kapital = st.number_input("Tillgängligt kapital (SEK)", value=500.0)
+    riktkurs_val = st.selectbox("Jämför med riktkurs för år", ["2026", "2027", "2028", "idag"])
+    portfolj_only = st.checkbox("Visa bara bolag du redan äger", value=False)
+
+    riktkolumn = f"Riktkurs {riktkurs_val}" if riktkurs_val != "idag" else "Riktkurs idag"
+
+    df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
+    portfoljvarde = df["Värde (SEK)"].sum()
+
+    filtrerad = df.copy()
+    if portfolj_only:
+        filtrerad = filtrerad[filtrerad["Antal aktier"] > 0]
+
+    filtrerad = filtrerad[filtrerad[riktkolumn] > filtrerad["Aktuell kurs"]]
+    filtrerad["Potential (%)"] = ((filtrerad[riktkolumn] - filtrerad["Aktuell kurs"]) / filtrerad["Aktuell kurs"]) * 100
+    filtrerad = filtrerad.sort_values(by="Potential (%)", ascending=False).reset_index(drop=True)
+
+    if "inv_index" not in st.session_state:
+        st.session_state.inv_index = 0
+
+    if st.button("➡️ Nästa förslag"):
+        st.session_state.inv_index += 1
+
+    index = st.session_state.inv_index
+    if index >= len(filtrerad):
+        st.warning("Inga fler förslag.")
+        return
+
+    rad = filtrerad.iloc[index]
+    yahoo_valuta = rad.get("Valuta", "USD")
+    antal = int((kapital / valutakurs) // rad["Aktuell kurs"])
+    total_sek = antal * rad["Aktuell kurs"] * valutakurs
+    befintligt_varde = rad["Antal aktier"] * rad["Aktuell kurs"] * valutakurs
+    andel = (befintligt_varde / portfoljvarde) * 100 if portfoljvarde > 0 else 0
+    maxandel = rad.get("Max andel", 100)
+    tillåtet = max(0, maxandel - andel)
+    max_köp_sek = (tillåtet / 100) * portfoljvarde
+
+    st.markdown(f"""
+        ### 🎯 Förslag {index + 1} av {len(filtrerad)}
+        - **Bolag:** {rad['Bolag']} ({rad['Ticker']})
+        - **Aktuell kurs:** {round(rad['Aktuell kurs'], 2)} USD
+        - **Riktkurs ({riktkurs_val}):** {round(rad[riktkolumn], 2)} USD
+        - **Potential:** {round(rad['Potential (%)'], 1)}%
+        - **Befintligt innehav:** {round(andel, 2)}% av portföljen
+        - **Max andel:** {maxandel}%
+        - **Rekommenderat köp:** {antal} st aktier
+        - **Köp för max:** {round(max_köp_sek, 2)} SEK
+    """)
+
+def visa_portfolj(df, valutakurs):
+    st.header("📦 Min portfölj")
+    df = df[df["Antal aktier"] > 0].copy()
+    if df.empty:
+        st.info("Du äger inga aktier.")
+        return
+
+    df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * valutakurs
+    df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
+
+    df["Årlig utdelning (SEK)"] = df["Årlig utdelning"] * df["Antal aktier"] * valutakurs
+    total_utdelning = df["Årlig utdelning (SEK)"].sum()
+    manadsutdelning = total_utdelning / 12
+
+    totalt = round(df["Värde (SEK)"].sum(), 2)
+    st.metric("💰 Totalt portföljvärde", f"{totalt:,.0f} SEK")
+    st.metric("📈 Förväntad årlig utdelning", f"{total_utdelning:,.0f} SEK")
+    st.metric("📆 Snitt månadsutdelning", f"{manadsutdelning:,.0f} SEK")
+
+    st.dataframe(df[[
+        "Bolag", "Ticker", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)", "Årlig utdelning (SEK)"
+    ]], use_container_width=True)
+
 def main():
-    st.set_page_config(page_title="Aktieanalys", layout="wide")
-    st.title("📈 Aktieanalys & Investeringsverktyg")
+    st.set_page_config(page_title="📊 Aktieanalys & Portfölj", layout="wide")
+    st.title("📊 Aktieanalys & investeringsförslag")
 
-    sheet = connect_to_gsheet(SHEET_URL)
-    df = get_database(sheet)
+    df = hamta_data()
+    df = säkerställ_kolumner(df)
+    df = konvertera_typer(df)
 
-    menyval = st.sidebar.radio("Välj vy", ["📦 Portfölj", "💡 Investeringsförslag", "➕ Lägg till / uppdatera bolag", "🔄 Uppdatera kurser"])
+    meny = st.sidebar.radio("📋 Välj vy", ["Portfölj", "Lägg till / uppdatera bolag", "Investeringsförslag", "Uppdatera kurser", "Data"])
 
-    if menyval == "📦 Portfölj":
-        portfoljvy(df)
+    valutakurs = st.sidebar.number_input("Valutakurs USD → SEK", value=10.0)
+    
+    if meny == "Portfölj":
+        df = uppdatera_berakningar(df)
+        visa_portfolj(df, valutakurs)
 
-    elif menyval == "💡 Investeringsförslag":
-        investeringsforslag(df)
-
-    elif menyval == "➕ Lägg till / uppdatera bolag":
+    elif meny == "Lägg till / uppdatera bolag":
         df = lagg_till_eller_uppdatera(df)
-        spara_df(sheet, df)
+        spara_data(df)
 
-    elif menyval == "🔄 Uppdatera kurser":
+    elif meny == "Investeringsförslag":
+        df = uppdatera_berakningar(df)
+        visa_investeringsforslag(df, valutakurs)
+
+    elif meny == "Uppdatera kurser":
         df = uppdatera_kurser(df)
-        spara_df(sheet, df)
+        spara_data(df)
+
+    elif meny == "Data":
+        st.subheader("📊 Rådata")
+        st.dataframe(df)
 
 if __name__ == "__main__":
     main()

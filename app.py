@@ -101,21 +101,26 @@ def konvertera_typer(df):
     return df
 
 # ---------------------------------------
-# BERÄKNA RIKTKURSER
+# BERÄKNA RIKTKURSER OCH LOGGA P/S-SNITT
 # ---------------------------------------
-def uppdatera_berakningar(df):
+def uppdatera_berakningar(df, logga=False):
+    ps_logg = []
     for i, rad in df.iterrows():
-        ps = [rad["P/S Q1"], rad["P/S Q2"], rad["P/S Q3"], rad["P/S Q4"]]
-        ps = [x for x in ps if x > 0]
-        ps_snitt = round(np.mean(ps), 2) if ps else 0
+        ps_varden = [rad["P/S Q1"], rad["P/S Q2"], rad["P/S Q3"], rad["P/S Q4"]]
+        ps_filtrerade = [x for x in ps_varden if x > 0]
+        ps_snitt = round(np.mean(ps_filtrerade), 2) if ps_filtrerade else 0
         df.at[i, "P/S-snitt"] = ps_snitt
+
+        if logga:
+            ps_logg.append(f"{rad['Bolagsnamn']} ({rad['Ticker']}) – P/S-värden: {ps_filtrerade} → Snitt: {ps_snitt}")
 
         if rad["Utestående aktier"] > 0:
             df.at[i, "Riktkurs idag"] = round((rad["Omsättning idag"] * ps_snitt) / rad["Utestående aktier"], 2)
             df.at[i, "Riktkurs 2026"] = round((rad["Omsättning nästa år"] * ps_snitt) / rad["Utestående aktier"], 2)
             df.at[i, "Riktkurs 2027"] = round((rad["Omsättning om 2 år"] * ps_snitt) / rad["Utestående aktier"], 2)
             df.at[i, "Riktkurs 2028"] = round((rad["Omsättning om 3 år"] * ps_snitt) / rad["Utestående aktier"], 2)
-    return df
+
+    return df, ps_logg if logga else df
 
 # ---------------------------------------
 # FORMULÄR: LÄGG TILL / UPPDATERA BOLAG
@@ -170,51 +175,6 @@ def lagg_till_eller_uppdatera(df):
             st.success(f"{ticker} tillagt.")
     return df
 
-# ---------------------------------------
-# HÄMTA KURS & P/S MED RÄTT ENHETER
-# ---------------------------------------
-def hamta_ps_och_kurs(ticker):
-    try:
-        yticker = yf.Ticker(ticker)
-        info = yticker.info
-
-        # Kurs & valuta
-        pris = info.get("regularMarketPrice", None)
-        valuta = info.get("currency", "USD")
-
-        # Market Cap
-        marketcap = parse_yahoo_number(info.get("marketCap", None))
-
-        # TTM Omsättning från Income Statement
-        oms_ttm = None
-        try:
-            fin_df = yticker.financials
-            if not fin_df.empty and "Total Revenue" in fin_df.index:
-                oms_ttm = fin_df.loc["Total Revenue"].iloc[0]
-        except:
-            oms_ttm = None
-
-        # P/S idag
-        ps_idag = None
-        if marketcap and oms_ttm and oms_ttm > 0:
-            ps_idag = marketcap / oms_ttm
-
-        # Kvartalsomsättning för P/S Q1–Q4
-        ps_hist = []
-        try:
-            q_fin_df = yticker.quarterly_financials
-            if not q_fin_df.empty and "Total Revenue" in q_fin_df.index:
-                oms_values = q_fin_df.loc["Total Revenue"].dropna().tolist()
-                for oms in oms_values[:4]:
-                    if marketcap and oms and oms > 0:
-                        ps_hist.append(marketcap / (oms * 4))  # skalar upp kvartalet till helår
-        except:
-            pass
-
-        return pris, valuta, ps_idag, ps_hist
-    except:
-        return None, None, None, []
-
 def analysvy(df):
     st.subheader("📈 Analysläge")
 
@@ -224,6 +184,7 @@ def analysvy(df):
         total = len(df)
         status = st.empty()
         bar = st.progress(0)
+        ps_logg_lista = []
 
         with st.spinner("Uppdaterar data från Yahoo Finance..."):
             for i, row in df.iterrows():
@@ -236,16 +197,19 @@ def analysvy(df):
                 try:
                     pris, valuta, ps_idag, ps_hist = hamta_ps_och_kurs(ticker)
 
+                    # Kurs och valuta
                     if pris:
                         df.at[i, "Aktuell kurs"] = round(pris, 2)
                         df.at[i, "Valuta"] = valuta
 
-                    if ps_idag:
+                    # P/S idag
+                    if ps_idag and ps_idag > 0:
                         df.at[i, "P/S"] = round(ps_idag, 2)
                         df.at[i, "P/S-metod"] = "Yahoo"
                     else:
                         df.at[i, "P/S-metod"] = "Saknas"
 
+                    # P/S kvartal
                     if ps_hist and len(ps_hist) >= 4:
                         df.at[i, "P/S Q1"] = round(ps_hist[0], 2)
                         df.at[i, "P/S Q2"] = round(ps_hist[1], 2)
@@ -258,14 +222,21 @@ def analysvy(df):
                     misslyckade.append(ticker)
 
                 bar.progress((i+1)/total)
-                time.sleep(1)  # Paus för att undvika blockering
+                time.sleep(1)  # paus för att undvika blockering
 
-        df = uppdatera_berakningar(df)
+            # Efter att alla rader är uppdaterade, beräkna riktkurser och logga P/S
+            df, ps_logg_lista = uppdatera_berakningar(df, logga=True)
+
         spara_data(df)
-
         st.success(f"{uppdaterade} tickers uppdaterade.")
+
         if misslyckade:
             st.warning("Kunde inte uppdatera följande tickers:\n" + ", ".join(misslyckade))
+
+        # Visa P/S-logg i expander
+        with st.expander("📄 Detaljerad P/S-logg"):
+            for rad in ps_logg_lista:
+                st.write(rad)
 
     st.dataframe(df, use_container_width=True)
 
@@ -361,10 +332,10 @@ def main():
         df = lagg_till_eller_uppdatera(df)
         spara_data(df)
     elif meny == "Investeringsförslag":
-        df = uppdatera_berakningar(df)
+        df, _ = uppdatera_berakningar(df, logga=False)
         visa_investeringsforslag(df, valutakurser)
     elif meny == "Portfölj":
-        df = uppdatera_berakningar(df)
+        df, _ = uppdatera_berakningar(df, logga=False)
         visa_portfolj(df, valutakurser)
 
 

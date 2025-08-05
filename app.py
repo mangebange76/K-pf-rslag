@@ -8,13 +8,14 @@ from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
-# Google Sheets
+# 📄 Google Sheets-inställningar
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
 client = gspread.authorize(credentials)
 
+# Standardvalutakurser (till SEK)
 STANDARD_VALUTAKURSER = {
     "USD": 9.75,
     "NOK": 0.95,
@@ -39,7 +40,7 @@ def konvertera_typer(df):
     kolumner = [
         "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
         "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Aktuell kurs", "Antal aktier", "Årlig utdelning"
+        "Aktuell kurs", "Antal aktier", "P/S-snitt"
     ]
     for kol in kolumner:
         if kol in df.columns:
@@ -48,11 +49,10 @@ def konvertera_typer(df):
 
 def säkerställ_kolumner(df):
     nödvändiga = [
-        "Ticker", "Bolagsnamn", "Aktuell kurs", "Utestående aktier", "Valuta",
+        "Ticker", "Bolagsnamn", "Valuta", "Aktuell kurs", "Utestående aktier",
         "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
         "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-        "P/S-snitt", "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028",
-        "Antal aktier", "Årlig utdelning"
+        "P/S-snitt", "Riktkurs idag", "Riktkurs 2026", "Riktkurs 2027", "Riktkurs 2028", "Antal aktier"
     ]
     for kol in nödvändiga:
         if kol not in df.columns:
@@ -90,11 +90,11 @@ def lagg_till_eller_uppdatera(df):
     with st.form("form"):
         ticker = st.text_input("Ticker", value=befintlig.get("Ticker", "") if not befintlig.empty else "").upper()
         namn = st.text_input("Bolagsnamn", value=befintlig.get("Bolagsnamn", "") if not befintlig.empty else "")
+        valuta = st.selectbox("Valuta", ["USD", "NOK", "CAD", "SEK", "EUR"], 
+                              index=0 if befintlig.empty else ["USD", "NOK", "CAD", "SEK", "EUR"].index(befintlig.get("Valuta", "USD")))
         kurs = st.number_input("Aktuell kurs", value=float(befintlig.get("Aktuell kurs", 0.0)) if not befintlig.empty else 0.0)
         aktier = st.number_input("Utestående aktier (miljoner)", value=float(befintlig.get("Utestående aktier", 0.0)) if not befintlig.empty else 0.0)
-        valuta = st.selectbox("Valuta", ["USD", "NOK", "CAD", "SEK", "EUR"], index=0 if befintlig.get("Valuta", "") not in ["USD", "NOK", "CAD", "SEK", "EUR"] else ["USD", "NOK", "CAD", "SEK", "EUR"].index(befintlig.get("Valuta", "USD")))
         antal_aktier = st.number_input("Antal aktier du äger", value=float(befintlig.get("Antal aktier", 0.0)) if not befintlig.empty else 0.0)
-        utdelning = st.number_input("Årlig utdelning per aktie", value=float(befintlig.get("Årlig utdelning", 0.0)) if not befintlig.empty else 0.0)
 
         ps_idag = st.number_input("P/S idag", value=float(befintlig.get("P/S", 0.0)) if not befintlig.empty else 0.0)
         ps1 = st.number_input("P/S Q1", value=float(befintlig.get("P/S Q1", 0.0)) if not befintlig.empty else 0.0)
@@ -103,20 +103,19 @@ def lagg_till_eller_uppdatera(df):
         ps4 = st.number_input("P/S Q4", value=float(befintlig.get("P/S Q4", 0.0)) if not befintlig.empty else 0.0)
 
         oms_idag = st.number_input("Omsättning idag (miljoner)", value=float(befintlig.get("Omsättning idag", 0.0)) if not befintlig.empty else 0.0)
-        oms_1 = st.number_input("Omsättning nästa år (miljoner)", value=float(befintlig.get("Omsättning nästa år", 0.0)) if not befintlig.empty else 0.0)
-        oms_2 = st.number_input("Omsättning om 2 år (miljoner)", value=float(befintlig.get("Omsättning om 2 år", 0.0)) if not befintlig.empty else 0.0)
-        oms_3 = st.number_input("Omsättning om 3 år (miljoner)", value=float(befintlig.get("Omsättning om 3 år", 0.0)) if not befintlig.empty else 0.0)
+        oms_1 = st.number_input("Omsättning nästa år", value=float(befintlig.get("Omsättning nästa år", 0.0)) if not befintlig.empty else 0.0)
+        oms_2 = st.number_input("Omsättning om 2 år", value=float(befintlig.get("Omsättning om 2 år", 0.0)) if not befintlig.empty else 0.0)
+        oms_3 = st.number_input("Omsättning om 3 år", value=float(befintlig.get("Omsättning om 3 år", 0.0)) if not befintlig.empty else 0.0)
 
         sparaknapp = st.form_submit_button("💾 Spara")
 
     if sparaknapp and ticker:
         ny_rad = {
-            "Ticker": ticker, "Bolagsnamn": namn, "Aktuell kurs": kurs, "Utestående aktier": aktier, "Valuta": valuta,
-            "Antal aktier": antal_aktier, "Årlig utdelning": utdelning,
+            "Ticker": ticker, "Bolagsnamn": namn, "Valuta": valuta,
+            "Aktuell kurs": kurs, "Utestående aktier": aktier, "Antal aktier": antal_aktier,
             "P/S": ps_idag, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
             "Omsättning idag": oms_idag, "Omsättning nästa år": oms_1, "Omsättning om 2 år": oms_2, "Omsättning om 3 år": oms_3
         }
-
         if ticker in df["Ticker"].values:
             df.loc[df["Ticker"] == ticker, ny_rad.keys()] = ny_rad.values()
             st.success(f"{ticker} uppdaterat.")
@@ -131,23 +130,12 @@ def visa_portfolj(df, valutakurser):
     if df.empty:
         st.info("Du äger inga aktier.")
         return
-
     df["Växelkurs"] = df["Valuta"].map(valutakurser).fillna(1.0)
     df["Värde (SEK)"] = df["Antal aktier"] * df["Aktuell kurs"] * df["Växelkurs"]
     df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
-
     total = df["Värde (SEK)"].sum()
-    total_utdelning = (df["Antal aktier"] * df["Årlig utdelning"] * df["Växelkurs"]).sum()
-    manads_utdelning = total_utdelning / 12
-
     st.markdown(f"**Totalt portföljvärde:** {round(total, 2)} SEK")
-    st.markdown(f"**Förväntad årlig utdelning:** {round(total_utdelning, 2)} SEK")
-    st.markdown(f"**Förväntad genomsnittlig månadsutdelning:** {round(manads_utdelning, 2)} SEK")
-
-    st.dataframe(df[[
-        "Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Valuta",
-        "Värde (SEK)", "Andel (%)", "Årlig utdelning"
-    ]], use_container_width=True)
+    st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Valuta", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
 
 def visa_investeringsforslag(df, valutakurser):
     st.subheader("💡 Investeringsförslag")
@@ -206,12 +194,23 @@ def visa_investeringsforslag(df, valutakurser):
         st.session_state.forslags_index += 1
 
 
+def format_belopp(värde):
+    if värde is None or värde == 0:
+        return ""
+    if abs(värde) >= 1_000_000_000:
+        return f"{värde/1_000_000_000:.2f} B"
+    elif abs(värde) >= 1_000_000:
+        return f"{värde/1_000_000:.2f} M"
+    else:
+        return str(värde)
+
+
 def analysvy(df, valutakurser):
     st.subheader("📈 Analysläge")
 
     if st.button("🔄 Uppdatera alla aktuella kurser och fundamenta från Yahoo"):
         misslyckade, uppdaterade = [], 0
-        ps_yahoo, ps_manuell, ps_saknas = [], [], []
+        logg_data = []
         total = len(df)
         status = st.empty()
         bar = st.progress(0)
@@ -219,6 +218,11 @@ def analysvy(df, valutakurser):
         with st.spinner("Uppdaterar data..."):
             for i, row in df.iterrows():
                 ticker = str(row["Ticker"]).strip().upper()
+                metod = ""
+                årsoms_värde = None
+                marketcap_värde = None
+                ps_q_values = {"P/S Q1": "", "P/S Q2": "", "P/S Q3": "", "P/S Q4": ""}
+
                 status.text(f"🔄 Uppdaterar {i+1} av {total} ({ticker})...")
 
                 try:
@@ -232,62 +236,75 @@ def analysvy(df, valutakurser):
                         df.at[i, "Aktuell kurs"] = round(pris, 2)
                         df.at[i, "Valuta"] = valuta
 
-                    # 2️⃣ P/S idag (Yahoo eller manuellt)
+                    # 2️⃣ P/S idag (Yahoo eller manuell via årsomsättning)
                     ps_ttm = info.get("priceToSalesTrailing12Months", None)
+                    marketcap = info.get("marketCap", None)
+                    marketcap_värde = marketcap
+
                     if ps_ttm is not None and 0 < ps_ttm < 1000:
                         df.at[i, "P/S"] = round(ps_ttm, 2)
-                        ps_yahoo.append(ticker)
+                        metod = "Yahoo"
                     else:
-                        marketcap = info.get("marketCap", None)
-                        if marketcap and "Total Revenue" in yticker.financials.index:
-                            revenues = yticker.financials.loc["Total Revenue"].dropna().tolist()
-                            if revenues:
-                                senaste_oms = revenues[0]
-                                if senaste_oms > 1_000_000:  # måste vara minst 1M USD
-                                    ps_calc = marketcap / senaste_oms
-                                    if 0 < ps_calc < 1000:
-                                        df.at[i, "P/S"] = round(ps_calc, 2)
-                                        ps_manuell.append(ticker)
-                        if df.at[i, "P/S"] == 0:
-                            ps_saknas.append(ticker)
+                        årsoms_list = []
+                        if "Total Revenue" in yticker.financials.index:
+                            årsoms_list = yticker.financials.loc["Total Revenue"].dropna().tolist()
 
-                    # 3️⃣ P/S Q1–Q4 från kvartalsdata eller fallback
+                        if marketcap and årsoms_list:
+                            senaste_årsoms = årsoms_list[0]
+                            årsoms_värde = senaste_årsoms
+                            if senaste_årsoms > 1_000_000:
+                                ps_calc = marketcap / senaste_årsoms
+                                if 0 < ps_calc < 1000:
+                                    df.at[i, "P/S"] = round(ps_calc, 2)
+                                    metod = "Manuell"
+                        if df.at[i, "P/S"] == 0:
+                            metod = "Saknas"
+
+                    # 3️⃣ P/S Q1–Q4
                     aktier_utest = row.get("Utestående aktier", 0) * 1_000_000
                     kursdata = yticker.history(period="1y", interval="3mo")["Close"].dropna().tolist()
                     kvartalsoms = []
                     if "Total Revenue" in yticker.quarterly_financials.index:
                         kvartalsoms = yticker.quarterly_financials.loc["Total Revenue"].dropna().tolist()
 
-                    if aktier_utest > 0 and len(kvartalsoms) >= 1:
+                    if aktier_utest > 0 and kvartalsoms:
                         antal_kvartal = min(len(kursdata), len(kvartalsoms))
                         for idx in range(min(4, antal_kvartal)):
                             kurs_q = kursdata[idx]
-                            oms_q = kvartalsoms[idx] if idx < len(kvartalsoms) else None
-                            if oms_q and oms_q > 1_000_000:  # minst 1M USD
+                            oms_q = kvartalsoms[idx]
+                            if oms_q > 1_000_000:
                                 ps_val = (kurs_q * aktier_utest) / oms_q
                                 if 0 < ps_val < 1000:
                                     df.at[i, f"P/S Q{idx+1}"] = round(ps_val, 2)
-                    else:
-                        # fallback till årsdata
-                        if "Total Revenue" in yticker.financials.index:
-                            årsoms = yticker.financials.loc["Total Revenue"].dropna().tolist()
-                            if årsoms and årsoms[0] > 1_000_000:
-                                uppskattad_kvartalsoms = årsoms[0] / 4
-                                for idx in range(min(4, len(kursdata))):
-                                    kurs_q = kursdata[idx]
-                                    ps_val = (kurs_q * aktier_utest) / uppskattad_kvartalsoms
-                                    if 0 < ps_val < 1000:
-                                        df.at[i, f"P/S Q{idx+1}"] = round(ps_val, 2)
+                                    ps_q_values[f"P/S Q{idx+1}"] = round(ps_val, 2)
+
+                    # 🔢 Beräkna P/S-snitt
+                    ps_list = [v for v in ps_q_values.values() if isinstance(v, (int, float)) and v > 0]
+                    ps_snitt = round(sum(ps_list) / len(ps_list), 2) if ps_list else 0
+                    df.at[i, "P/S-snitt"] = ps_snitt
 
                     uppdaterade += 1
 
                 except Exception:
                     misslyckade.append(ticker)
 
+                # 📜 Loggrad
+                logg_data.append({
+                    "Ticker": ticker,
+                    "Market Cap": format_belopp(marketcap_värde),
+                    "Årsomsättning (TTM)": format_belopp(årsoms_värde),
+                    "P/S idag": df.at[i, "P/S"],
+                    "Metod": metod,
+                    "P/S Q1": ps_q_values["P/S Q1"],
+                    "P/S Q2": ps_q_values["P/S Q2"],
+                    "P/S Q3": ps_q_values["P/S Q3"],
+                    "P/S Q4": ps_q_values["P/S Q4"],
+                    "P/S-snitt": ps_snitt
+                })
+
                 bar.progress((i + 1) / total)
                 time.sleep(1)
 
-        # 🔄 Beräkna snitt & riktkurser direkt
         df = uppdatera_berakningar(df)
         spara_data(df)
 
@@ -295,12 +312,10 @@ def analysvy(df, valutakurser):
         st.success(f"{uppdaterade} tickers uppdaterade.")
         if misslyckade:
             st.warning("Kunde inte uppdatera följande tickers:\n" + ", ".join(misslyckade))
-        if ps_yahoo:
-            st.info(f"P/S hämtades direkt från Yahoo för: {', '.join(ps_yahoo)}")
-        if ps_manuell:
-            st.info(f"P/S beräknades manuellt för: {', '.join(ps_manuell)}")
-        if ps_saknas:
-            st.warning(f"Inget P/S kunde sättas för: {', '.join(ps_saknas)}")
+
+        st.markdown("### Logg över P/S-beräkningar")
+        logg_df = pd.DataFrame(logg_data)
+        st.dataframe(logg_df, use_container_width=True)
 
     st.dataframe(df, use_container_width=True)
 
@@ -310,8 +325,9 @@ def main():
     df = säkerställ_kolumner(df)
     df = konvertera_typer(df)
 
+    # 💱 Valutakurser i sidomenyn
     valutakurser = {}
-    st.sidebar.subheader("💱 Valutakurser")
+    st.sidebar.subheader("💱 Valutakurser (till SEK)")
     for valuta in ["USD", "NOK", "CAD", "SEK", "EUR"]:
         valutakurser[valuta] = st.sidebar.number_input(
             f"{valuta} → SEK",

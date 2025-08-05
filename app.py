@@ -45,15 +45,12 @@ def säkerställ_kolumner(df):
     ]
     for kol in nödvändiga:
         if kol not in df.columns:
-            if kol in ["Ticker", "Bolagsnamn", "Valuta"]:
-                df[kol] = ""
-            elif "Riktkurs" in kol or "P/S" in kol or "Omsättning" in kol or "kurs" in kol.lower():
+            if "kurs" in kol.lower() or "omsättning" in kol.lower() or "p/s" in kol.lower():
                 df[kol] = 0.0
             else:
                 df[kol] = ""
     return df
 
-# --- Hjälpfunktion för att tolka tal från Yahoo (B/M/T) ---
 def parse_yahoo_number(value):
     if value is None or value == "":
         return None
@@ -75,7 +72,6 @@ def parse_yahoo_number(value):
     except:
         return None
 
-# --- Hämtar kurs, valuta och P/S från Yahoo ---
 def hamta_ps_och_kurs(ticker):
     try:
         yticker = yf.Ticker(ticker)
@@ -85,7 +81,6 @@ def hamta_ps_och_kurs(ticker):
         valuta = info.get("currency", "USD")
         marketcap = parse_yahoo_number(info.get("marketCap", None))
 
-        # TTM omsättning
         oms_ttm = None
         try:
             fin_df = yticker.financials
@@ -98,7 +93,6 @@ def hamta_ps_och_kurs(ticker):
         if marketcap and oms_ttm and oms_ttm > 0:
             ps_idag = marketcap / oms_ttm
 
-        # Kvartals-P/S
         ps_hist = []
         try:
             q_fin_df = yticker.quarterly_financials
@@ -116,18 +110,8 @@ def hamta_ps_och_kurs(ticker):
     except Exception as e:
         return None, None, None, [], str(e)
 
-# --- Analysläge ---
-def analysvy(df):
+def analysvy(df, valutakurser):
     st.subheader("📈 Analysläge")
-
-    # Standardvalutakurser
-    valutakurser = {
-        "USD": st.sidebar.number_input("USD → SEK", value=9.50, step=0.01),
-        "NOK": st.sidebar.number_input("NOK → SEK", value=0.93, step=0.01),
-        "EUR": st.sidebar.number_input("EUR → SEK", value=11.10, step=0.01),
-        "CAD": st.sidebar.number_input("CAD → SEK", value=7.00, step=0.01)
-    }
-
     felsokningslage = st.checkbox("Visa felsökningsinfo vid uppdatering", value=False)
 
     if st.button("🔄 Uppdatera alla aktuella kurser och P/S från Yahoo"):
@@ -190,7 +174,6 @@ def analysvy(df):
             st.subheader("🛠 Felsökningslogg")
             st.dataframe(pd.DataFrame(felsokningslogg))
 
-    # Visa alltid databasen i analysläget
     st.dataframe(df, use_container_width=True)
 
 def uppdatera_berakningar(df):
@@ -331,13 +314,17 @@ def visa_portfolj(df, valutakurser):
     if df.empty:
         st.info("Du äger inga aktier.")
         return
-    df["Värde (SEK)"] = df.apply(lambda r: r["Antal aktier"] * r["Aktuell kurs"] * valutakurser.get(r["Valuta"], 1), axis=1)
+    df["Värde (SEK)"] = df.apply(
+        lambda r: r["Antal aktier"] * r["Aktuell kurs"] * valutakurser.get(r["Valuta"], 1),
+        axis=1
+    )
     df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
     total = df["Värde (SEK)"].sum()
     st.markdown(f"**Totalt portföljvärde:** {round(total, 2)} SEK")
-    st.dataframe(df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Valuta", "Värde (SEK)", "Andel (%)"]],
-                 use_container_width=True)
-
+    st.dataframe(
+        df[["Ticker", "Bolagsnamn", "Antal aktier", "Aktuell kurs", "Valuta", "Värde (SEK)", "Andel (%)"]],
+        use_container_width=True
+    )
 
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
@@ -352,10 +339,13 @@ def main():
         "CAD": st.sidebar.number_input("CAD → SEK", value=7.00, step=0.01)
     }
 
-    meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
+    meny = st.sidebar.radio(
+        "Meny",
+        ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"]
+    )
 
     if meny == "Analys":
-        analysvy(df)
+        analysvy(df, valutakurser)
     elif meny == "Lägg till / uppdatera bolag":
         df = lagg_till_eller_uppdatera(df)
         spara_data(df)
@@ -365,7 +355,6 @@ def main():
     elif meny == "Portfölj":
         df = uppdatera_berakningar(df)
         visa_portfolj(df, valutakurser)
-
 
 if __name__ == "__main__":
     main()

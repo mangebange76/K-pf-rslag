@@ -258,28 +258,22 @@ def analysvy(df, valutakurser):
                         if ps_ttm is None:
                             ps_saknas.append(ticker)
 
-                    # P/S Q1–Q4
+                    # 3️⃣ P/S Q1–Q4 (endast om data finns)
                     aktier_utest = row.get("Utestående aktier", 0)
-                    if aktier_utest > 0 and "Total Revenue" in yticker.quarterly_financials.index:
-                        kursdata = yticker.history(period="1y", interval="3mo")["Close"].tolist()
-                        kvartalsoms = yticker.quarterly_financials.loc["Total Revenue"].tolist()
-                        ps_values = []
-                        for kurs_q, oms_q in zip(kursdata, kvartalsoms):
-                            if kurs_q and oms_q and oms_q > 0:
-                                marketcap_q = kurs_q * aktier_utest
-                                ps_values.append(round(marketcap_q / oms_q, 2))
-                            else:
-                                ps_values.append(None)
-                        if len(ps_values) > 0 and ps_values[0] is not None:
-                            df.at[i, "P/S Q1"] = ps_values[0]
-                        if len(ps_values) > 1 and ps_values[1] is not None:
-                            df.at[i, "P/S Q2"] = ps_values[1]
-                        if len(ps_values) > 2 and ps_values[2] is not None:
-                            df.at[i, "P/S Q3"] = ps_values[2]
-                        if len(ps_values) > 3 and ps_values[3] is not None:
-                            df.at[i, "P/S Q4"] = ps_values[3]
+                    if aktier_utest > 0 and not yticker.quarterly_financials.empty:
+                        if "Total Revenue" in yticker.quarterly_financials.index:
+                            kursdata = yticker.history(period="1y", interval="3mo")["Close"].dropna().tolist()
+                            kvartalsoms = yticker.quarterly_financials.loc["Total Revenue"].dropna().tolist()
+                            antal_kvartal = min(len(kursdata), len(kvartalsoms))
+                            for idx in range(min(4, antal_kvartal)):
+                                kurs_q = kursdata[idx]
+                                oms_q = kvartalsoms[idx]
+                                if kurs_q and oms_q and oms_q > 0:
+                                    marketcap_q = kurs_q * aktier_utest
+                                    ps_varde = round(marketcap_q / oms_q, 2)
+                                    df.at[i, f"P/S Q{idx+1}"] = ps_varde
 
-                    # 3️⃣ Omsättning nästa år och om 2 år
+                    # 4️⃣ Omsättning nästa år och om 2 år
                     oms1, oms2 = None, None
                     try:
                         analysis = yticker.analysis
@@ -294,7 +288,7 @@ def analysvy(df, valutakurser):
                     except Exception:
                         pass
 
-                    # 4️⃣ Historisk omsättning för CAGR
+                    # 5️⃣ Historisk omsättning för CAGR
                     cagr = None
                     try:
                         if "Total Revenue" in yticker.financials.index:
@@ -309,7 +303,7 @@ def analysvy(df, valutakurser):
                     except Exception:
                         pass
 
-                    # 5️⃣ Omsättning om 3 och 4 år
+                    # 6️⃣ Omsättning om 3 och 4 år
                     if oms1 and oms2:
                         growth_rate = cagr if cagr is not None else (oms2 - oms1) / oms1
                         if growth_rate < 0:
@@ -328,7 +322,7 @@ def analysvy(df, valutakurser):
                 bar.progress((i + 1) / total)
                 time.sleep(1)
 
-        # ✅ Spara alla ändringar direkt efter loopen
+        # ✅ Spara alla ändringar direkt
         spara_data(df)
 
         status.text("✅ Uppdatering klar.")

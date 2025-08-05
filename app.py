@@ -258,11 +258,12 @@ def analysvy(df, valutakurser):
                         if ps_ttm is None:
                             ps_saknas.append(ticker)
 
-                    # 3️⃣ P/S Q1–Q4 (endast om data finns)
+                    # 3️⃣ P/S Q1–Q4 med fallback till årsdata
                     aktier_utest = row.get("Utestående aktier", 0)
+                    kursdata = yticker.history(period="1y", interval="3mo")["Close"].dropna().tolist()
+
                     if aktier_utest > 0 and not yticker.quarterly_financials.empty:
                         if "Total Revenue" in yticker.quarterly_financials.index:
-                            kursdata = yticker.history(period="1y", interval="3mo")["Close"].dropna().tolist()
                             kvartalsoms = yticker.quarterly_financials.loc["Total Revenue"].dropna().tolist()
                             antal_kvartal = min(len(kursdata), len(kvartalsoms))
                             for idx in range(min(4, antal_kvartal)):
@@ -270,8 +271,18 @@ def analysvy(df, valutakurser):
                                 oms_q = kvartalsoms[idx]
                                 if kurs_q and oms_q and oms_q > 0:
                                     marketcap_q = kurs_q * aktier_utest
-                                    ps_varde = round(marketcap_q / oms_q, 2)
-                                    df.at[i, f"P/S Q{idx+1}"] = ps_varde
+                                    df.at[i, f"P/S Q{idx+1}"] = round(marketcap_q / oms_q, 2)
+                    else:
+                        # Fallback med årsdata
+                        if "Total Revenue" in yticker.financials.index:
+                            årsoms = yticker.financials.loc["Total Revenue"].dropna().tolist()
+                            if årsoms:
+                                uppskattad_kvartalsoms = årsoms[0] / 4
+                                for idx in range(min(4, len(kursdata))):
+                                    kurs_q = kursdata[idx]
+                                    if kurs_q and uppskattad_kvartalsoms > 0:
+                                        marketcap_q = kurs_q * aktier_utest
+                                        df.at[i, f"P/S Q{idx+1}"] = round(marketcap_q / uppskattad_kvartalsoms, 2)
 
                     # 4️⃣ Omsättning nästa år och om 2 år
                     oms1, oms2 = None, None

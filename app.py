@@ -243,11 +243,16 @@ def analysvy(df, valutakurser):
                         df.at[i, "Aktuell kurs"] = round(pris, 2)
                         df.at[i, "Valuta"] = valuta
 
-                    # 2️⃣ P/S idag och Q1-Q4
+                    # 2️⃣ P/S idag från Yahoo
+                    ps_ttm = info.get("priceToSalesTrailing12Months", None)
+                    if ps_ttm is not None:
+                        df.at[i, "P/S"] = round(ps_ttm, 2)
+
+                    # P/S Q1–Q4 (bara om vi har kvartalsomsättning)
                     aktier_utest = row.get("Utestående aktier", 0)
-                    if aktier_utest > 0:
+                    if aktier_utest > 0 and "Total Revenue" in yticker.quarterly_financials.index:
                         kursdata = yticker.history(period="1y", interval="3mo")["Close"].tolist()
-                        kvartalsoms = yticker.quarterly_financials.loc["Total Revenue"].tolist() if "Total Revenue" in yticker.quarterly_financials.index else []
+                        kvartalsoms = yticker.quarterly_financials.loc["Total Revenue"].tolist()
 
                         ps_values = []
                         for kurs_q, oms_q in zip(kursdata, kvartalsoms):
@@ -257,17 +262,14 @@ def analysvy(df, valutakurser):
                             else:
                                 ps_values.append(None)
 
-                        if ps_values:
-                            if len(ps_values) > 0 and ps_values[0] is not None:
-                                df.at[i, "P/S"] = ps_values[0]
-                            if len(ps_values) > 1 and ps_values[1] is not None:
-                                df.at[i, "P/S Q1"] = ps_values[1]
-                            if len(ps_values) > 2 and ps_values[2] is not None:
-                                df.at[i, "P/S Q2"] = ps_values[2]
-                            if len(ps_values) > 3 and ps_values[3] is not None:
-                                df.at[i, "P/S Q3"] = ps_values[3]
-                            if len(ps_values) > 4 and ps_values[4] is not None:
-                                df.at[i, "P/S Q4"] = ps_values[4]
+                        if len(ps_values) > 0 and ps_values[0] is not None:
+                            df.at[i, "P/S Q1"] = ps_values[0]
+                        if len(ps_values) > 1 and ps_values[1] is not None:
+                            df.at[i, "P/S Q2"] = ps_values[1]
+                        if len(ps_values) > 2 and ps_values[2] is not None:
+                            df.at[i, "P/S Q3"] = ps_values[2]
+                        if len(ps_values) > 3 and ps_values[3] is not None:
+                            df.at[i, "P/S Q4"] = ps_values[3]
 
                     # 3️⃣ Omsättning nästa år och om 2 år
                     oms1, oms2 = None, None

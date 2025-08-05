@@ -76,9 +76,6 @@ def uppdatera_berakningar(df):
             df.at[i, "Riktkurs 2028"] = round((rad["Omsättning om 3 år"] * ps_snitt) / rad["Utestående aktier"], 2)
     return df
 
-def hamta_valutakurs(valuta):
-    return STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0)
-
 def lagg_till_eller_uppdatera(df):
     st.subheader("➕ Lägg till / uppdatera bolag")
     namn_map = {f"{rad['Bolagsnamn']} ({rad['Ticker']})": rad['Ticker'] for _, rad in df.iterrows()}
@@ -223,6 +220,7 @@ def analysvy(df, valutakurser):
 
     if st.button("🔄 Uppdatera alla aktuella kurser och fundamenta från Yahoo"):
         misslyckade, uppdaterade = [], 0
+        ps_yahoo, ps_manuell, ps_saknas = [], [], []
         total = len(df)
         status = st.empty()
         bar = st.progress(0)
@@ -243,17 +241,29 @@ def analysvy(df, valutakurser):
                         df.at[i, "Aktuell kurs"] = round(pris, 2)
                         df.at[i, "Valuta"] = valuta
 
-                    # 2️⃣ P/S idag från Yahoo
+                    # 2️⃣ P/S idag (Yahoo eller manuellt)
                     ps_ttm = info.get("priceToSalesTrailing12Months", None)
                     if ps_ttm is not None:
                         df.at[i, "P/S"] = round(ps_ttm, 2)
+                        ps_yahoo.append(ticker)
+                    else:
+                        marketcap = info.get("marketCap", None)
+                        if marketcap and "Total Revenue" in yticker.financials.index:
+                            revenues = yticker.financials.loc["Total Revenue"].dropna().tolist()
+                            if revenues:
+                                senaste_oms = revenues[0]
+                                if senaste_oms > 0:
+                                    ps_ttm = marketcap / senaste_oms
+                                    df.at[i, "P/S"] = round(ps_ttm, 2)
+                                    ps_manuell.append(ticker)
+                        if ps_ttm is None:
+                            ps_saknas.append(ticker)
 
-                    # P/S Q1–Q4 (bara om vi har kvartalsomsättning)
+                    # P/S Q1–Q4
                     aktier_utest = row.get("Utestående aktier", 0)
                     if aktier_utest > 0 and "Total Revenue" in yticker.quarterly_financials.index:
                         kursdata = yticker.history(period="1y", interval="3mo")["Close"].tolist()
                         kvartalsoms = yticker.quarterly_financials.loc["Total Revenue"].tolist()
-
                         ps_values = []
                         for kurs_q, oms_q in zip(kursdata, kvartalsoms):
                             if kurs_q and oms_q and oms_q > 0:
@@ -261,7 +271,6 @@ def analysvy(df, valutakurser):
                                 ps_values.append(round(marketcap_q / oms_q, 2))
                             else:
                                 ps_values.append(None)
-
                         if len(ps_values) > 0 and ps_values[0] is not None:
                             df.at[i, "P/S Q1"] = ps_values[0]
                         if len(ps_values) > 1 and ps_values[1] is not None:
@@ -279,7 +288,6 @@ def analysvy(df, valutakurser):
                             revenue_estimates = analysis.loc["Revenue Estimate"]
                             oms1 = revenue_estimates.iloc[0, 1] if pd.notna(revenue_estimates.iloc[0, 1]) else None
                             oms2 = revenue_estimates.iloc[1, 1] if pd.notna(revenue_estimates.iloc[1, 1]) else None
-
                             if oms1:
                                 df.at[i, "Omsättning nästa år"] = oms1
                             if oms2:
@@ -292,7 +300,7 @@ def analysvy(df, valutakurser):
                     try:
                         if "Total Revenue" in yticker.financials.index:
                             revenues = yticker.financials.loc["Total Revenue"].dropna().tolist()
-                            revenues = revenues[::-1]  # äldsta först
+                            revenues = revenues[::-1]
                             if len(revenues) >= 2:
                                 start_val = revenues[0]
                                 end_val = revenues[-1]
@@ -319,9 +327,8 @@ def analysvy(df, valutakurser):
                     misslyckade.append(ticker)
 
                 bar.progress((i + 1) / total)
-                time.sleep(1)  # Väntetid = 1 sekund per ticker
+                time.sleep(1)
 
-            # 6️⃣ Uppdatera riktkurser
             df = uppdatera_berakningar(df)
             spara_data(df)
 
@@ -329,18 +336,21 @@ def analysvy(df, valutakurser):
         st.success(f"{uppdaterade} tickers uppdaterade.")
         if misslyckade:
             st.warning("Kunde inte uppdatera följande tickers:\n" + ", ".join(misslyckade))
+        if ps_yahoo:
+            st.info(f"P/S hämtades direkt från Yahoo för: {', '.join(ps_yahoo)}")
+        if ps_manuell:
+            st.info(f"P/S beräknades manuellt för: {', '.join(ps_manuell)}")
+        if ps_saknas:
+            st.warning(f"Inget P/S kunde sättas för: {', '.join(ps_saknas)}")
 
     st.dataframe(df, use_container_width=True)
 
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
-
-    # Hämta data och säkerställ kolumner
     df = hamta_data()
     df = säkerställ_kolumner(df)
     df = konvertera_typer(df)
 
-    # Valutakurser – kan ändras manuellt
     valutakurser = {}
     st.sidebar.subheader("💱 Valutakurser")
     for valuta in ["USD", "NOK", "CAD", "SEK", "EUR"]:
@@ -350,20 +360,16 @@ def main():
             step=0.01
         )
 
-    # Meny
     meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
 
     if meny == "Analys":
         analysvy(df, valutakurser)
-
     elif meny == "Lägg till / uppdatera bolag":
         df = lagg_till_eller_uppdatera(df)
         spara_data(df)
-
     elif meny == "Investeringsförslag":
         df = uppdatera_berakningar(df)
         visa_investeringsforslag(df, valutakurser)
-
     elif meny == "Portfölj":
         df = uppdatera_berakningar(df)
         visa_portfolj(df, valutakurser)

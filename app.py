@@ -216,7 +216,6 @@ def visa_investeringsforslag(df, valutakurser):
 
 def analysvy(df, valutakurser):
     st.subheader("📈 Analysläge")
-    df = uppdatera_berakningar(df)
 
     if st.button("🔄 Uppdatera alla aktuella kurser och fundamenta från Yahoo"):
         misslyckade, uppdaterade = [], 0
@@ -241,7 +240,7 @@ def analysvy(df, valutakurser):
                         df.at[i, "Aktuell kurs"] = round(pris, 2)
                         df.at[i, "Valuta"] = valuta
 
-                    # 2️⃣ P/S idag (Yahoo eller manuellt)
+                    # 2️⃣ P/S idag
                     ps_ttm = info.get("priceToSalesTrailing12Months", None)
                     if ps_ttm is not None:
                         df.at[i, "P/S"] = round(ps_ttm, 2)
@@ -329,8 +328,8 @@ def analysvy(df, valutakurser):
                 bar.progress((i + 1) / total)
                 time.sleep(1)
 
-            df = uppdatera_berakningar(df)
-            spara_data(df)
+        # ✅ Spara alla ändringar direkt efter loopen
+        spara_data(df)
 
         status.text("✅ Uppdatering klar.")
         st.success(f"{uppdaterade} tickers uppdaterade.")

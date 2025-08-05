@@ -8,11 +8,13 @@ from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
-# -------------------------------------------------------
-# KONSTANTER
-# -------------------------------------------------------
+# Google Sheets
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
+client = gspread.authorize(credentials)
+
 STANDARD_VALUTAKURSER = {
     "USD": 9.75,
     "NOK": 0.95,
@@ -20,13 +22,6 @@ STANDARD_VALUTAKURSER = {
     "SEK": 1.0,
     "EUR": 11.18
 }
-
-# -------------------------------------------------------
-# GOOGLE SHEETS
-# -------------------------------------------------------
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
-client = gspread.authorize(credentials)
 
 def skapa_koppling():
     return client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
@@ -40,9 +35,6 @@ def spara_data(df):
     sheet.clear()
     sheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
 
-# -------------------------------------------------------
-# HJÄLPFUNKTIONER
-# -------------------------------------------------------
 def konvertera_typer(df):
     kolumner = [
         "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
@@ -132,7 +124,6 @@ def lagg_till_eller_uppdatera(df):
             df = pd.concat([df, pd.DataFrame([ny_rad])], ignore_index=True)
             st.success(f"{ticker} tillagt.")
     return df
-
 
 def visa_portfolj(df, valutakurser):
     st.subheader("📦 Min portfölj")
@@ -241,7 +232,7 @@ def analysvy(df, valutakurser):
                         df.at[i, "Aktuell kurs"] = round(pris, 2)
                         df.at[i, "Valuta"] = valuta
 
-                    # 2️⃣ P/S idag
+                    # 2️⃣ P/S idag (Yahoo eller manuellt)
                     ps_ttm = info.get("priceToSalesTrailing12Months", None)
                     if ps_ttm is not None and 0 < ps_ttm < 1000:
                         df.at[i, "P/S"] = round(ps_ttm, 2)
@@ -252,7 +243,7 @@ def analysvy(df, valutakurser):
                             revenues = yticker.financials.loc["Total Revenue"].dropna().tolist()
                             if revenues:
                                 senaste_oms = revenues[0]
-                                if senaste_oms > 0:
+                                if senaste_oms > 1_000_000:  # måste vara minst 1M USD
                                     ps_calc = marketcap / senaste_oms
                                     if 0 < ps_calc < 1000:
                                         df.at[i, "P/S"] = round(ps_calc, 2)
@@ -260,7 +251,7 @@ def analysvy(df, valutakurser):
                         if df.at[i, "P/S"] == 0:
                             ps_saknas.append(ticker)
 
-                    # 3️⃣ P/S Q1–Q4 med kontroll
+                    # 3️⃣ P/S Q1–Q4 från kvartalsdata eller fallback
                     aktier_utest = row.get("Utestående aktier", 0) * 1_000_000
                     kursdata = yticker.history(period="1y", interval="3mo")["Close"].dropna().tolist()
                     kvartalsoms = []
@@ -272,22 +263,21 @@ def analysvy(df, valutakurser):
                         for idx in range(min(4, antal_kvartal)):
                             kurs_q = kursdata[idx]
                             oms_q = kvartalsoms[idx] if idx < len(kvartalsoms) else None
-                            if kurs_q and oms_q and oms_q > 0:
+                            if oms_q and oms_q > 1_000_000:  # minst 1M USD
                                 ps_val = (kurs_q * aktier_utest) / oms_q
                                 if 0 < ps_val < 1000:
                                     df.at[i, f"P/S Q{idx+1}"] = round(ps_val, 2)
                     else:
-                        # Fallback med årsdata
+                        # fallback till årsdata
                         if "Total Revenue" in yticker.financials.index:
                             årsoms = yticker.financials.loc["Total Revenue"].dropna().tolist()
-                            if årsoms:
+                            if årsoms and årsoms[0] > 1_000_000:
                                 uppskattad_kvartalsoms = årsoms[0] / 4
                                 for idx in range(min(4, len(kursdata))):
                                     kurs_q = kursdata[idx]
-                                    if kurs_q and uppskattad_kvartalsoms > 0:
-                                        ps_val = (kurs_q * aktier_utest) / uppskattad_kvartalsoms
-                                        if 0 < ps_val < 1000:
-                                            df.at[i, f"P/S Q{idx+1}"] = round(ps_val, 2)
+                                    ps_val = (kurs_q * aktier_utest) / uppskattad_kvartalsoms
+                                    if 0 < ps_val < 1000:
+                                        df.at[i, f"P/S Q{idx+1}"] = round(ps_val, 2)
 
                     uppdaterade += 1
 
@@ -297,7 +287,10 @@ def analysvy(df, valutakurser):
                 bar.progress((i + 1) / total)
                 time.sleep(1)
 
+        # 🔄 Beräkna snitt & riktkurser direkt
+        df = uppdatera_berakningar(df)
         spara_data(df)
+
         status.text("✅ Uppdatering klar.")
         st.success(f"{uppdaterade} tickers uppdaterade.")
         if misslyckade:

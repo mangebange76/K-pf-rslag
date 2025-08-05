@@ -207,6 +207,7 @@ def uppdatera_berakningar(df):
             df.at[i, "Riktkurs om 3 år"] = round((rad["Omsättning om 3 år"] * ps_snitt) / rad["Utestående aktier"], 2)
     return df
 
+
 def lagg_till_eller_uppdatera(df):
     st.subheader("➕ Lägg till / uppdatera bolag")
     namn_map = {f"{rad['Bolagsnamn']} ({rad['Ticker']})": rad['Ticker'] for _, rad in df.iterrows()}
@@ -222,7 +223,11 @@ def lagg_till_eller_uppdatera(df):
         ticker = st.text_input("Ticker", value=befintlig.get("Ticker", "") if not befintlig.empty else "").upper()
         namn = st.text_input("Bolagsnamn", value=befintlig.get("Bolagsnamn", "") if not befintlig.empty else "")
         kurs = st.number_input("Aktuell kurs", value=float(befintlig.get("Aktuell kurs", 0.0)) if not befintlig.empty else 0.0)
-        valuta = st.selectbox("Valuta", ["USD", "NOK", "EUR", "CAD"], index=0 if befintlig.get("Valuta", "") == "" else ["USD", "NOK", "EUR", "CAD"].index(befintlig.get("Valuta", "USD")))
+        valuta = st.selectbox(
+            "Valuta",
+            ["USD", "NOK", "EUR", "CAD"],
+            index=0 if befintlig.get("Valuta", "") == "" else ["USD", "NOK", "EUR", "CAD"].index(befintlig.get("Valuta", "USD"))
+        )
         aktier = st.number_input("Utestående aktier (miljoner)", value=float(befintlig.get("Utestående aktier", 0.0)) if not befintlig.empty else 0.0)
         antal_aktier = st.number_input("Antal aktier du äger", value=float(befintlig.get("Antal aktier", 0.0)) if not befintlig.empty else 0.0)
 
@@ -241,40 +246,84 @@ def lagg_till_eller_uppdatera(df):
 
     if sparaknapp and ticker:
         ny_rad = {
-            "Ticker": ticker, "Bolagsnamn": namn, "Aktuell kurs": kurs, "Valuta": valuta, "Utestående aktier": aktier, "Antal aktier": antal_aktier,
+            "Ticker": ticker, "Bolagsnamn": namn, "Aktuell kurs": kurs, "Valuta": valuta,
+            "Utestående aktier": aktier, "Antal aktier": antal_aktier,
             "P/S": ps_idag, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
             "Omsättning idag": oms_idag, "Omsättning nästa år": oms_1, "Omsättning om 2 år": oms_2, "Omsättning om 3 år": oms_3
+        }
 
-Här kommer **Del 3** igen, komplett och i rätt form, med nya riktkurs‑namn, valutahantering och oförändrad baslogik i övrigt.  
-
----
-
-```python
-def uppdatera_berakningar(df):
-    for i, rad in df.iterrows():
-        ps = [rad["P/S Q1"], rad["P/S Q2"], rad["P/S Q3"], rad["P/S Q4"]]
-        ps = [x for x in ps if x > 0]
-        ps_snitt = round(np.mean(ps), 2) if ps else 0
-        df.at[i, "P/S-snitt"] = ps_snitt
-
-        if rad["Utestående aktier"] > 0:
-            df.at[i, "Riktkurs idag"] = round((rad["Omsättning idag"] * ps_snitt) / rad["Utestående aktier"], 2)
-            df.at[i, "Riktkurs om 1 år"] = round((rad["Omsättning nästa år"] * ps_snitt) / rad["Utestående aktier"], 2)
-            df.at[i, "Riktkurs om 2 år"] = round((rad["Omsättning om 2 år"] * ps_snitt) / rad["Utestående aktier"], 2)
-            df.at[i, "Riktkurs om 3 år"] = round((rad["Omsättning om 3 år"] * ps_snitt) / rad["Utestående aktier"], 2)
+        if ticker in df["Ticker"].values:
+            df.loc[df["Ticker"] == ticker, ny_rad.keys()] = ny_rad.values()
+            st.success(f"{ticker} uppdaterat.")
+        else:
+            df = pd.concat([df, pd.DataFrame([ny_rad])], ignore_index=True)
+            st.success(f"{ticker} tillagt.")
     return df
 
 
-def lagg_till_eller_uppdatera(df):
-    st.subheader("➕ Lägg till / uppdatera bolag")
-    namn_map = {f"{rad['Bolagsnamn']} ({rad['Ticker']})": rad['Ticker'] for _, rad in df.iterrows()}
-    valt = st.selectbox("Välj bolag att uppdatera (eller lämna tom för nytt)", [""] + sorted(namn_map.keys()))
+def visa_investeringsforslag(df, valutakurser):
+    st.subheader("💡 Investeringsförslag")
+    kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=500.0, step=500.0)
 
-    if valt:
-        ticker_vald = namn_map[valt]
-        befintlig = df[df["Ticker"] == ticker_vald].iloc[0]
+    riktkurs_val = st.selectbox(
+        "Vilken riktkurs ska användas?",
+        ["Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år"],
+        index=1
+    )
+
+    filterval = st.radio("Visa förslag för:", ["Alla bolag", "Endast portföljen"])
+
+    df_portfolj = df[df["Antal aktier"] > 0].copy()
+    df_portfolj["Värde (SEK)"] = df_portfolj.apply(
+        lambda r: r["Antal aktier"] * r["Aktuell kurs"] * valutakurser.get(r["Valuta"], 1), axis=1
+    )
+    portfoljvarde = df_portfolj["Värde (SEK)"].sum()
+
+    if filterval == "Endast portföljen":
+        df_forslag = df_portfolj[df_portfolj[riktkurs_val] > df_portfolj["Aktuell kurs"]].copy()
     else:
-        befintlig = pd.Series(dtype=object)
+        df_forslag = df[df[riktkurs_val] > df["Aktuell kurs"]].copy()
+
+    df_forslag["Potential (%)"] = ((df_forslag[riktkurs_val] - df_forslag["Aktuell kurs"]) / df_forslag["Aktuell kurs"]) * 100
+    df_forslag = df_forslag.sort_values(by="Potential (%)", ascending=False).reset_index(drop=True)
+
+    if df_forslag.empty:
+        st.info("Inga bolag matchar kriterierna just nu.")
+        return
+
+    if 'forslags_index' not in st.session_state:
+        st.session_state.forslags_index = 0
+
+    index = st.session_state.forslags_index
+    if index >= len(df_forslag):
+        st.info("Inga fler förslag att visa.")
+        return
+
+    rad = df_forslag.iloc[index]
+    kapital_valuta = kapital_sek / valutakurser.get(rad["Valuta"], 1)
+
+    antal = int(kapital_valuta // rad["Aktuell kurs"])
+    investering_sek = antal * rad["Aktuell kurs"] * valutakurser.get(rad["Valuta"], 1)
+
+    nuvarande_innehav = df_portfolj[df_portfolj["Ticker"] == rad["Ticker"]]["Värde (SEK)"].sum()
+    ny_total = nuvarande_innehav + investering_sek
+    nuvarande_andel = round((nuvarande_innehav / portfoljvarde) * 100, 2) if portfoljvarde > 0 else 0
+    ny_andel = round((ny_total / portfoljvarde) * 100, 2) if portfoljvarde > 0 else 0
+
+    st.markdown(f"""
+        ### 💰 Förslag {index+1} av {len(df_forslag)}
+        - **Bolag:** {rad['Bolagsnamn']} ({rad['Ticker']})
+        - **Aktuell kurs:** {round(rad['Aktuell kurs'], 2)} {rad['Valuta']}
+        - **{riktkurs_val}:** {round(rad[riktkurs_val], 2)} {rad['Valuta']}
+        - **Potential:** {round(rad['Potential (%)'], 2)}%
+        - **Antal att köpa:** {antal} st
+        - **Beräknad investering:** {round(investering_sek, 2)} SEK
+        - **Nuvarande andel i portföljen:** {nuvarande_andel}%
+        - **Andel efter köp:** {ny_andel}%
+    """)
+
+    if st.button("➡️ Nästa förslag"):
+        st.session_state.forslags_index += 1
 
 def visa_portfolj(df, valutakurser):
     st.subheader("📦 Min portfölj")

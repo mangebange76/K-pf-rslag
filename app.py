@@ -193,7 +193,6 @@ def visa_investeringsforslag(df, valutakurser):
     filterval = st.radio("Visa förslag för:", ["Alla bolag", "Endast portföljen"])
 
     df_portfolj = df[df["Antal aktier"] > 0].copy()
-    # Konvertera alla till SEK baserat på bolagets valuta
     df_portfolj["Värde (SEK)"] = df_portfolj.apply(
         lambda x: x["Antal aktier"] * x["Aktuell kurs"] * valutakurser.get(x["Valuta"], 1),
         axis=1
@@ -257,7 +256,6 @@ def visa_portfolj(df, valutakurser):
     df["Andel (%)"] = round(df["Värde (SEK)"] / df["Värde (SEK)"].sum() * 100, 2)
     total = df["Värde (SEK)"].sum()
 
-    # Utdelningar
     df["Årlig utdelning (SEK)"] = df.apply(
         lambda x: x["Årlig utdelning"] * x["Antal aktier"] * valutakurser.get(x["Valuta"], 1),
         axis=1
@@ -274,17 +272,9 @@ def visa_portfolj(df, valutakurser):
         "Värde (SEK)", "Andel (%)", "Årlig utdelning (SEK)"
     ]], use_container_width=True)
 
-def analysvy(df):
+def analysvy(df, valutakurser):
     st.subheader("📈 Analysläge")
     df = uppdatera_berakningar(df)
-
-    valutakurser = {
-        "USD": st.sidebar.number_input("USD → SEK", value=9.50, step=0.01),
-        "NOK": st.sidebar.number_input("NOK → SEK", value=0.93, step=0.01),
-        "CAD": st.sidebar.number_input("CAD → SEK", value=7.00, step=0.01),
-        "SEK": 1.0,
-        "EUR": st.sidebar.number_input("EUR → SEK", value=11.10, step=0.01)
-    }
 
     if st.button("🔄 Uppdatera alla aktuella kurser från Yahoo"):
         misslyckade = {}
@@ -308,7 +298,7 @@ def analysvy(df):
                 except Exception:
                     misslyckade.setdefault(ticker, []).append("Kunde inte uppdateras alls")
 
-                time.sleep(2)  # paus mellan anrop
+                time.sleep(2)
 
         df = räkna_omsättning_cagr(df)
         spara_data(df)
@@ -328,11 +318,8 @@ def analysvy(df):
     st.dataframe(df, use_container_width=True)
 
 def räkna_omsättning_cagr(df):
-    """Beräknar omsättning år 2 och år 3 baserat på CAGR för de senaste 5 åren om möjligt."""
     for i, rad in df.iterrows():
-        # Om vi redan har manuell data för år 2/3 rör vi den inte
         if rad["Omsättning nästa år"] > 0 and rad["Omsättning om 2 år"] == 0:
-            # Försök hämta CAGR
             try:
                 hist = yf.Ticker(rad["Ticker"]).history(period="5y", interval="1y")
                 oms_hist = hist["Close"].tolist()
@@ -340,7 +327,7 @@ def räkna_omsättning_cagr(df):
                     start_val = oms_hist[0]
                     slut_val = oms_hist[-1]
                     cagr = ((slut_val / start_val) ** (1 / (len(oms_hist) - 1))) - 1
-                    cagr = max(min(cagr, 0.50), -0.02)  # Tak 50%, golv -2% (inflationsjusterat)
+                    cagr = max(min(cagr, 0.50), -0.02)
 
                     år2 = rad["Omsättning nästa år"] * (1 + cagr)
                     år3 = år2 * (1 + cagr)
@@ -368,7 +355,7 @@ def main():
     meny = st.sidebar.radio("Meny", ["Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"])
 
     if meny == "Analys":
-        analysvy(df)
+        analysvy(df, valutakurser)
     elif meny == "Lägg till / uppdatera bolag":
         df = lagg_till_eller_uppdatera(df)
         spara_data(df)

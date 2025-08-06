@@ -82,16 +82,22 @@ def uppdatera_berakningar(df):
 
 def massinmatning_ps_oms(df):
     st.subheader("📝 Massinmatning av P/S och omsättning")
-    st.info("Fyll i dina manuella värden. Tomma fält betyder att inget värde är satt.")
+    st.info("Fyll i dina manuella värden. Ticker är låst och kan inte ändras.")
 
-    redigerbara_kolumner = ["Ticker", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-                             "Omsättning idag", "Omsättning nästa år"]
+    # Se till att Ticker ligger först
+    kolumner = ["Ticker", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+                "Omsättning idag", "Omsättning nästa år"]
 
-    # Visa en redigerbar tabell
     df_edit = st.data_editor(
-        df[redigerbara_kolumner],
+        df[kolumner],
         num_rows="dynamic",
-        use_container_width=True
+        use_container_width=True,
+        column_config={
+            "Ticker": st.column_config.TextColumn(
+                "Ticker",
+                disabled=True  # Gör Ticker read-only
+            )
+        }
     )
 
     if st.button("💾 Spara ändringar"):
@@ -156,10 +162,6 @@ def visa_investeringsforslag(df, valutakurser):
 
     df_forslag["Potential (%)"] = ((df_forslag[riktkurs_val] - df_forslag["Aktuell kurs"]) / df_forslag["Aktuell kurs"]) * 100
     df_forslag = df_forslag.sort_values(by="Potential (%)", ascending=False).reset_index(drop=True)
-
-    if valutakurser.get("USD", 0) == 0:
-        st.warning("Valutakursen får inte vara 0.")
-        return
 
     kapital_usd = kapital_sek / valutakurser.get("USD", 1)
 
@@ -265,6 +267,8 @@ def analysvy(df):
             miss_str = "\n".join(f"{t}: {', '.join(fel)}" for t, fel in misslyckade.items())
             st.text_area("Misslyckade uppdateringar", miss_str)
 
+    # Visa hela databasen längst ner
+    st.markdown("### 📄 Hela databasen")
     st.dataframe(df, use_container_width=True)
 
 def main():

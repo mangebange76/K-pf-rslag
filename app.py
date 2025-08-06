@@ -102,7 +102,7 @@ def scrape_yahoo_finance(ticker):
         if price_tag:
             try:
                 kurs = float(price_tag.get_text(strip=True).replace(",", ""))
-                if 0.01 < kurs < 2000:  # Rimlighetskontroll
+                if 0.01 < kurs < 2000:
                     result["Aktuell kurs"] = kurs
                 else:
                     result["Aktuell kurs_flag"] = f"⚠ Orimlig kurs ({kurs})"
@@ -121,10 +121,11 @@ def scrape_yahoo_finance(ticker):
             cols = [c.get_text(strip=True) for c in row.find_all("td")]
             if len(cols) == 2 and "Price/Sales" in cols[0]:
                 ps_val = parse_yahoo_number(cols[1])
-                if ps_val:
+                if ps_val is None or ps_val > 2000:
+                    result["P/S"] = 0
+                    result["P/S_flag"] = "⚠ Orimligt eller saknas – satt till 0"
+                else:
                     result["P/S"] = ps_val
-                    if ps_val > 200:
-                        result["P/S_flag"] = f"⚠ Högt P/S ({ps_val})"
 
         # --- Analysis-sidan för omsättning ---
         analysis_url = f"{base_url}/analysis"
@@ -167,10 +168,13 @@ def fallback_yfinance(ticker, current_data):
             oms_ttm = parse_yahoo_number(info.get("totalRevenue"))
             if oms_ttm and marketcap:
                 ps_val = marketcap / oms_ttm
-                current_data["P/S"] = ps_val
-                if ps_val > 200:
-                    current_data["P/S_flag"] = f"⚠ Högt P/S ({ps_val})"
-
+                if ps_val is None or ps_val > 2000:
+                    current_data["P/S"] = 0
+                    current_data["P/S_flag"] = "⚠ Orimligt eller saknas – satt till 0"
+                else:
+                    current_data["P/S"] = ps_val
+            else:
+                current_data["P/S"] = 0
     except Exception:
         pass
 
@@ -199,19 +203,22 @@ def analysvy(df, valutakurser):
             if "Aktuell kurs" in data and data["Aktuell kurs"] is not None:
                 df.at[i, "Aktuell kurs"] = data["Aktuell kurs"]
             else:
-                fel_falt.append("Aktuell kurs")
+                df.at[i, "Aktuell kurs"] = 0
+                fel_falt.append("Aktuell kurs saknas")
             if "Aktuell kurs_flag" in data:
                 fel_falt.append(data["Aktuell kurs_flag"])
 
             if data.get("Valuta"):
                 df.at[i, "Valuta"] = data["Valuta"]
             else:
+                df.at[i, "Valuta"] = "USD"
                 fel_falt.append("Valuta saknas")
 
             # P/S
             if data.get("P/S") is not None:
                 df.at[i, "P/S"] = data["P/S"]
             else:
+                df.at[i, "P/S"] = 0
                 fel_falt.append("P/S saknas")
             if "P/S_flag" in data:
                 fel_falt.append(data["P/S_flag"])
@@ -220,26 +227,28 @@ def analysvy(df, valutakurser):
             if data.get("Omsättning idag") is not None:
                 df.at[i, "Omsättning idag"] = data["Omsättning idag"]
             else:
+                df.at[i, "Omsättning idag"] = 0
                 fel_falt.append("Omsättning idag saknas")
 
             if data.get("Omsättning nästa år") is not None:
                 df.at[i, "Omsättning nästa år"] = data["Omsättning nästa år"]
             else:
+                df.at[i, "Omsättning nästa år"] = 0
                 fel_falt.append("Omsättning nästa år saknas")
 
-            # Beräkna omsättning år 2 och 3 med CAGR
-            if data.get("Omsättning idag") and data.get("Omsättning nästa år"):
-                oms0 = data["Omsättning idag"]
-                oms1 = data["Omsättning nästa år"]
-                if oms0 > 0:
-                    cagr = (oms1 / oms0) - 1
-                    if cagr > 0.50:
-                        fel_falt.append(f"⚠ Hög tillväxt ({round(cagr*100,1)}%)")
-                    cagr = min(max(cagr, 0.02), 0.50)
-                    df.at[i, "Omsättning om 2 år"] = oms1 * (1 + cagr)
-                    df.at[i, "Omsättning om 3 år"] = df.at[i, "Omsättning om 2 år"] * (1 + cagr)
+            # Beräkna omsättning år 2 och 3 med CAGR (tak 50%)
+            if df.at[i, "Omsättning idag"] > 0 and df.at[i, "Omsättning nästa år"] > 0:
+                oms0 = df.at[i, "Omsättning idag"]
+                oms1 = df.at[i, "Omsättning nästa år"]
+                cagr = (oms1 / oms0) - 1
+                if cagr > 0.50:
+                    fel_falt.append(f"⚠ Hög tillväxt ({round(cagr*100,1)}%)")
+                cagr = min(max(cagr, 0.02), 0.50)
+                df.at[i, "Omsättning om 2 år"] = oms1 * (1 + cagr)
+                df.at[i, "Omsättning om 3 år"] = df.at[i, "Omsättning om 2 år"] * (1 + cagr)
             else:
-                fel_falt.extend(["Omsättning om 2 år saknas", "Omsättning om 3 år saknas"])
+                df.at[i, "Omsättning om 2 år"] = 0
+                df.at[i, "Omsättning om 3 år"] = 0
 
             if fel_falt:
                 fel_lista.append({"Ticker": ticker, "Fel": fel_falt})
@@ -260,9 +269,9 @@ def analysvy(df, valutakurser):
 
 def uppdatera_berakningar(df):
     for i, rad in df.iterrows():
-        ps = [rad["P/S Q1"], rad["P/S Q2"], rad["P/S Q3"], rad["P/S Q4"]]
-        ps = [x for x in ps if x > 0]
-        ps_snitt = round(np.mean(ps), 2) if ps else 0
+        ps_values = [rad["P/S Q1"], rad["P/S Q2"], rad["P/S Q3"], rad["P/S Q4"]]
+        ps_values = [x for x in ps_values if 0 < x < 2000]  # Endast rimliga värden
+        ps_snitt = round(np.mean(ps_values), 2) if ps_values else 0
         df.at[i, "P/S-snitt"] = ps_snitt
 
         if rad["Utestående aktier"] > 0 and ps_snitt > 0:
@@ -270,6 +279,11 @@ def uppdatera_berakningar(df):
             df.at[i, "Riktkurs om 1 år"] = round((rad["Omsättning nästa år"] * ps_snitt) / rad["Utestående aktier"], 2)
             df.at[i, "Riktkurs om 2 år"] = round((rad["Omsättning om 2 år"] * ps_snitt) / rad["Utestående aktier"], 2)
             df.at[i, "Riktkurs om 3 år"] = round((rad["Omsättning om 3 år"] * ps_snitt) / rad["Utestående aktier"], 2)
+        else:
+            df.at[i, "Riktkurs idag"] = 0
+            df.at[i, "Riktkurs om 1 år"] = 0
+            df.at[i, "Riktkurs om 2 år"] = 0
+            df.at[i, "Riktkurs om 3 år"] = 0
     return df
 
 
@@ -405,7 +419,10 @@ def visa_portfolj(df, valutakurser):
     total = df["Värde (SEK)"].sum()
 
     st.markdown(f"**Totalt portföljvärde:** {round(total, 2)} SEK")
-    st.dataframe(df[["Ticker", "Bolagsnamn", "Valuta", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]], use_container_width=True)
+    st.dataframe(
+        df[["Ticker", "Bolagsnamn", "Valuta", "Antal aktier", "Aktuell kurs", "Värde (SEK)", "Andel (%)"]],
+        use_container_width=True
+    )
 
 
 def main():

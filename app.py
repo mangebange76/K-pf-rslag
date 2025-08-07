@@ -98,7 +98,7 @@ def lagg_till_eller_uppdatera(df):
     else:
         data = pd.Series(dtype=object)
 
-    med st.form("nytt_bolag"):
+    with st.form("nytt_bolag"):
         ticker = st.text_input("Ticker", data.get("Ticker", ""))
         utestående_aktier = st.number_input("Utestående aktier", value=float(data.get("Utestående aktier", 0)), step=1.0)
         ps = st.number_input("P/S", value=float(data.get("P/S", 0)), step=0.01)

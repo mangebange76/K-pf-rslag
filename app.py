@@ -309,58 +309,6 @@ def portfoljvy(df):
     st.metric("Total kommande utdelning", f"{total_utdelning:,.0f} SEK")
     st.metric("Utdelning per månad (snitt)", f"{utdelning_per_manad:,.0f} SEK")
 
-def konvertera_typer(df):
-    """
-    Säkerställer att alla numeriska kolumner konverteras korrekt för att möjliggöra beräkningar.
-    """
-    numeriska_kolumner = [
-        "Kurs", "Utdelning", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "P/S-snitt", "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-        "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-        "CAGR 5 år (%)", "Antal aktier"
-    ]
-    for kolumn in numeriska_kolumner:
-        if kolumn in df.columns:
-            df[kolumn] = pd.to_numeric(df[kolumn], errors="coerce")
-    return df
-
-
-def main():
-    st.title("📊 Aktieanalys och investeringsförslag")
-
-    meny = st.sidebar.radio("Välj vy", [
-        "Lägg till / uppdatera bolag",
-        "Portfölj",
-        "Investeringsförslag",
-        "Analys",
-        "Massuppdatera"
-    ])
-
-    df = hamta_data()
-    df = säkerställ_kolumner(df)
-    df = konvertera_typer(df)
-    df = beräkna_allt(df)
-
-    if meny == "Lägg till / uppdatera bolag":
-        df = lagg_till_eller_uppdatera(df)
-        spara_data(df)
-
-    elif meny == "Portfölj":
-        visa_portfolj(df)
-
-    elif meny == "Investeringsförslag":
-        visa_investeringsforslag(df)
-
-    elif meny == "Analys":
-        analysvy(df)
-
-    elif meny == "Massuppdatera":
-        massuppdatera(df)
-
-
-if __name__ == "__main__":
-    main()
-
 def visa_portfolj(df):
     st.subheader("📈 Portföljsammanställning")
 
@@ -472,3 +420,55 @@ def massuppdatera(df):
 
         spara_data(df)
         st.success("Massuppdatering klar!")
+
+def konvertera_typer(df):
+    """
+    Säkerställer att alla numeriska kolumner konverteras korrekt för att möjliggöra beräkningar.
+    """
+    numeriska_kolumner = [
+        "Kurs", "Utdelning", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "P/S-snitt", "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+        "CAGR 5 år (%)", "Antal aktier"
+    ]
+    for kolumn in numeriska_kolumner:
+        if kolumn in df.columns:
+            df[kolumn] = pd.to_numeric(df[kolumn], errors="coerce")
+    return df
+
+
+def main():
+    st.title("📊 Aktieanalys och investeringsförslag")
+
+    meny = st.sidebar.radio("Välj vy", [
+        "Lägg till / uppdatera bolag",
+        "Portfölj",
+        "Investeringsförslag",
+        "Analys",
+        "Massuppdatera"
+    ])
+
+    df = hamta_data()
+    df = säkerställ_kolumner(df)
+    df = konvertera_typer(df)
+    df = beräkna_allt(df)
+
+    if meny == "Lägg till / uppdatera bolag":
+        df = lagg_till_eller_uppdatera(df)
+        spara_data(df)
+
+    elif meny == "Portfölj":
+        visa_portfolj(df)
+
+    elif meny == "Investeringsförslag":
+        visa_investeringsforslag(df)
+
+    elif meny == "Analys":
+        analysvy(df)
+
+    elif meny == "Massuppdatera":
+        massuppdatera(df)
+
+
+if __name__ == "__main__":
+    main()

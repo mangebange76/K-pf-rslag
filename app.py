@@ -259,15 +259,25 @@ def investeringsförslag(df):
             st.experimental_set_query_params(index=index + 1)
             st.rerun()
 
+# --- Funktion: konvertera_typer ---
+def konvertera_typer(df):
+    numeriska_kolumner = [
+        "Aktuell kurs", "Utdelning", "Utestående aktier", "P/S",
+        "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "P/S-snitt", "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+        "Antal aktier", "CAGR 5 år (%)"
+    ]
+    for kolumn in numeriska_kolumner:
+        if kolumn in df.columns:
+            df[kolumn] = pd.to_numeric(df[kolumn], errors="coerce")
+
+    return df
+
+# --- Huvudprogram ---
 def main():
-    st.title("📊 Aktieanalys och investeringsförslag")
-    menyval = st.sidebar.radio("Meny", [
-        "Lägg till / uppdatera bolag",
-        "Analys",
-        "Portfölj",
-        "Investeringsförslag",
-        "Uppdatera alla bolag"
-    ])
+    st.sidebar.title("Meny")
+    menyval = st.sidebar.radio("Välj vy", ["Lägg till / uppdatera bolag", "Analys", "Portfölj", "Investeringsförslag", "Uppdatera alla bolag"])
 
     df = hämta_data()
     df = säkerställ_kolumner(df)
@@ -276,19 +286,14 @@ def main():
 
     if menyval == "Lägg till / uppdatera bolag":
         formulär(df)
-
     elif menyval == "Analys":
-        visa_analys(df)
-
+        analysvy(df)
     elif menyval == "Portfölj":
         visa_portfolj(df)
-
     elif menyval == "Investeringsförslag":
         investeringsförslag(df)
-
     elif menyval == "Uppdatera alla bolag":
         massuppdatera(df)
-
 
 if __name__ == "__main__":
     main()

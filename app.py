@@ -91,12 +91,10 @@ def hamta_vaxelkurs_for_rad(row, valutakurser: dict) -> float:
     val = str(row.get("Valuta", "") or "").upper()
     return float(valutakurser.get(val, 1.0))
 
-# --- Yahoo helpers ---
+# --- Yahoo-hämtning av kurs/valuta/namn/utdelning ---
 
 def hamta_kurs_valuta_namn_utdelning(ticker: str):
-    """
-    Hämtar aktuell kurs, valuta, bolagsnamn och årlig utdelning (om tillgänglig).
-    """
+    """Hämtar aktuell kurs, valuta, bolagsnamn och årlig utdelning (om tillgänglig)."""
     try:
         t = yf.Ticker(ticker)
         info = t.info or {}
@@ -114,10 +112,12 @@ def hamta_kurs_valuta_namn_utdelning(ticker: str):
     except Exception:
         return None, None, "", 0.0
 
+# --- CAGR 5 år från resultaträkning (Total Revenue) ---
+
 def hamta_cagr_5ar(ticker: str) -> float:
     """
-    Beräknar CAGR för intäkter över ~5 år från Yahoo (income statement).
-    Använder 'Total Revenue' om möjligt.
+    Beräknar CAGR för intäkter över ~5 år från Yahoo (income_stmt / financials).
+    Använder 'Total Revenue' om möjligt. Returnerar % (t.ex. 12.34).
     """
     try:
         t = yf.Ticker(ticker)
@@ -160,29 +160,32 @@ def hamta_cagr_5ar(ticker: str) -> float:
     except Exception:
         return 0.0
 
-# --- Beräkningar ---
+# --- CAGR-justering & omsättningsprognos ---
 
 def justera_cagr(cagr_procent: float) -> float:
     """
-    Begränsning: >100% -> 50% ; <0% -> 2%
-    Returnerar decimal (0.50 etc).
+    Begränsning för prognos:
+      - >100%  -> använd 50%
+      - <0%    -> använd 2% (inflation)
+      - annars decimalen av angiven CAGR
+    Returnerar decimal (0.50, 0.02 etc).
     """
     if cagr_procent > 100.0:
         return 0.50
-    if cagr_procent < 0.0:
+    if cagr_prosent := cagr_procent < 0.0:  # bara för läsbarhet – ger bool
         return 0.02
     return float(cagr_procent) / 100.0
 
 def räkna_omsättning_framåt(oms_next_year: float, cagr_pct: float):
-    """
-    Från 'Omsättning nästa år' -> räkna fram 'om 2 år' och 'om 3 år' med justerad CAGR.
-    """
+    """Från 'Omsättning nästa år' -> räkna fram 'om 2 år' och 'om 3 år' med justerad CAGR."""
     g = justera_cagr(cagr_pct)
     if oms_next_year <= 0:
         return 0.0, 0.0
     oms2 = oms_next_year * (1.0 + g)
     oms3 = oms2 * (1.0 + g)
     return round(oms2, 2), round(oms3, 2)
+
+# --- Riktkurser & P/S-snitt ---
 
 def uppdatera_berakningar(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -220,6 +223,8 @@ def uppdatera_berakningar(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[i, kol] = 0.0
     return df
 
+# --- Massuppdatering (1 s paus) ---
+
 def massuppdatera_yahoo(df: pd.DataFrame, paus_s: float = 1.0) -> pd.DataFrame:
     """
     För varje ticker: hämta kurs/valuta/namn/utdelning + CAGR, räkna om omsättning 2/3 år och riktkurser.
@@ -232,6 +237,9 @@ def massuppdatera_yahoo(df: pd.DataFrame, paus_s: float = 1.0) -> pd.DataFrame:
 
     for i, row in df.iterrows():
         ticker = str(row.get("Ticker", "")).strip()
+        if not ticker:
+            continue
+
         status.text(f"Uppdaterar {i+1}/{total}: {ticker}")
         try:
             pris, valuta, namn, utd = hamta_kurs_valuta_namn_utdelning(ticker)
@@ -275,7 +283,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
     # 🔁 Nollställ bläddring
     if st.button("🔁 Nollställ bläddring", key="reset_edit"):
         st.session_state.edit_idx = 0
-        st.experimental_rerun()
+        st.rerun()
 
     if "edit_idx" not in st.session_state:
         st.session_state.edit_idx = 0
@@ -291,11 +299,11 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
     with cnav[0]:
         if st.button("⬅️ Föregående", disabled=df.empty or st.session_state.edit_idx<=0):
             st.session_state.edit_idx = max(0, st.session_state.edit_idx-1)
-            st.experimental_rerun()
+            st.rerun()
     with cnav[1]:
         if st.button("Nästa ➡️", disabled=df.empty or st.session_state.edit_idx>=max(0,len(options)-1)):
             st.session_state.edit_idx = min(max(0,len(options)-1), st.session_state.edit_idx+1)
-            st.experimental_rerun()
+            st.rerun()
     with cnav[2]:
         if options:
             st.caption(f"Post **{st.session_state.edit_idx+1} / {len(options)}**")
@@ -358,7 +366,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
         ny["Omsättning om 2 år"] = oms2
         ny["Omsättning om 3 år"] = oms3
 
-        # Fyll eventuella saknade kolumner
+        # Säkerställ alla kolumner
         for kol in KOLUMNER:
             if kol not in ny:
                 ny[kol] = df.iloc[0][kol] if (not df.empty and kol in df.columns) else (0.0 if kol in NUMERISKA else "")
@@ -373,11 +381,11 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
         df = konvertera_typer(df)
         df = uppdatera_berakningar(df)
         spara_data(df)
-        st.experimental_rerun()
+        st.rerun()
 
     return df
 
-# --- Analysvy med portföljfilter & bläddring ---
+# --- Analysvy (filter + bläddring + nollställ) ---
 
 def analysvy(df: pd.DataFrame, valutakurser: dict):
     st.header("📈 Analys")
@@ -385,7 +393,7 @@ def analysvy(df: pd.DataFrame, valutakurser: dict):
     # 🔁 Nollställ bläddringsindex
     if st.button("🔁 Nollställ bläddring", key="reset_analys"):
         st.session_state.analys_idx = 0
-        st.experimental_rerun()
+        st.rerun()
 
     dfall = df.copy()
     dfall["Antal aktier"] = pd.to_numeric(dfall["Antal aktier"], errors="coerce").fillna(0.0)
@@ -422,11 +430,11 @@ def analysvy(df: pd.DataFrame, valutakurser: dict):
     with cnav[0]:
         if st.button("⬅️ Föregående", use_container_width=True) and st.session_state.analys_idx > 0:
             st.session_state.analys_idx -= 1
-            st.experimental_rerun()
+            st.rerun()
     with cnav[1]:
         if st.button("Nästa ➡️", use_container_width=True) and st.session_state.analys_idx < len(options) - 1:
             st.session_state.analys_idx += 1
-            st.experimental_rerun()
+            st.rerun()
     with cnav[2]:
         st.caption(f"Post **{st.session_state.analys_idx + 1} / {len(options)}**")
 
@@ -443,9 +451,9 @@ def analysvy(df: pd.DataFrame, valutakurser: dict):
         nytt = massuppdatera_yahoo(df, paus_s=1.0)
         spara_data(nytt)
         st.success("Uppdaterat och sparat.")
-        st.experimental_rerun()
+        st.rerun()
 
-# --- Investeringsförslag (med portföljfilter & bläddring) ---
+# --- Investeringsförslag (med filter + bläddring + nollställ) ---
 
 def investeringsforslag(df: pd.DataFrame, valutakurser: dict):
     st.header("💡 Investeringsförslag")
@@ -453,7 +461,7 @@ def investeringsforslag(df: pd.DataFrame, valutakurser: dict):
     # 🔁 Nollställ bläddringsindex
     if st.button("🔁 Nollställ bläddring", key="reset_forslag"):
         st.session_state.forslag_idx = 0
-        st.experimental_rerun()
+        st.rerun()
 
     # Filter: alla vs endast innehav i portföljen
     filterval = st.radio("Visa", ["Alla bolag", "Endast portföljen"], horizontal=True)
@@ -464,7 +472,7 @@ def investeringsforslag(df: pd.DataFrame, valutakurser: dict):
         st.session_state.forslag_filter = filterval
         st.session_state.forslag_idx = 0
 
-    # Välj riktkurs som styr sortering/uppsida
+    # Sortering/uppsida efter vald riktkurs
     val = st.selectbox(
         "Sortera & beräkna uppsida utifrån:",
         ["Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år"],
@@ -493,9 +501,11 @@ def investeringsforslag(df: pd.DataFrame, valutakurser: dict):
     with cnav[0]:
         if st.button("⬅️ Föregående", use_container_width=True) and st.session_state.forslag_idx > 0:
             st.session_state.forslag_idx -= 1
+            st.rerun()
     with cnav[1]:
         if st.button("Nästa ➡️", use_container_width=True) and st.session_state.forslag_idx < len(d) - 1:
             st.session_state.forslag_idx += 1
+            st.rerun()
     with cnav[2]:
         st.caption(f"Förslag **{st.session_state.forslag_idx + 1} / {len(d)}**")
 
@@ -546,14 +556,14 @@ def investeringsforslag(df: pd.DataFrame, valutakurser: dict):
     else:
         st.info("Ingen registrerad portfölj (Antal aktier = 0 på alla rader).")
 
-# --- Portföljvy (SEK-summering) ---
+# --- Portfölj (SEK-summering) ---
 
 def visa_portfolj(df: pd.DataFrame, valutakurser: dict):
     st.header("📦 Min portfölj")
 
-    # 🔁 Nollställ (ingen bläddring här – men för konsekvens)
+    # 🔁 Nollställ (ingen bläddring här – bara för konsekvens)
     if st.button("🔁 Nollställ bläddring", key="reset_port"):
-        st.experimental_rerun()
+        st.rerun()
 
     d = df.copy()
     d["Antal aktier"] = pd.to_numeric(d["Antal aktier"], errors="coerce").fillna(0.0)
@@ -612,7 +622,7 @@ def main():
         df2 = konvertera_typer(df2)
         df2 = uppdatera_berakningar(df2)
         spara_data(df2)
-        st.experimental_rerun()
+        st.rerun()
     elif meny == "Investeringsförslag":
         df = konvertera_typer(df)
         df = uppdatera_berakningar(df)

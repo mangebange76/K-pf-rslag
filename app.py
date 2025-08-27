@@ -72,6 +72,14 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
                 df[kol] = 0.0
             else:
                 df[kol] = ""
+    # Ta bort eventuella extrakolumner som inte används
+    extra = [c for c in df.columns if c not in FINAL_COLS]
+    if extra:
+        df = df[[c for c in df.columns if c in FINAL_COLS]]  # håll ordningen för befintliga
+        for c in FINAL_COLS:
+            if c not in df.columns:
+                df[c] = "" if c in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad"] else 0.0
+        df = df[FINAL_COLS]
     return df
 
 def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
@@ -208,12 +216,12 @@ def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
         # Riktkurser (kräver Utestående aktier > 0)
         aktier_ut = float(rad.get("Utestående aktier", 0.0))
         if aktier_ut > 0 and ps_snitt > 0:
-            df.at[i, "Riktkurs idag"]   = round((float(rad.get("Omsättning idag", 0.0))       * ps_snitt) / aktier_ut, 2)
-            df.at[i, "Riktkurs om 1 år"] = round((float(rad.get("Omsättning nästa år", 0.0))   * ps_snitt) / aktier_ut, 2)
-            df.at[i, "Riktkurs om 2 år"] = round((float(df.at[i, "Omsättning om 2 år"])        * ps_snitt) / aktier_ut, 2)
-            df.at[i, "Riktkurs om 3 år"] = round((float(df.at[i, "Omsättning om 3 år"])        * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs idag"]    = round((float(rad.get("Omsättning idag", 0.0))     * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs om 1 år"] = round((float(rad.get("Omsättning nästa år", 0.0)) * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs om 2 år"] = round((float(df.at[i, "Omsättning om 2 år"])      * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs om 3 år"] = round((float(df.at[i, "Omsättning om 3 år"])      * ps_snitt) / aktier_ut, 2)
         else:
-            df.at[i, "Riktkurs idag"]   = 0.0
+            df.at[i, "Riktkurs idag"]    = 0.0
             df.at[i, "Riktkurs om 1 år"] = 0.0
             df.at[i, "Riktkurs om 2 år"] = 0.0
             df.at[i, "Riktkurs om 3 år"] = 0.0
@@ -317,8 +325,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         with c1:
             ticker = st.text_input("Ticker (Yahoo-format)", value=bef.get("Ticker","") if not bef.empty else "").upper()
             utest = st.number_input("Utestående aktier (miljoner)", value=float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0)
-            antal = st.number_input("Antal aktier du äger", value=float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0)
-
+            antal = st.number_input("Antal aktier du äger", value=float(bef.get("Antal aktier",0.0)) if not befintlig.empty else 0.0) if not bef.empty else st.number_input("Antal aktier du äger", value=0.0)
             ps = st.number_input("P/S", value=float(bef.get("P/S",0.0)) if not bef.empty else 0.0)
             ps1 = st.number_input("P/S Q1", value=float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0)
             ps2 = st.number_input("P/S Q2", value=float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0)
@@ -387,13 +394,15 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     tips = df.sort_values(by=["_sort_datum","Bolagsnamn"]).head(10)
     st.dataframe(tips[["Ticker","Bolagsnamn","Senast manuellt uppdaterad","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]], use_container_width=True)
 
+    # Städa bort hjälpkolumn
+    if "_sort_datum" in df.columns:
+        df.drop(columns=["_sort_datum"], inplace=True, errors="ignore")
+
     return df
 
 # ---- Analysvy ----
 def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
     st.header("📈 Analys")
-    # Uppdatera från Yahoo i sidopanelen (global knapp)
-    # (massuppdatera anropas i main; här bara visning)
     # Filter: välj ett bolag + bläddra
     vis_df = df.sort_values(by=["Bolagsnamn","Ticker"]).reset_index(drop=True)
     etiketter = [f"{r['Bolagsnamn']} ({r['Ticker']})" for _, r in vis_df.iterrows()]
@@ -532,18 +541,41 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 """
     )
 
+# ---- Hjälpare för valutainmatning som text ----
+def parse_rate_input(raw: str, fallback: float) -> float:
+    if raw is None:
+        return fallback
+    raw = raw.strip().replace(" ", "").replace(",", ".")
+    try:
+        val = float(raw)
+        if val <= 0:
+            return fallback
+        return val
+    except Exception:
+        return fallback
+
 # ---- main ----
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    # Sidopanel: manuella valutakurser (till SEK)
+    # Sidopanel: manuella valutakurser (till SEK) via textfält (lättare att rensa/klistra)
     st.sidebar.header("💱 Valutakurser → SEK")
+    if "last_rates" not in st.session_state:
+        st.session_state.last_rates = STANDARD_VALUTAKURSER.copy()
+
+    usd_in = st.sidebar.text_input("USD → SEK", value=str(st.session_state.last_rates["USD"]))
+    nok_in = st.sidebar.text_input("NOK → SEK", value=str(st.session_state.last_rates["NOK"]))
+    cad_in = st.sidebar.text_input("CAD → SEK", value=str(st.session_state.last_rates["CAD"]))
+    eur_in = st.sidebar.text_input("EUR → SEK", value=str(st.session_state.last_rates["EUR"]))
+
     user_rates = {
-        "USD": st.sidebar.number_input("USD → SEK", value=STANDARD_VALUTAKURSER["USD"], step=0.01, key="usd"),
-        "NOK": st.sidebar.number_input("NOK → SEK", value=STANDARD_VALUTAKURSER["NOK"], step=0.01, key="nok"),
-        "CAD": st.sidebar.number_input("CAD → SEK", value=STANDARD_VALUTAKURSER["CAD"], step=0.01, key="cad"),
-        "EUR": st.sidebar.number_input("EUR → SEK", value=STANDARD_VALUTAKURSER["EUR"], step=0.01, key="eur"),
+        "USD": parse_rate_input(usd_in, st.session_state.last_rates["USD"]),
+        "NOK": parse_rate_input(nok_in, st.session_state.last_rates["NOK"]),
+        "CAD": parse_rate_input(cad_in, st.session_state.last_rates["CAD"]),
+        "EUR": parse_rate_input(eur_in, st.session_state.last_rates["EUR"]),
     }
+    # spara senaste giltiga
+    st.session_state.last_rates.update(user_rates)
 
     # Läs data
     df = hamta_data()

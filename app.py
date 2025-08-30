@@ -23,6 +23,8 @@ st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wi
 # ---- Google Sheets koppling ----
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
+RATES_SHEET = "Valutakurser"  # blad för kurser
+
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
 client = gspread.authorize(credentials)
@@ -37,7 +39,6 @@ def try_get_ws(sheet_name: str):
         return None
 
 def skapa_koppling():
-    # huvudarket (Blad1)
     return get_spreadsheet().worksheet(SHEET_NAME)
 
 def hamta_data():
@@ -64,9 +65,7 @@ def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
         return 1.0
     return float(user_rates.get(valuta.upper(), STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0)))
 
-# ===== Valutakurser: läs/spara robust, med komma-decimal-stöd =====
-RATES_SHEET = "Valutakurser"  # bladnamn där kurser lagras
-
+# ===== Valutakurser: skapa, läsa, spara (utan cache) =====
 def ensure_rates_sheet_exists():
     ss = get_spreadsheet()
     ws = try_get_ws(RATES_SHEET)
@@ -80,8 +79,8 @@ def _parse_rate(x) -> float:
     Robust tolkning:
     - '9,46' -> 9.46
     - '9.46' -> 9.46
-    - '9 46' -> 9.46 (om någon skrivit konstigt)
-    - skydd mot '946' (skalas ner till 9.46)
+    - '9 46' -> 9.46
+    - '946'  -> 9.46 (nedskalning om orimligt stort)
     """
     s = str(x).strip()
     s = s.replace(" ", "")
@@ -97,11 +96,12 @@ def _parse_rate(x) -> float:
     except Exception:
         return 0.0
 
-@st.cache_data(show_spinner=False)
-def _las_sparade_valutakurser_cached(_reload_token: int) -> dict:
-    ws = try_get_ws(RATES_SHEET)
-    if ws is None:
-        return {}
+def las_sparade_valutakurser() -> tuple[dict, str]:
+    """
+    Returnerar (rates_dict, källa_str).
+    Läser alltid live från bladet (ingen cache).
+    """
+    ws = ensure_rates_sheet_exists()
     try:
         rows = ws.get_all_records()  # [{Valuta: USD, Kurs: 9.75}, ...]
         out = {}
@@ -110,28 +110,27 @@ def _las_sparade_valutakurser_cached(_reload_token: int) -> dict:
             kurs = r.get("Kurs", "")
             if val in ("USD", "NOK", "CAD", "EUR"):
                 out[val] = _parse_rate(kurs)
-        return out
+        if out:
+            return out, "Valutakurser (blad)"
+        else:
+            return {}, "Standard (tomt blad)"
     except Exception:
-        return {}
-
-def las_sparade_valutakurser() -> dict:
-    token = st.session_state.get("rates_reload", 0)
-    return _las_sparade_valutakurser_cached(token)
+        # Om läsning misslyckas använder vi standard
+        return {}, "Standard (fel vid läsning)"
 
 def spara_valutakurser(rates: dict):
     """
     rates = {"USD": 9.46, "NOK": 0.93, "CAD": 7.00, "EUR": 11.10, "SEK": 1.0}
-    Sparar endast USD/NOK/CAD/EUR.
+    Sparar endast USD/NOK/CAD/EUR (SEK alltid 1.0 lokalt).
     """
     ws = ensure_rates_sheet_exists()
     data = [["Valuta", "Kurs"]]
     for k in ("USD", "NOK", "CAD", "EUR"):
         v = rates.get(k, "")
+        # skriv med punkt-decimal i arket
         data.append([k, str(v).replace(",", ".")])
     ws.clear()
     ws.update(data)
-    # bumpa cache-token så att läsning sker om
-    st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
 
 def _num_text_input(label: str, default: float) -> float:
     """
@@ -308,14 +307,13 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
     if st.sidebar.button("🔄 Uppdatera alla från Yahoo", key=f"{key_prefix}_massupd_btn"):
         status = st.sidebar.empty()
         bar = st.sidebar.progress(0)
-        misslyckade = []   # ["TICKER: fält1, fält2 ..."]
+        misslyckade = []
         total = len(df)
         for i, row in df.iterrows():
             tkr = str(row["Ticker"]).strip()
             status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
             data = hamta_yahoo_fält(tkr)
             failed_fields = []
-            # Skriv endast om något faktiskt kom
             if data.get("Bolagsnamn"):
                 df.at[i, "Bolagsnamn"] = data["Bolagsnamn"]
             else:
@@ -347,14 +345,12 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
             time.sleep(1.0)
             bar.progress((i+1)/total)
 
-        # Beräkna om efter hämtning
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
         st.sidebar.success("Klart! Alla bolag uppdaterade.")
         if misslyckade:
             st.sidebar.warning("Vissa fält kunde inte hämtas. Kopiera listan nedan:")
             st.sidebar.text_area("Misslyckade fält (kopierbar)", "\n".join(misslyckade), height=160, key=f"{key_prefix}_miss")
-
     return df
 
 # app.py — DEL 3/4
@@ -364,7 +360,6 @@ MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning
 def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     st.header("➕ Lägg till / uppdatera bolag")
 
-    # sorteringshjälp för rullistan
     sort_val = st.selectbox("Sortera för redigering", ["A–Ö (bolagsnamn)","Äldst manuell uppdatering först"])
     if sort_val.startswith("Äldst"):
         df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00")
@@ -374,7 +369,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     namn_map = {f"{r['Bolagsnamn']} ({r['Ticker']})": r['Ticker'] for _, r in vis_df.iterrows()}
     val_lista = [""] + list(namn_map.keys())
 
-    # index för bläddring
     if "edit_index" not in st.session_state:
         st.session_state.edit_index = 0
     st.session_state.edit_index = min(st.session_state.edit_index, len(val_lista)-1)
@@ -424,7 +418,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             "Omsättning idag": oms_idag, "Omsättning nästa år": oms_next
         }
 
-        # datum-flagga
         datum_sätt = False
         if not bef.empty:
             before = {f: float(bef.get(f,0.0)) for f in MANUELL_FALT_FOR_DATUM}
@@ -435,7 +428,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             if any(float(ny.get(f,0.0)) != 0.0 for f in MANUELL_FALT_FOR_DATUM):
                 datum_sätt = True
 
-        # skriv df
         if not bef.empty:
             for k,v in ny.items():
                 df.loc[df["Ticker"]==ticker, k] = v
@@ -447,7 +439,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         if datum_sätt:
             df.loc[df["Ticker"]==ticker, "Senast manuellt uppdaterad"] = now_stamp()
 
-        # hämta Yahoo-fält
         data = hamta_yahoo_fält(ticker)
         if data.get("Bolagsnamn"): df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = data["Bolagsnamn"]
         if data.get("Valuta"): df.loc[df["Ticker"]==ticker, "Valuta"] = data["Valuta"]
@@ -459,7 +450,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         spara_data(df)
         st.success("Sparat och uppdaterat från Yahoo.")
 
-    # tipslista
     st.markdown("### ⏱️ Äldst manuellt uppdaterade (topp 10)")
     df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00")
     tips = df.sort_values(by=["_sort_datum","Bolagsnamn"]).head(10)
@@ -531,7 +521,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     subset = st.radio("Vilka bolag?", ["Alla bolag","Endast portfölj"], horizontal=True)
     läge = st.radio("Sortering", ["Störst potential","Närmast riktkurs"], horizontal=True)
 
-    # Filter
     if subset == "Endast portfölj":
         base = df[df["Antal aktier"] > 0].copy()
     else:
@@ -551,7 +540,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
         base["absdiff"] = base["Diff till mål (%)"].abs()
         base = base.sort_values(by="absdiff", ascending=True).reset_index(drop=True)
 
-    # bläddring
     if "forslags_index" not in st.session_state:
         st.session_state.forslags_index = 0
     st.session_state.forslags_index = min(st.session_state.forslags_index, len(base)-1)
@@ -568,7 +556,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 
     rad = base.iloc[st.session_state.forslags_index]
 
-    # Portföljdata i SEK
     port = df[df["Antal aktier"] > 0].copy()
     port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
     port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
@@ -588,7 +575,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     nuv_andel = round((nuv_innehav / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
     ny_andel  = round((ny_total   / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
 
-    # Presentationskort (alla riktkurser visas; vald markeras)
     def mark(vald): return "**⬅ vald**" if riktkurs_val == vald else ""
     st.subheader(f"{rad['Bolagsnamn']} ({rad['Ticker']})")
     st.markdown(
@@ -607,24 +593,18 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 
 def valutapanel_sidebar() -> dict:
     st.sidebar.header("💱 Valutakurser → SEK")
-    ensure_rates_sheet_exists()
+    # Läs alltid live från bladet
+    saved, källa = las_sparade_valutakurser()
 
-    try:
-        saved_rates = las_sparade_valutakurser()
-    except Exception:
-        saved_rates = {}
+    current = STANDARD_VALUTAKURSER.copy()
+    for k in ("USD","NOK","CAD","EUR"):
+        if k in saved and saved[k] > 0:
+            current[k] = float(saved[k])
 
-    current_rates = STANDARD_VALUTAKURSER.copy()
-    for k, v in saved_rates.items():
-        try:
-            current_rates[k] = float(v)
-        except Exception:
-            pass
-
-    usd_edit = _num_text_input("USD → SEK", current_rates.get("USD", STANDARD_VALUTAKURSER["USD"]))
-    nok_edit = _num_text_input("NOK → SEK", current_rates.get("NOK", STANDARD_VALUTAKURSER["NOK"]))
-    cad_edit = _num_text_input("CAD → SEK", current_rates.get("CAD", STANDARD_VALUTAKURSER["CAD"]))
-    eur_edit = _num_text_input("EUR → SEK", current_rates.get("EUR", STANDARD_VALUTAKURSER["EUR"]))
+    usd_edit = _num_text_input("USD → SEK", current.get("USD", STANDARD_VALUTAKURSER["USD"]))
+    nok_edit = _num_text_input("NOK → SEK", current.get("NOK", STANDARD_VALUTAKURSER["NOK"]))
+    cad_edit = _num_text_input("CAD → SEK", current.get("CAD", STANDARD_VALUTAKURSER["CAD"]))
+    eur_edit = _num_text_input("EUR → SEK", current.get("EUR", STANDARD_VALUTAKURSER["EUR"]))
 
     user_rates = {"USD": usd_edit, "NOK": nok_edit, "CAD": cad_edit, "EUR": eur_edit, "SEK": 1.0}
 
@@ -638,17 +618,15 @@ def valutapanel_sidebar() -> dict:
                 st.sidebar.error(f"Kunde inte spara: {e}")
     with col_sr2:
         if st.button("↺ Läs sparade"):
-            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
-            st.sidebar.success("Läser om sparade kurser – ladda om om inget syns direkt.")
+            st.experimental_rerun()
 
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Används för SEK-värden i portfölj och köpbelopp i SEK.")
+    st.sidebar.caption(f"Källa nu: **{källa}**")
     return user_rates
 
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    # Sidopanel: valutakurser
+    # Sidopanel: valutakurser (läser från bladet varje gång)
     user_rates = valutapanel_sidebar()
 
     # Läs data

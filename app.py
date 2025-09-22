@@ -477,7 +477,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
 # app.py — Del 4/7
 # --- FX via FMP + fallback (ECB / exchangerate.host) ---
 def _parse_fx_mid(obj: dict) -> float:
-    if not isinstance(obj, dict): 
+    if not isinstance(obj, dict):
         return 0.0
     b = obj.get("bid"); a = obj.get("ask"); p = obj.get("price")
     try:
@@ -675,6 +675,80 @@ def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
         out.columns = [str(c).strip().lower() for c in out.columns]
     return out
 
+# --- yfinance-hjälpare (fast_info + info) ---
+def _yfi_get(t: yf.Ticker, *keys):
+    """
+    Försöker först i fast_info (snabbt, mer robust), sedan i info.
+    Returnerar första icke-None av givna keys.
+    """
+    try:
+        fi = dict(getattr(t, "fast_info", {}) or {})
+    except Exception:
+        fi = {}
+    for k in keys:
+        v = fi.get(k, None)
+        if v is not None:
+            return v
+
+    inf = {}
+    try:
+        inf = t.info or {}
+    except Exception:
+        inf = {}
+    for k in keys:
+        v = inf.get(k, None)
+        if v is not None:
+            return v
+    return None
+
+def _extract_quarterly_revenues(t: yf.Ticker):
+    """
+    Hämtar kvartalsvisa intäkter. Försöker med .quarterly_income_stmt (nyare)
+    och faller tillbaka till .quarterly_financials (äldre).
+    Returnerar lista med de 4 senaste värdena (float), samt summerad LTM.
+    """
+    q_revs = []
+
+    def _pick_rev_row(df: pd.DataFrame) -> pd.Series:
+        keys = {str(ix).strip().lower().replace(" ", ""): ix for ix in df.index}
+        for cand in ("totalrevenue", "total revenue"):
+            if cand in keys:
+                return df.loc[keys[cand]]
+        for cand in ("revenue", "sales"):
+            if cand in keys:
+                return df.loc[keys[cand]]
+        return pd.Series(dtype=float)
+
+    try:
+        qis = getattr(t, "quarterly_income_stmt", None)
+        if isinstance(qis, pd.DataFrame) and not qis.empty:
+            row = _pick_rev_row(qis)
+            if not row.empty:
+                for c in list(qis.columns)[:4]:
+                    v = row.get(c, None)
+                    if pd.notna(v):
+                        try: q_revs.append(float(v))
+                        except: pass
+    except Exception:
+        pass
+
+    if not q_revs:
+        try:
+            qfin = getattr(t, "quarterly_financials", None)
+            if isinstance(qfin, pd.DataFrame) and not qfin.empty:
+                if "Total Revenue" in qfin.index:
+                    row = qfin.loc["Total Revenue"]
+                    for c in list(qfin.columns)[:4]:
+                        v = row.get(c, None)
+                        if pd.notna(v):
+                            try: q_revs.append(float(v))
+                            except: pass
+        except Exception:
+            pass
+
+    rev_ltm = sum(q_revs) if q_revs else 0.0
+    return q_revs, rev_ltm
+
 # --- CAGR via yfinance ---
 def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
     try:
@@ -704,13 +778,8 @@ def hamta_yahoo_fält(ticker: str) -> dict:
     out = {"Bolagsnamn": "", "Aktuell kurs": 0.0, "Valuta": "USD", "Årlig utdelning": 0.0, "CAGR 5 år (%)": 0.0}
     try:
         t = yf.Ticker(ticker)
-        info = {}
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
 
-        pris = info.get("regularMarketPrice", None)
+        pris = _yfi_get(t, "last_price", "regularMarketPrice")
         if pris is None:
             h = t.history(period="1d")
             if not h.empty and "Close" in h:
@@ -718,72 +787,88 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         if pris is not None:
             out["Aktuell kurs"] = float(pris)
 
-        valuta = info.get("currency", None)
+        valuta = _yfi_get(t, "currency", "financialCurrency")
         if valuta:
             out["Valuta"] = str(valuta).upper()
 
-        namn = info.get("shortName") or info.get("longName") or ""
+        namn = None
+        try:
+            inf = t.info or {}
+            namn = inf.get("shortName") or inf.get("longName") or inf.get("displayName")
+        except Exception:
+            namn = None
         if namn:
             out["Bolagsnamn"] = str(namn)
 
-        div_rate = info.get("dividendRate", None)
-        if div_rate is not None:
-            out["Årlig utdelning"] = float(div_rate)
+        try:
+            inf = t.info or {}
+            div_rate = inf.get("dividendRate", None)
+            if div_rate is None and inf.get("dividendYield") and out["Aktuell kurs"] > 0:
+                div_rate = float(inf["dividendYield"]) * out["Aktuell kurs"]
+            if div_rate is not None:
+                out["Årlig utdelning"] = float(div_rate)
+        except Exception:
+            pass
 
         out["CAGR 5 år (%)"] = beräkna_cagr_från_finansiella(t)
     except Exception:
         pass
     return out
 
-# --- Yahoo P/S-fallback ---
+# --- Yahoo P/S-fallback (stark) ---
 def yahoo_ps_fallback(ticker: str) -> dict:
     """
-    Beräknar P/S (TTM) via yfinance när FMP inte ger data.
-    - sharesOutstanding -> Utestående aktier (M)
-    - marketCap och kvartalsomsättning (LTM = summa 4 senaste kvartal)
-    - P/S Q1–Q4 approx: marketCap / respektive kvartalsomsättning (om tillgängligt)
+    Beräknar:
+      - Utestående aktier (M) från fast_info/info, eller market_cap / price
+      - P/S (TTM) = market_cap / LTM-omsättning
+      - P/S Q1–Q4 ≈ market_cap / respektive kvartalsintäkt (om finns)
     """
     out = {}
     try:
         t = yf.Ticker(ticker)
-        info = {}
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
 
-        mcap = float(info.get("marketCap") or 0.0)
-        shares = float(info.get("sharesOutstanding") or 0.0)
+        mcap = _yfi_get(t, "market_cap", "marketCap")
+        pris = _yfi_get(t, "last_price", "regularMarketPrice")
+        shares = _yfi_get(t, "shares_outstanding", "shares", "sharesOutstanding")
+
+        try: mcap = float(mcap or 0.0)
+        except: mcap = 0.0
+        try: pris = float(pris or 0.0)
+        except: pris = 0.0
+        try: shares = float(shares or 0.0)
+        except: shares = 0.0
+
+        if shares <= 0 and mcap > 0 and pris > 0:
+            shares = mcap / pris
+
         if shares > 0:
-            out["Utestående aktier"] = shares / 1e6  # miljoner
+            out["Utestående aktier"] = shares / 1e6
 
-        # LTM-omsättning från quarterly_financials
-        qfin = getattr(t, "quarterly_financials", None)
-        rev_ltm = 0.0
-        q_revs = []
-        if isinstance(qfin, pd.DataFrame) and not qfin.empty and "Total Revenue" in qfin.index:
-            cols = list(qfin.columns)[:4]
-            q_revs = [float(qfin.loc["Total Revenue", c]) for c in cols if pd.notna(qfin.loc["Total Revenue", c])]
-            if q_revs:
-                rev_ltm = sum(q_revs)
+        q_revs, rev_ltm = _extract_quarterly_revenues(t)
 
-        # fallback: annual financials
         if rev_ltm <= 0:
-            afin = getattr(t, "financials", None)
-            if isinstance(afin, pd.DataFrame) and not afin.empty and "Total Revenue" in afin.index:
-                try:
-                    rev_ltm = float(afin.loc["Total Revenue"].dropna().iloc[0])
-                except Exception:
-                    rev_ltm = 0.0
+            try:
+                ain = getattr(t, "income_stmt", None)
+                if isinstance(ain, pd.DataFrame) and not ain.empty:
+                    idxkeys = {str(ix).strip().lower().replace(" ", ""): ix for ix in ain.index}
+                    ix = None
+                    for cand in ("totalrevenue", "total revenue", "revenue", "sales"):
+                        if cand in idxkeys:
+                            ix = idxkeys[cand]; break
+                    if ix is not None:
+                        ser = ain.loc[ix].dropna()
+                        if not ser.empty:
+                            rev_ltm = float(ser.iloc[0])
+            except Exception:
+                pass
 
-        if mcap > 0 and rev_ltm > 0:
+        if mcap > 0 and rev_ltm and rev_ltm > 0:
             out["P/S"] = float(mcap / rev_ltm)
 
-        # approximera P/S Q1–Q4
         if mcap > 0 and q_revs:
-            for idx, rv in enumerate(q_revs, start=1):
+            for i, rv in enumerate(q_revs[:4], start=1):
                 if rv and rv > 0:
-                    out[f"P/S Q{idx}"] = float(mcap / rv)
+                    out[f"P/S Q{i}"] = float(mcap / rv)
     except Exception:
         pass
     return out
@@ -892,12 +977,10 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
         estimat_miss = []
         change_summaries = []
 
-        # räknare
         ps_count = 0
         psq_count = 0
         est_count = 0
 
-        # körningsrapport
         updated_tickers = []
         unchanged_tickers = []
         changes_map = {}
@@ -919,7 +1002,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
 
             failed_fields = []
 
-            # Namn/Valuta/Kurs (från vald källa först)
+            # Namn/Valuta/Kurs
             if data.get("Bolagsnamn"):
                 mark_field_if_changed(df, i, "Bolagsnamn", data["Bolagsnamn"])
             else: failed_fields.append("Bolagsnamn")
@@ -936,11 +1019,9 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                 # Shares + P/S + kvartal
                 if data.get("Utestående aktier", 0) > 0:
                     mark_field_if_changed(df, i, "Utestående aktier", float(data["Utestående aktier"]))
-                # P/S TTM
                 if data.get("P/S", 0) > 0:
                     if mark_field_if_changed(df, i, "P/S", float(data["P/S"])):
                         ps_count += 1
-                # Kvartal (endast i full-mode)
                 if not st.session_state.get("fmp_light_mode", True):
                     psq_touched = False
                     for q in (1,2,3,4):
@@ -951,8 +1032,6 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                     if psq_touched:
                         psq_count += 1
 
-                # Estimat (FMP -> Yahoo-fallback) endast i full-mode
-                if not st.session_state.get("fmp_light_mode", True):
                     est_touched = False
                     cur_est = data.get("Omsättning idag", 0.0)
                     nxt_est = data.get("Omsättning nästa år", 0.0)
@@ -981,7 +1060,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                     if est_touched:
                         est_count += 1
 
-                # --- NYTT: om FMP inte gav basics → fyll från Yahoo ---
+                # Fyll basfält via Yahoo om saknas
                 if not data.get("Bolagsnamn") or not data.get("Valuta") or not data.get("Aktuell kurs"):
                     y_basic = hamta_yahoo_fält(tkr)
                     if y_basic.get("Bolagsnamn"):
@@ -991,7 +1070,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                     if y_basic.get("Aktuell kurs", 0) > 0:
                         mark_field_if_changed(df, i, "Aktuell kurs", float(y_basic["Aktuell kurs"]))
 
-                # --- NYTT: Yahoo-fallback för P/S & shares när NÅGON saknas ---
+                # P/S & shares via Yahoo-fallback om saknas
                 got_ps = float(df.at[i, "P/S"]) if "P/S" in df.columns else 0.0
                 got_sh = float(df.at[i, "Utestående aktier"]) if "Utestående aktier" in df.columns else 0.0
                 if got_ps == 0.0 or got_sh == 0.0:
@@ -1015,7 +1094,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                             df.at[i, "Senast uppdaterad källa"] = "Yahoo fallback"
 
             else:
-                # source == "Yahoo" → försök estimat via Yahoo
+                # source == "Yahoo"
                 y_est = hamta_yahoo_omsattningsestimat(tkr)
                 est_touched = False
                 v = float(y_est.get("Omsättning idag", 0.0))
@@ -1031,7 +1110,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                 else:
                     est_count += 1
 
-            # diffa fält för körningsrapporten
+            # diffa fält
             after = {f: df.at[i, f] if f in df.columns else 0.0 for f in UPPDATERBARA_FALT}
             changed_fields = []
             for f in UPPDATERBARA_FALT:
@@ -1059,7 +1138,6 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
             time.sleep(1.0)
             bar.progress((i+1)/total)
 
-        # spara endast om något ändrats
         if change_summaries:
             df = uppdatera_berakningar(df, user_rates)
             spara_data(df, do_snapshot=True)
@@ -1069,7 +1147,6 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
 
         st.sidebar.info(f"P/S uppdaterades på {ps_count} bolag; P/S kvartal på {psq_count}; Estimat på {est_count}.")
 
-        # Loggvisning
         log_parts = []
         if change_summaries:
             log_parts.append("[Ändringar]")
@@ -1091,7 +1168,6 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                 key=f"{key_prefix}_chglog_dl"
             )
 
-        # --- Spara körningsrapport till sessionen ---
         st.session_state["run_report"] = {
             "ts": _ts_human(),
             "source": source,
@@ -1217,7 +1293,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
         if changed_manual:
             df.loc[df["Ticker"]==ticker, "Senast manuellt uppdaterad"] = now_stamp()
 
-        # Hämta från vald källa (med TS-stämpling)
+        # Hämta från vald källa
         if st.session_state["datakalla_form"] == "FMP":
             data = hamta_fmp_falt_light(ticker) if st.session_state.get("fmp_light_mode", True) else hamta_fmp_falt(ticker)
             if data.get("Bolagsnamn"):
@@ -1231,7 +1307,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
                 if data.get(key, 0) and row_index is not None:
                     mark_field_if_changed(df, row_index, key, float(data[key]))
 
-            # Estimat endast i full-mode
             if not st.session_state.get("fmp_light_mode", True):
                 y_est = None
                 if float(data.get("Omsättning idag",0.0)) > 0 and row_index is not None:
@@ -1250,7 +1325,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
                     if v > 0 and row_index is not None:
                         mark_field_if_changed(df, row_index, "Omsättning nästa år", v)
 
-            # --- NYTT: Basics från Yahoo om FMP inte gav dem ---
+            # Basics via Yahoo om saknas
             if not data.get("Bolagsnamn") or not data.get("Valuta") or not data.get("Aktuell kurs"):
                 y_basic = hamta_yahoo_fält(ticker)
                 if y_basic.get("Bolagsnamn"):
@@ -1260,7 +1335,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
                 if y_basic.get("Aktuell kurs",0)>0:
                     df.loc[df["Ticker"]==ticker, "Aktuell kurs"] = float(y_basic["Aktuell kurs"])
 
-            # --- NYTT: Fallback när NÅGON av P/S eller shares saknas
             got_ps = float(df.at[row_index, "P/S"]) if "P/S" in df.columns else 0.0
             got_sh = float(df.at[row_index, "Utestående aktier"]) if "Utestående aktier" in df.columns else 0.0
             if got_ps == 0.0 or got_sh == 0.0:
@@ -1293,7 +1367,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
         spara_data(df)
         st.success("Sparat och uppdaterat från vald källa.")
 
-    # --- LISTOR OCH RAPPORTER ---
+    # Listor
     st.markdown("### ⏱️ Äldst manuellt uppdaterade (topp 10)")
     df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00")
     tips = df.sort_values(by=["_sort_datum","Bolagsnamn"]).head(10)
@@ -1483,7 +1557,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 def kontrollvy(df: pd.DataFrame) -> None:
     st.header("🧪 Kontroll & Reconciliation")
 
-    # 1) Körningsrapport (senaste massuppdatering i sessionen)
     rr = st.session_state.get("run_report")
     st.subheader("Senaste körningsrapport")
     if not rr:
@@ -1539,7 +1612,6 @@ def kontrollvy(df: pd.DataFrame) -> None:
 
     st.markdown("---")
 
-    # 2) Äldst auto-uppdaterade (topp 10)
     st.subheader("🤖 Äldst auto-uppdaterade (topp 10)")
     auto_df = df.copy()
     auto_df["_auto_dt"] = pd.to_datetime(auto_df["Senast auto-uppdaterad"], errors="coerce")\
@@ -1554,7 +1626,6 @@ def kontrollvy(df: pd.DataFrame) -> None:
         use_container_width=True
     )
 
-    # 3) Utan auto-uppdatering sedan valt datum
     st.subheader("📅 Utan auto-uppdatering sedan valt datum")
     default_cutoff = (_ts_datetime() - timedelta(days=90)).date()
     cutoff_date = st.date_input("Visa bolag med auto-uppdatering äldre än:", value=default_cutoff)
@@ -1615,14 +1686,13 @@ def main():
         key_preview = (FMP_KEY[:4] + "…") if key_present else "(saknas)"
         st.caption(f"FMP_API_KEY: {key_preview} | BASE: {FMP_BASE} | CALL_DELAY: {FMP_CALL_DELAY}s")
 
-        # Visa ev. paus (circuit breaker) efter 429 och möjlighet att återuppta
         blocked_until = st.session_state.get("fmp_block_until")
         if blocked_until:
             if _ts_datetime() < blocked_until:
                 st.warning(f"FMP är pausad till {blocked_until.strftime('%Y-%m-%d %H:%M')}")
                 if st.button("Återuppta nu", key="fmp_unblock"):
                     st.session_state.pop("fmp_block_until", None)
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 st.session_state.pop("fmp_block_until", None)
 

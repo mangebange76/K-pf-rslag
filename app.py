@@ -1,3 +1,4 @@
+# app.py — Del 1/7
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -118,6 +119,7 @@ FINAL_COLS = [
     "Senast uppdaterad källa",
 ]
 
+# app.py — Del 2/7
 @st.cache_data(show_spinner=False)
 def las_sparade_valutakurser_cached(nonce: int):
     ws = skapa_rates_sheet_if_missing()
@@ -144,7 +146,7 @@ def spara_valutakurser(rates: dict):
     _with_backoff(ws.clear)
     _with_backoff(ws.update, body)
 
-def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
+def hamta_valutakurser(valuta: str, user_rates: dict) -> float:
     if not valuta:
         return 1.0
     return user_rates.get(valuta.upper(), STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0))
@@ -226,26 +228,33 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].astype(str)
     return df
 
+# app.py — Del 3/7
 # --- FMP: konfiguration + hjälpare ---
 FMP_BASE = st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
 FMP_KEY  = st.secrets.get("FMP_API_KEY", "")
-FMP_CALL_DELAY = float(st.secrets.get("FMP_CALL_DELAY", 0.6))  # sek per anrop (skonsamt läge)
+FMP_CALL_DELAY = float(st.secrets.get("FMP_CALL_DELAY", 2.5))  # skonsam default
+FMP_BLOCK_MINUTES = float(st.secrets.get("FMP_BLOCK_MINUTES", 20))  # paus efter 429
 
 def _fmp_get(path: str, params=None, stable: bool = True):
     """
-    Throttlad GET med enkel backoff. Återvänder (json, statuscode).
-    Backoff triggas på 429/403/5xx.
+    Throttlad GET med enkel backoff + 'circuit breaker' vid 429.
+    Returnerar (json, statuscode). Anropa med path t.ex. 'api/v3/quote/AAPL'.
     """
+    # blockera om vi nyligen fått 429
+    block_until = st.session_state.get("fmp_block_until")
+    if block_until and _ts_datetime() < block_until:
+        return None, 429
+
     params = params or {}
     if FMP_KEY:
         params["apikey"] = FMP_KEY
-    url = f"{FMP_BASE}/stable/{path}" if stable else f"{FMP_BASE}/{path}"
+    url = f"{FMP_BASE}/{path}"
 
-    delays = [0.0, 1.2, 2.5]  # enkel backoff
+    delays = [0.0, 1.2, 2.5]  # backoff
     last_sc = 0
     last_json = None
 
-    for attempt, extra_sleep in enumerate(delays, start=1):
+    for extra_sleep in delays:
         try:
             if FMP_CALL_DELAY > 0:
                 time.sleep(FMP_CALL_DELAY)
@@ -261,10 +270,18 @@ def _fmp_get(path: str, params=None, stable: bool = True):
             if 200 <= sc < 300:
                 return j, sc
 
-            if sc in (429, 403, 502, 503, 504):
+            # 429 → aktivera paus
+            if sc == 429:
+                st.session_state["fmp_block_until"] = _ts_datetime() + timedelta(minutes=FMP_BLOCK_MINUTES)
                 time.sleep(extra_sleep)
                 continue
 
+            # Transienta fel → backoff
+            if sc in (403, 502, 503, 504):
+                time.sleep(extra_sleep)
+                continue
+
+            # Övriga fel → ge upp
             return j, sc
         except Exception:
             time.sleep(extra_sleep)
@@ -273,63 +290,69 @@ def _fmp_get(path: str, params=None, stable: bool = True):
     return last_json, last_sc
 
 def _fmp_pick_symbol(yahoo_ticker: str) -> str:
+    """
+    Försök validera symbol via quote-short, annars search. Faller tillbaka till upper().
+    """
     sym = str(yahoo_ticker).strip().upper()
-    js, sc = _fmp_get("api/v3/quote-short", {"symbol": sym}, stable=False)
+    js, sc = _fmp_get(f"api/v3/quote-short/{sym}", stable=False)
     if isinstance(js, list) and js:
         return sym
-    js, sc = _fmp_get("search-symbol", {"query": yahoo_ticker})
+    js, sc = _fmp_get("api/v3/search", {"query": yahoo_ticker, "limit": 1}, stable=False)
     if isinstance(js, list) and js:
         return str(js[0].get("symbol", sym)).upper()
     return sym
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def hamta_fmp_falt_light(yahoo_ticker: str) -> dict:
-    """Minimala anrop: profile (namn/valuta), quote (pris/mcap), ratios-ttm (P/S)."""
+    """
+    Mycket lätt variant: endast quote (pris/mcap/shares) + ratios-ttm (P/S).
+    Namn/valuta hämtas via Yahoo i fallback senare vid behov.
+    """
     out = {"_debug": {}, "_symbol": _fmp_pick_symbol(yahoo_ticker)}
     sym = out["_symbol"]
 
-    prof, sc_prof = _fmp_get("profile", {"symbol": sym})
-    out["_debug"]["profile_sc"] = sc_prof
-    if isinstance(prof, list) and prof:
-        p0 = prof[0]
-        if p0.get("companyName"): out["Bolagsnamn"] = p0["companyName"]
-        if p0.get("currency"):    out["Valuta"]     = str(p0["currency"]).upper()
-        if p0.get("price") is not None:
-            try: out["Aktuell kurs"] = float(p0["price"])
-            except: pass
-
+    # pris, marketCap, sharesOutstanding
     q, sc_q = _fmp_get(f"api/v3/quote/{sym}", stable=False)
     out["_debug"]["quote_sc"] = sc_q
     if isinstance(q, list) and q:
         q0 = q[0]
-        if "price" in q0 and "Aktuell kurs" not in out:
+        if "price" in q0:
             try: out["Aktuell kurs"] = float(q0["price"])
             except: pass
+        if q0.get("marketCap") is not None:
+            try: out["_marketCap"] = float(q0["marketCap"])
+            except: pass
+        if q0.get("sharesOutstanding") is not None:
+            try: out["Utestående aktier"] = float(q0["sharesOutstanding"]) / 1e6
+            except: pass
 
-    rttm, sc_rttm = _fmp_get("ratios-ttm", {"symbol": sym})
+    # P/S TTM
+    rttm, sc_rttm = _fmp_get(f"api/v3/ratios-ttm/{sym}", stable=False)
     out["_debug"]["ratios_ttm_sc"] = sc_rttm
     if isinstance(rttm, list) and rttm:
+        v = rttm[0].get("priceToSalesTTM") or rttm[0].get("priceToSalesRatioTTM")
         try:
-            v = rttm[0].get("priceToSalesTTM") or rttm[0].get("priceToSalesRatioTTM")
             if v and float(v) > 0:
                 out["P/S"] = float(v)
                 out["_debug"]["ps_source"] = "ratios-ttm"
         except Exception:
             pass
+
     return out
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def hamta_fmp_falt(yahoo_ticker: str) -> dict:
     """
-    Hämta/beräkna P/S (TTM), P/S Q1–Q4, namn/valuta/kurs/shares och ev. omsättningsestimat.
-    Inkluderar _debug med HTTP-statusar och ps_source.
+    Fullare variant: försök hämta namn/valuta/pris/shares, P/S (TTM, key-metrics, beräkning),
+    P/S Q1–Q4 (ratios quarterly) samt analytikerestimat (om plan tillåter).
+    Lägger även in _debug med HTTP-statusar.
     """
     out = {"_debug": {}}
     sym = _fmp_pick_symbol(yahoo_ticker)
     out["_symbol"] = sym
 
-    # Profile
-    prof, sc_prof = _fmp_get("profile", {"symbol": sym})
+    # Profile (namn/valuta/price/shares)
+    prof, sc_prof = _fmp_get(f"api/v3/profile/{sym}", stable=False)
     out["_debug"]["profile_sc"] = sc_prof
     if isinstance(prof, list) and prof:
         p0 = prof[0]
@@ -357,7 +380,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
 
     # Shares fallback
     if "Utestående aktier" not in out:
-        flo, sc_flo = _fmp_get("all-shares-float", {"symbol": sym})
+        flo, sc_flo = _fmp_get(f"api/v4/shares_float/{sym}", stable=False)
         out["_debug"]["shares_float_sc"] = sc_flo
         if isinstance(flo, list):
             for it in flo:
@@ -369,14 +392,13 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
                     except:
                         pass
 
-    # P/S TTM via ratios-ttm
-    rttm, sc_rttm = _fmp_get("ratios-ttm", {"symbol": sym})
+    # P/S via ratios-ttm
+    rttm, sc_rttm = _fmp_get(f"api/v3/ratios-ttm/{sym}", stable=False)
     out["_debug"]["ratios_ttm_sc"] = sc_rttm
     ps_from_ratios = None
     if isinstance(rttm, list) and rttm:
         try:
-            v = rttm[0].get("priceToSalesTTM")
-            if v is None: v = rttm[0].get("priceToSalesRatioTTM")
+            v = rttm[0].get("priceToSalesTTM") or rttm[0].get("priceToSalesRatioTTM")
             if v is not None:
                 ps_from_ratios = float(v)
         except Exception:
@@ -391,15 +413,14 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
         out["_debug"]["key_metrics_ttm_sc"] = sc_kttm
         if isinstance(kttm, list) and kttm:
             try:
-                v = kttm[0].get("priceToSalesRatioTTM")
-                if v is None: v = kttm[0].get("priceToSalesTTM")
+                v = kttm[0].get("priceToSalesRatioTTM") or kttm[0].get("priceToSalesTTM")
                 if v and float(v) > 0:
                     out["P/S"] = float(v)
                     out["_debug"]["ps_source"] = "key-metrics-ttm"
             except Exception:
                 pass
 
-    # Beräkna P/S = MarketCap / RevenueTTM
+    # P/S = marketCap / revenueTTM
     if "P/S" not in out and market_cap > 0:
         isttm, sc_isttm = _fmp_get(f"api/v3/income-statement-ttm/{sym}", stable=False)
         out["_debug"]["income_ttm_sc"] = sc_isttm
@@ -421,7 +442,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
             except Exception:
                 pass
 
-    # P/S Q1–Q4 (kvartalsratios)
+    # P/S Q1–Q4
     rq, sc_rq = _fmp_get(f"api/v3/ratios/{sym}", {"period": "quarter", "limit": 4}, stable=False)
     out["_debug"]["ratios_quarter_sc"] = sc_rq
     if isinstance(rq, list) and rq:
@@ -433,8 +454,8 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
                 except:
                     pass
 
-    # Estimat (kan kräva betalplan)
-    est, est_sc = _fmp_get("analyst-estimates", {"symbol": sym, "period": "annual", "limit": 2})
+    # Analytikerestimat (kan kräva betalplan)
+    est, est_sc = _fmp_get("api/v3/analyst-estimates", {"symbol": sym, "period": "annual", "limit": 2}, stable=False)
     out["_debug"]["analyst_estimates_sc"] = est_sc
     def _pick_rev(obj: dict) -> float:
         for k in ("revenueAvg", "revenueMean", "revenue", "revenueEstimateAvg"):
@@ -453,16 +474,18 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
 
     return out
 
+# app.py — Del 4/7
 # --- FX via FMP + fallback (ECB / exchangerate.host) ---
 def _parse_fx_mid(obj: dict) -> float:
-    if not isinstance(obj, dict): return 0.0
+    if not isinstance(obj, dict): 
+        return 0.0
     b = obj.get("bid"); a = obj.get("ask"); p = obj.get("price")
     try:
         if b is not None and a is not None:
             return (float(b) + float(a)) / 2.0
         if p is not None:
             return float(p)
-    except:
+    except Exception:
         pass
     return 0.0
 
@@ -550,6 +573,7 @@ def _current_backup_prefix() -> str:
 def list_drive_backups(limit: int = 500) -> list:
     service = _build_drive_service()
     prefix = _current_backup_prefix()
+    # undvik f-string med backslash i uttrycket – förbered separat
     safe_prefix = prefix.replace("'", "\\'")
     base_q = "mimeType='application/vnd.google-apps.spreadsheet' and 'me' in owners"
     q = f"{base_q} and name contains '{safe_prefix}'"
@@ -641,6 +665,7 @@ def spara_data(df: pd.DataFrame, do_snapshot: bool = True):
     _with_backoff(sheet.clear)
     _with_backoff(sheet.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
 
+# app.py — Del 5/7
 # --- Helper för att flattena kolumner från yfinance ---
 def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -706,6 +731,59 @@ def hamta_yahoo_fält(ticker: str) -> dict:
             out["Årlig utdelning"] = float(div_rate)
 
         out["CAGR 5 år (%)"] = beräkna_cagr_från_finansiella(t)
+    except Exception:
+        pass
+    return out
+
+# --- Yahoo P/S-fallback ---
+def yahoo_ps_fallback(ticker: str) -> dict:
+    """
+    Beräknar P/S (TTM) via yfinance när FMP inte ger data.
+    - sharesOutstanding -> Utestående aktier (M)
+    - marketCap och kvartalsomsättning (LTM = summa 4 senaste kvartal)
+    - P/S Q1–Q4 approx: marketCap / respektive kvartalsomsättning (om tillgängligt)
+    """
+    out = {}
+    try:
+        t = yf.Ticker(ticker)
+        info = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
+
+        mcap = float(info.get("marketCap") or 0.0)
+        shares = float(info.get("sharesOutstanding") or 0.0)
+        if shares > 0:
+            out["Utestående aktier"] = shares / 1e6  # miljoner
+
+        # LTM-omsättning från quarterly_financials
+        qfin = getattr(t, "quarterly_financials", None)
+        rev_ltm = 0.0
+        q_revs = []
+        if isinstance(qfin, pd.DataFrame) and not qfin.empty and "Total Revenue" in qfin.index:
+            cols = list(qfin.columns)[:4]
+            q_revs = [float(qfin.loc["Total Revenue", c]) for c in cols if pd.notna(qfin.loc["Total Revenue", c])]
+            if q_revs:
+                rev_ltm = sum(q_revs)
+
+        # fallback: annual financials
+        if rev_ltm <= 0:
+            afin = getattr(t, "financials", None)
+            if isinstance(afin, pd.DataFrame) and not afin.empty and "Total Revenue" in afin.index:
+                try:
+                    rev_ltm = float(afin.loc["Total Revenue"].dropna().iloc[0])
+                except Exception:
+                    rev_ltm = 0.0
+
+        if mcap > 0 and rev_ltm > 0:
+            out["P/S"] = float(mcap / rev_ltm)
+
+        # approximera P/S Q1–Q4
+        if mcap > 0 and q_revs:
+            for idx, rv in enumerate(q_revs, start=1):
+                if rv and rv > 0:
+                    out[f"P/S Q{idx}"] = float(mcap / rv)
     except Exception:
         pass
     return out
@@ -804,6 +882,7 @@ def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
             df.at[i, "Riktkurs idag"] = df.at[i, "Riktkurs om 1 år"] = df.at[i, "Riktkurs om 2 år"] = df.at[i, "Riktkurs om 3 år"] = 0.0
     return df
 
+# app.py — Del 6/7
 def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: str = "Yahoo") -> pd.DataFrame:
     st.sidebar.markdown("---")
     if st.sidebar.button("🔄 Uppdatera alla från " + source, key=f"{key_prefix}_massupd_btn"):
@@ -840,7 +919,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
 
             failed_fields = []
 
-            # Namn/Valuta/Kurs
+            # Namn/Valuta/Kurs (från vald källa först)
             if data.get("Bolagsnamn"):
                 mark_field_if_changed(df, i, "Bolagsnamn", data["Bolagsnamn"])
             else: failed_fields.append("Bolagsnamn")
@@ -902,6 +981,39 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                     if est_touched:
                         est_count += 1
 
+                # --- NYTT: om FMP inte gav basics → fyll från Yahoo ---
+                if not data.get("Bolagsnamn") or not data.get("Valuta") or not data.get("Aktuell kurs"):
+                    y_basic = hamta_yahoo_fält(tkr)
+                    if y_basic.get("Bolagsnamn"):
+                        mark_field_if_changed(df, i, "Bolagsnamn", y_basic["Bolagsnamn"])
+                    if y_basic.get("Valuta"):
+                        mark_field_if_changed(df, i, "Valuta", y_basic["Valuta"])
+                    if y_basic.get("Aktuell kurs", 0) > 0:
+                        mark_field_if_changed(df, i, "Aktuell kurs", float(y_basic["Aktuell kurs"]))
+
+                # --- NYTT: Yahoo-fallback för P/S & shares när NÅGON saknas ---
+                got_ps = float(df.at[i, "P/S"]) if "P/S" in df.columns else 0.0
+                got_sh = float(df.at[i, "Utestående aktier"]) if "Utestående aktier" in df.columns else 0.0
+                if got_ps == 0.0 or got_sh == 0.0:
+                    yb = yahoo_ps_fallback(tkr)
+                    touched = False
+                    if yb.get("Utestående aktier", 0) > 0 and got_sh == 0.0:
+                        if mark_field_if_changed(df, i, "Utestående aktier", float(yb["Utestående aktier"])):
+                            touched = True
+                    if yb.get("P/S", 0) > 0 and got_ps == 0.0:
+                        if mark_field_if_changed(df, i, "P/S", float(yb["P/S"])):
+                            ps_count += 1
+                            touched = True
+                    for q in (1,2,3,4):
+                        key = f"P/S Q{q}"
+                        if yb.get(key, 0) > 0 and float(df.at[i, key]) == 0.0:
+                            if mark_field_if_changed(df, i, key, float(yb[key])):
+                                touched = True
+                    if touched:
+                        df.at[i, "Senast auto-uppdaterad"] = _ts_human()
+                        if not df.at[i, "Senast uppdaterad källa"]:
+                            df.at[i, "Senast uppdaterad källa"] = "Yahoo fallback"
+
             else:
                 # source == "Yahoo" → försök estimat via Yahoo
                 y_est = hamta_yahoo_omsattningsestimat(tkr)
@@ -933,7 +1045,8 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
 
             if changed_fields:
                 df.at[i, "Senast auto-uppdaterad"] = _ts_human()
-                df.at[i, "Senast uppdaterad källa"] = source
+                if not df.at[i, "Senast uppdaterad källa"]:
+                    df.at[i, "Senast uppdaterad källa"] = source
                 change_summaries.append(f"{tkr}: " + ", ".join(changed_fields))
                 updated_tickers.append(tkr)
                 changes_map[tkr] = changed_fields
@@ -1137,6 +1250,30 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
                     if v > 0 and row_index is not None:
                         mark_field_if_changed(df, row_index, "Omsättning nästa år", v)
 
+            # --- NYTT: Basics från Yahoo om FMP inte gav dem ---
+            if not data.get("Bolagsnamn") or not data.get("Valuta") or not data.get("Aktuell kurs"):
+                y_basic = hamta_yahoo_fält(ticker)
+                if y_basic.get("Bolagsnamn"):
+                    df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = y_basic["Bolagsnamn"]
+                if y_basic.get("Valuta"):
+                    df.loc[df["Ticker"]==ticker, "Valuta"] = y_basic["Valuta"]
+                if y_basic.get("Aktuell kurs",0)>0:
+                    df.loc[df["Ticker"]==ticker, "Aktuell kurs"] = float(y_basic["Aktuell kurs"])
+
+            # --- NYTT: Fallback när NÅGON av P/S eller shares saknas
+            got_ps = float(df.at[row_index, "P/S"]) if "P/S" in df.columns else 0.0
+            got_sh = float(df.at[row_index, "Utestående aktier"]) if "Utestående aktier" in df.columns else 0.0
+            if got_ps == 0.0 or got_sh == 0.0:
+                yb = yahoo_ps_fallback(ticker)
+                if yb.get("Utestående aktier", 0) > 0 and got_sh == 0.0:
+                    mark_field_if_changed(df, row_index, "Utestående aktier", float(yb["Utestående aktier"]))
+                if yb.get("P/S", 0) > 0 and got_ps == 0.0:
+                    mark_field_if_changed(df, row_index, "P/S", float(yb["P/S"]))
+                for q in (1,2,3,4):
+                    key = f"P/S Q{q}"
+                    if yb.get(key, 0) > 0 and float(df.at[row_index, key]) == 0.0:
+                        mark_field_if_changed(df, row_index, key, float(yb[key]))
+
         else:
             data = hamta_yahoo_fält(ticker)
             if data.get("Bolagsnamn"): df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = data["Bolagsnamn"]
@@ -1204,6 +1341,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
 
     return df
 
+# app.py — Del 7/7
 # --- Analysvy ---
 def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
     st.header("📈 Analys")
@@ -1244,7 +1382,7 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     if port.empty:
         st.info("Du äger inga aktier.")
         return
-    port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
+    port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurser(v, user_rates))
     port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
     total_värde = float(port["Värde (SEK)"].sum())
     port["Andel (%)"] = round(port["Värde (SEK)"] / total_värde * 100.0, 2)
@@ -1308,11 +1446,11 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     rad = base.iloc[st.session_state.forslags_index]
 
     port = df[df["Antal aktier"] > 0].copy()
-    port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
+    port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurser(v, user_rates))
     port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
     port_värde = float(port["Värde (SEK)"].sum()) if not port.empty else 0.0
 
-    vx = hamta_valutakurs(rad["Valuta"], user_rates)
+    vx = hamta_valutakurser(rad["Valuta"], user_rates)
     kurs_sek = rad["Aktuell kurs"] * vx
     antal_köp = int(kapital_sek // max(kurs_sek, 1e-9))
     investering = antal_köp * kurs_sek
@@ -1476,6 +1614,18 @@ def main():
         key_present = bool(FMP_KEY)
         key_preview = (FMP_KEY[:4] + "…") if key_present else "(saknas)"
         st.caption(f"FMP_API_KEY: {key_preview} | BASE: {FMP_BASE} | CALL_DELAY: {FMP_CALL_DELAY}s")
+
+        # Visa ev. paus (circuit breaker) efter 429 och möjlighet att återuppta
+        blocked_until = st.session_state.get("fmp_block_until")
+        if blocked_until:
+            if _ts_datetime() < blocked_until:
+                st.warning(f"FMP är pausad till {blocked_until.strftime('%Y-%m-%d %H:%M')}")
+                if st.button("Återuppta nu", key="fmp_unblock"):
+                    st.session_state.pop("fmp_block_until", None)
+                    st.experimental_rerun()
+            else:
+                st.session_state.pop("fmp_block_until", None)
+
         if not key_present:
             st.warning("Ingen FMP_API_KEY hittades i secrets. Lägg till den för att undvika 429/403.")
 

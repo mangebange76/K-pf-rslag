@@ -165,7 +165,10 @@ def _is_close(a, b, tol=1e-9):
         return str(a) == str(b)
 
 def mark_field_if_changed(df: pd.DataFrame, row_idx: int, field: str, new_value) -> bool:
-    """Sätter df[field] = new_value OM värdet verkligen ändrats. Stämplar TS-kolumnen. Returnerar True om ändrat."""
+    """
+    Sätt df[field] = new_value ENDAST om värdet ändrats. Stämpla TS-kolumnen om fältet spåras.
+    Returnerar True om någon verklig ändring skedde.
+    """
     old = df.at[row_idx, field] if field in df.columns else None
     changed = False
     try:
@@ -179,7 +182,7 @@ def mark_field_if_changed(df: pd.DataFrame, row_idx: int, field: str, new_value)
             df.at[row_idx, ts_col] = _ts_human()
     return changed
 
-# Fält vi diffar i ändringsrapporten
+# Fält vi diffar i körningsrapporten
 UPPDATERBARA_FALT = [
     "Bolagsnamn","Valuta","Aktuell kurs","Årlig utdelning","CAGR 5 år (%)",
     "Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
@@ -223,7 +226,9 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    for c in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa", *TS_FIELDS.values()]:
+    for c in ["Ticker","Bolagsnamn","Valuta",
+              "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa",
+              *TS_FIELDS.values()]:
         if c in df.columns:
             df[c] = df[c].astype(str)
     return df
@@ -534,19 +539,48 @@ def _pick_fact_number(fact: dict, unit_keys=("USD", "USD_shares", "shares"), wan
     return []
 
 def _sec_latest_shares(facts: dict) -> float:
-    candidates = [
+    """
+    Försöker först point-in-time aktier. Faller tillbaka till weighted average om nödvändigt.
+    Returnerar antal aktier (styck), inte miljoner.
+    """
+    dei = (facts.get("facts") or {}).get("dei", {})
+    gaap = (facts.get("facts") or {}).get("us-gaap", {})
+
+    # 1) Point-in-time (bäst)
+    point_candidates = [
         "EntityCommonStockSharesOutstanding",
         "CommonStockSharesOutstanding",
+        "EntityCommonSharesOutstanding",
         "ShareIssued",
     ]
-    for c in candidates:
-        fact = (facts.get("facts") or {}).get("dei", {}).get(c) or (facts.get("facts") or {}).get("us-gaap", {}).get(c)
+    for c in point_candidates:
+        fact = dei.get(c) or gaap.get(c)
         if fact:
             pts = _pick_fact_number(fact, unit_keys=("shares","USD_shares","shares"), want_quarterly=False)
             for _, v in pts:
                 try:
-                    if float(v) > 0:
-                        return float(v)
+                    v = float(v)
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+
+    # 2) Weighted average (näst bäst)
+    wa_candidates = [
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "WeightedAverageNumberOfSharesOutstanding",
+        "WeightedAverageNumberOfDilutedSharesOutstandingBasic",
+    ]
+    for c in wa_candidates:
+        fact = gaap.get(c)
+        if fact:
+            pts = _pick_fact_number(fact, unit_keys=("shares","USD_shares","shares"), want_quarterly=True)
+            for _, v in pts:
+                try:
+                    v = float(v)
+                    if v > 0:
+                        return v
                 except Exception:
                     pass
     return 0.0
@@ -588,20 +622,29 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
     cik = _sec_cik_for(ticker)
     if not cik:
         return out  # ej US
+
     facts, sc = _sec_companyfacts(cik)
     if sc != 200 or not isinstance(facts, dict):
         return out
 
-    # Yahoo-basics (definierad senare i filen, men det är ok i Python)
+    # Yahoo-basics
     y = hamta_yahoo_fält(ticker)
     for k in ("Bolagsnamn", "Valuta", "Aktuell kurs"):
         if y.get(k): out[k] = y[k]
 
+    # SEC shares → fallback till Yahoo om saknas
     shares = _sec_latest_shares(facts)
+    if shares <= 0:
+        try:
+            y_sh = _yfi_get(yf.Ticker(ticker), "shares_outstanding", "shares", "sharesOutstanding")
+            if y_sh and float(y_sh) > 0:
+                shares = float(y_sh)
+        except Exception:
+            pass
     if shares > 0:
         out["Utestående aktier"] = shares / 1e6
 
-    # Market cap från Yahoo (market_cap) eller pris * shares
+    # Market cap från Yahoo (helst), annars price*shares
     mcap = _yfi_get(yf.Ticker(ticker), "market_cap", "marketCap")
     try:
         mcap = float(mcap or 0.0)
@@ -610,6 +653,7 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
     if mcap <= 0 and out.get("Aktuell kurs", 0) > 0 and shares > 0:
         mcap = float(out["Aktuell kurs"]) * shares
 
+    # Kvartalsintäkter från SEC → P/S TTM + per kvartal
     q_revs = _sec_quarterly_revenues(facts)
     ltm = sum(q_revs) if q_revs else 0.0
 
@@ -1954,7 +1998,7 @@ def main():
         if not key_present:
             st.warning("Ingen FMP_API_KEY hittades i secrets. Lägg till den för att undvika 429/403.")
 
-    # 🧪 FMP-hälsokoll & Finnhub-status
+    # 🧪 API-hälsokoll
     with st.sidebar.expander("🧪 API-hälsokoll", expanded=False):
         test_tkr = st.text_input("Testa FMP/SEC/Yahoo för ticker (Yahoo-format):", key="fmp_test_ticker")
         if st.button("Kör test", disabled=not bool(st.session_state.get("fmp_test_ticker"))):
@@ -1989,7 +2033,6 @@ def main():
                     "P/S Q4": sec_sample.get("P/S Q4"),
                 }
             })
-        st.caption(f"Finnhub nyckel: {'OK' if st.secrets.get('FINNHUB_API_KEY') else 'SAKNAS'}")
 
     st.sidebar.markdown("---")
     if st.sidebar.button("↻ Läs om data från Google Sheets"):

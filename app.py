@@ -229,35 +229,94 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
 # --- FMP: konfiguration + hjälpare ---
 FMP_BASE = st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
 FMP_KEY  = st.secrets.get("FMP_API_KEY", "")
+FMP_CALL_DELAY = float(st.secrets.get("FMP_CALL_DELAY", 0.6))  # sek per anrop (skonsamt läge)
 
 def _fmp_get(path: str, params=None, stable: bool = True):
+    """
+    Throttlad GET med enkel backoff. Återvänder (json, statuscode).
+    Backoff triggas på 429/403/5xx.
+    """
     params = params or {}
     if FMP_KEY:
         params["apikey"] = FMP_KEY
     url = f"{FMP_BASE}/stable/{path}" if stable else f"{FMP_BASE}/{path}"
-    r = None
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        sc = r.status_code
-        r.raise_for_status()
-        return r.json(), sc
-    except requests.HTTPError:
+
+    delays = [0.0, 1.2, 2.5]  # enkel backoff
+    last_sc = 0
+    last_json = None
+
+    for attempt, extra_sleep in enumerate(delays, start=1):
         try:
-            return r.json(), r.status_code
+            if FMP_CALL_DELAY > 0:
+                time.sleep(FMP_CALL_DELAY)
+            r = requests.get(url, params=params, timeout=20)
+            sc = r.status_code
+            last_sc = sc
+            try:
+                j = r.json()
+            except Exception:
+                j = None
+            last_json = j
+
+            if 200 <= sc < 300:
+                return j, sc
+
+            if sc in (429, 403, 502, 503, 504):
+                time.sleep(extra_sleep)
+                continue
+
+            return j, sc
         except Exception:
-            return None, getattr(r, "status_code", 0)
-    except Exception:
-        return None, 0
+            time.sleep(extra_sleep)
+            continue
+
+    return last_json, last_sc
 
 def _fmp_pick_symbol(yahoo_ticker: str) -> str:
-    sym = str(yahoo_ticker).strip()
+    sym = str(yahoo_ticker).strip().upper()
     js, sc = _fmp_get("api/v3/quote-short", {"symbol": sym}, stable=False)
     if isinstance(js, list) and js:
         return sym
     js, sc = _fmp_get("search-symbol", {"query": yahoo_ticker})
     if isinstance(js, list) and js:
-        return str(js[0].get("symbol", sym))
+        return str(js[0].get("symbol", sym)).upper()
     return sym
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def hamta_fmp_falt_light(yahoo_ticker: str) -> dict:
+    """Minimala anrop: profile (namn/valuta), quote (pris/mcap), ratios-ttm (P/S)."""
+    out = {"_debug": {}, "_symbol": _fmp_pick_symbol(yahoo_ticker)}
+    sym = out["_symbol"]
+
+    prof, sc_prof = _fmp_get("profile", {"symbol": sym})
+    out["_debug"]["profile_sc"] = sc_prof
+    if isinstance(prof, list) and prof:
+        p0 = prof[0]
+        if p0.get("companyName"): out["Bolagsnamn"] = p0["companyName"]
+        if p0.get("currency"):    out["Valuta"]     = str(p0["currency"]).upper()
+        if p0.get("price") is not None:
+            try: out["Aktuell kurs"] = float(p0["price"])
+            except: pass
+
+    q, sc_q = _fmp_get(f"api/v3/quote/{sym}", stable=False)
+    out["_debug"]["quote_sc"] = sc_q
+    if isinstance(q, list) and q:
+        q0 = q[0]
+        if "price" in q0 and "Aktuell kurs" not in out:
+            try: out["Aktuell kurs"] = float(q0["price"])
+            except: pass
+
+    rttm, sc_rttm = _fmp_get("ratios-ttm", {"symbol": sym})
+    out["_debug"]["ratios_ttm_sc"] = sc_rttm
+    if isinstance(rttm, list) and rttm:
+        try:
+            v = rttm[0].get("priceToSalesTTM") or rttm[0].get("priceToSalesRatioTTM")
+            if v and float(v) > 0:
+                out["P/S"] = float(v)
+                out["_debug"]["ps_source"] = "ratios-ttm"
+        except Exception:
+            pass
+    return out
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def hamta_fmp_falt(yahoo_ticker: str) -> dict:
@@ -766,12 +825,19 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
 
         total = len(df)
         for i, row in df.iterrows():
-            tkr = str(row["Ticker"]).strip()
+            tkr = str(row["Ticker"]).strip().upper()
             status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
 
             before = {f: row.get(f, 0.0) for f in UPPDATERBARA_FALT}
 
-            data = hamta_fmp_falt(tkr) if source == "FMP" else hamta_yahoo_fält(tkr)
+            if source == "FMP":
+                if st.session_state.get("fmp_light_mode", True):
+                    data = hamta_fmp_falt_light(tkr)
+                else:
+                    data = hamta_fmp_falt(tkr)
+            else:
+                data = hamta_yahoo_fält(tkr)
+
             failed_fields = []
 
             # Namn/Valuta/Kurs
@@ -791,50 +857,50 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                 # Shares + P/S + kvartal
                 if data.get("Utestående aktier", 0) > 0:
                     mark_field_if_changed(df, i, "Utestående aktier", float(data["Utestående aktier"]))
-                else:
-                    failed_fields.append("Utestående aktier")
-
+                # P/S TTM
                 if data.get("P/S", 0) > 0:
                     if mark_field_if_changed(df, i, "P/S", float(data["P/S"])):
                         ps_count += 1
+                # Kvartal (endast i full-mode)
+                if not st.session_state.get("fmp_light_mode", True):
+                    psq_touched = False
+                    for q in (1,2,3,4):
+                        key = f"P/S Q{q}"
+                        if data.get(key, 0) > 0:
+                            if mark_field_if_changed(df, i, key, float(data[key])):
+                                psq_touched = True
+                    if psq_touched:
+                        psq_count += 1
 
-                psq_touched = False
-                for q in (1,2,3,4):
-                    key = f"P/S Q{q}"
-                    if data.get(key, 0) > 0:
-                        if mark_field_if_changed(df, i, key, float(data[key])):
-                            psq_touched = True
-                if psq_touched:
-                    psq_count += 1
+                # Estimat (FMP -> Yahoo-fallback) endast i full-mode
+                if not st.session_state.get("fmp_light_mode", True):
+                    est_touched = False
+                    cur_est = data.get("Omsättning idag", 0.0)
+                    nxt_est = data.get("Omsättning nästa år", 0.0)
+                    if cur_est and cur_est > 0:
+                        if mark_field_if_changed(df, i, "Omsättning idag", float(cur_est)):
+                            est_touched = True
+                    if nxt_est and nxt_est > 0:
+                        if mark_field_if_changed(df, i, "Omsättning nästa år", float(nxt_est)):
+                            est_touched = True
 
-                # Estimat (FMP -> Yahoo-fallback)
-                est_touched = False
-                cur_est = data.get("Omsättning idag", 0.0)
-                nxt_est = data.get("Omsättning nästa år", 0.0)
-                if cur_est and cur_est > 0:
-                    if mark_field_if_changed(df, i, "Omsättning idag", float(cur_est)):
-                        est_touched = True
-                if nxt_est and nxt_est > 0:
-                    if mark_field_if_changed(df, i, "Omsättning nästa år", float(nxt_est)):
-                        est_touched = True
+                    if not est_touched:
+                        y_est = hamta_yahoo_omsattningsestimat(tkr)
+                        y_ok = False
+                        v = float(y_est.get("Omsättning idag", 0.0))
+                        if v > 0:
+                            if mark_field_if_changed(df, i, "Omsättning idag", v):
+                                y_ok = True; est_touched = True
+                        v = float(y_est.get("Omsättning nästa år", 0.0))
+                        if v > 0:
+                            if mark_field_if_changed(df, i, "Omsättning nästa år", v):
+                                y_ok = True; est_touched = True
+                        if not y_ok:
+                            sc = data.get("_est_status", 0)
+                            estimat_miss.append(f"{tkr} (FMP HTTP {sc}, Yahoo saknar också)")
 
-                if not est_touched:
-                    y_est = hamta_yahoo_omsattningsestimat(tkr)
-                    y_ok = False
-                    v = float(y_est.get("Omsättning idag", 0.0))
-                    if v > 0:
-                        if mark_field_if_changed(df, i, "Omsättning idag", v):
-                            y_ok = True; est_touched = True
-                    v = float(y_est.get("Omsättning nästa år", 0.0))
-                    if v > 0:
-                        if mark_field_if_changed(df, i, "Omsättning nästa år", v):
-                            y_ok = True; est_touched = True
-                    if not y_ok:
-                        sc = data.get("_est_status", 0)
-                        estimat_miss.append(f"{tkr} (FMP HTTP {sc}, Yahoo saknar också)")
-
-                if est_touched:
-                    est_count += 1
+                    if est_touched:
+                        est_count += 1
 
             else:
                 # source == "Yahoo" → försök estimat via Yahoo
@@ -1040,7 +1106,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
 
         # Hämta från vald källa (med TS-stämpling)
         if st.session_state["datakalla_form"] == "FMP":
-            data = hamta_fmp_falt(ticker)
+            data = hamta_fmp_falt_light(ticker) if st.session_state.get("fmp_light_mode", True) else hamta_fmp_falt(ticker)
             if data.get("Bolagsnamn"):
                 df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = data["Bolagsnamn"]
             if data.get("Valuta"):
@@ -1052,23 +1118,24 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
                 if data.get(key, 0) and row_index is not None:
                     mark_field_if_changed(df, row_index, key, float(data[key]))
 
-            # Estimat (FMP, annars Yahoo)
-            y_est = None
-            if float(data.get("Omsättning idag",0.0)) > 0 and row_index is not None:
-                mark_field_if_changed(df, row_index, "Omsättning idag", float(data["Omsättning idag"]))
-            else:
-                y_est = hamta_yahoo_omsattningsestimat(ticker)
-                v = float(y_est.get("Omsättning idag",0.0))
-                if v > 0 and row_index is not None:
-                    mark_field_if_changed(df, row_index, "Omsättning idag", v)
+            # Estimat endast i full-mode
+            if not st.session_state.get("fmp_light_mode", True):
+                y_est = None
+                if float(data.get("Omsättning idag",0.0)) > 0 and row_index is not None:
+                    mark_field_if_changed(df, row_index, "Omsättning idag", float(data["Omsättning idag"]))
+                else:
+                    y_est = hamta_yahoo_omsattningsestimat(ticker)
+                    v = float(y_est.get("Omsättning idag",0.0))
+                    if v > 0 and row_index is not None:
+                        mark_field_if_changed(df, row_index, "Omsättning idag", v)
 
-            if float(data.get("Omsättning nästa år",0.0)) > 0 and row_index is not None:
-                mark_field_if_changed(df, row_index, "Omsättning nästa år", float(data["Omsättning nästa år"]))
-            else:
-                y_est = y_est or hamta_yahoo_omsattningsestimat(ticker)
-                v = float(y_est.get("Omsättning nästa år",0.0))
-                if v > 0 and row_index is not None:
-                    mark_field_if_changed(df, row_index, "Omsättning nästa år", v)
+                if float(data.get("Omsättning nästa år",0.0)) > 0 and row_index is not None:
+                    mark_field_if_changed(df, row_index, "Omsättning nästa år", float(data["Omsättning nästa år"]))
+                else:
+                    y_est = y_est or hamta_yahoo_omsattningsestimat(ticker)
+                    v = float(y_est.get("Omsättning nästa år",0.0))
+                    if v > 0 and row_index is not None:
+                        mark_field_if_changed(df, row_index, "Omsättning nästa år", v)
 
         else:
             data = hamta_yahoo_fält(ticker)
@@ -1403,12 +1470,23 @@ def main():
             if provider != "FMP":
                 st.info("FMP:s valutadata kan kräva högre plan. Automatisk fallback användes.")
 
+    # ⚙️ FMP-inställningar
+    with st.sidebar.expander("⚙️ FMP-inställningar", expanded=False):
+        st.session_state["fmp_light_mode"] = st.checkbox("FMP Light-mode (färre API-anrop)", value=True)
+        key_present = bool(FMP_KEY)
+        key_preview = (FMP_KEY[:4] + "…") if key_present else "(saknas)"
+        st.caption(f"FMP_API_KEY: {key_preview} | BASE: {FMP_BASE} | CALL_DELAY: {FMP_CALL_DELAY}s")
+        if not key_present:
+            st.warning("Ingen FMP_API_KEY hittades i secrets. Lägg till den för att undvika 429/403.")
+
     # 🧪 FMP-hälsokoll
     with st.sidebar.expander("🧪 FMP-hälsokoll", expanded=False):
         test_tkr = st.text_input("Testa FMP för ticker (Yahoo-format):", key="fmp_test_ticker")
         if st.button("Kör test", disabled=not bool(st.session_state.get("fmp_test_ticker"))):
-            d = hamta_fmp_falt(st.session_state["fmp_test_ticker"].strip())
+            tkr = st.session_state["fmp_test_ticker"].strip().upper()
+            d = hamta_fmp_falt_light(tkr) if st.session_state.get("fmp_light_mode", True) else hamta_fmp_falt(tkr)
             st.write({
+                "api_key": ("OK" if bool(FMP_KEY) else "saknas"),
                 "symbol": d.get("_symbol"),
                 "Bolagsnamn": d.get("Bolagsnamn"),
                 "Valuta": d.get("Valuta"),
@@ -1422,10 +1500,10 @@ def main():
                         "profile_sc","quote_sc","shares_float_sc",
                         "ratios_ttm_sc","key_metrics_ttm_sc","income_ttm_sc","ratios_quarter_sc",
                         "analyst_estimates_sc"
-                    ]
+                    ] if d.get("_debug", {}).get(k) is not None
                 }
             })
-            st.caption("Om P/S saknas men du har marketCap + revenueTTM (income-statement-ttm), beräknas P/S automatiskt.")
+            st.caption("Tips: använd versaler (t.ex. TTD). 429 = rate-limit/åtkomst. Light-mode minskar antalet anrop.")
 
     st.sidebar.markdown("---")
     if st.sidebar.button("↻ Läs om data från Google Sheets"):
@@ -1508,7 +1586,7 @@ def main():
                     res = cleanup_drive_backups(
                         keep_last=int(keep_last),
                         older_than_days=int(older_than_days) if older_than_days > 0 else None,
-                        dry_run=bool(dry_run)  # om false sker radering
+                        dry_run=bool(dry_run)
                     )
                     if dry_run:
                         st.info("Dry-run aktiv: ingen radering utfördes.")

@@ -7,7 +7,7 @@ import time
 import requests
 from datetime import datetime
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build  # NEW: för Drive-städning m.m.
+from googleapiclient.discovery import build  # för Drive-städning m.m.
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
@@ -33,7 +33,7 @@ SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 RATES_SHEET_NAME = "Valutakurser"
 
-# Moderna scopes (feeds -> spreadsheets)
+# Moderna scopes
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -75,7 +75,7 @@ def hamta_data():
     data = _with_backoff(sheet.get_all_records)
     return pd.DataFrame(data)
 
-# --- Backup: snapshot till ny flik + fullständig filkopia + CSV ---
+# --- Backup: snapshot till ny flik + CSV-export ---
 def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME) -> str:
     """
     Skapar en ny flik i samma Google Sheet med allt innehåll i df.
@@ -107,7 +107,7 @@ STANDARD_VALUTAKURSER = {
 @st.cache_data(show_spinner=False)
 def las_sparade_valutakurser_cached(nonce: int):
     ws = skapa_rates_sheet_if_missing()
-    rows = _with_backoff(ws.get_all_records)  # [{'Valuta': 'USD', 'Kurs': '9.46'}, ...]
+    rows = _with_backoff(ws.get_all_records)
     out = {}
     for r in rows:
         cur = str(r.get("Valuta", "")).upper().strip()
@@ -312,8 +312,12 @@ def _current_backup_prefix() -> str:
 def list_drive_backups(limit: int = 500) -> list:
     service = _build_drive_service()
     prefix = _current_backup_prefix()
+
+    # Escapa enkla citationstecken utanför f-string-uttrycket (fix för SyntaxError)
+    safe_prefix = prefix.replace("'", "\\'")
+
     base_q = "mimeType='application/vnd.google-apps.spreadsheet' and 'me' in owners"
-    q = f"{base_q} and name contains '{prefix.replace(\"'\", \"\\'\")}'"
+    q = f"{base_q} and name contains '{safe_prefix}'"
     if DRIVE_BACKUP_FOLDER_ID:
         q += f" and '{DRIVE_BACKUP_FOLDER_ID}' in parents"
 

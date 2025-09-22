@@ -5,9 +5,11 @@ import gspread
 import yfinance as yf
 import time
 import requests
-from typing import Optional
 from datetime import datetime
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build  # NEW: för Drive-städning m.m.
+
+st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
 # --- Lokal Stockholm-tid om pytz finns (annars systemtid) ---
 try:
@@ -26,14 +28,16 @@ except Exception:
 def _ts_str():
     return _ts_datetime().strftime("%Y%m%d-%H%M%S")
 
-st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
-
 # --- Google Sheets-koppling ---
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 RATES_SHEET_NAME = "Valutakurser"
 
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+# Moderna scopes (feeds -> spreadsheets)
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
 client = gspread.authorize(credentials)
 
@@ -87,21 +91,6 @@ def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME) -
         values += df.astype(str).values.tolist()
     _with_backoff(ws.update, values)
     return snap_title
-
-def backup_copy_spreadsheet():
-    """
-    Skapar en komplett kopia av aktuellt kalkylark i Drive (i servicekontots Drive).
-    """
-    ss = get_spreadsheet()
-    new_title = f"{ss.title} – BACKUP {now_stamp()} {_ts_datetime().strftime('%H%M%S')}"
-    copied = client.copy(ss.id, title=new_title, copy_permissions=False)
-    try:
-        return copied.id, copied.title
-    except Exception:
-        try:
-            return copied.get("id"), copied.get("name", new_title)
-        except Exception:
-            return None, new_title
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -212,7 +201,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
             try: out["Utestående aktier"] = float(p0["sharesOutstanding"]) / 1e6
             except: pass
 
-    # Fallback pris om saknas
+    # Fallback pris
     if "Aktuell kurs" not in out:
         q, _ = _fmp_get("api/v3/quote-short", {"symbol": sym}, stable=False)
         if isinstance(q, list) and q and q[0].get("price") is not None:
@@ -238,7 +227,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
         try: out["P/S"] = float(rttm[0]["priceToSalesTTM"])
         except: pass
 
-    # 3) P/S kvartal Q1..Q4 (senaste fyra)
+    # 3) P/S kvartal Q1..Q4
     rq, _ = _fmp_get(f"api/v3/ratios/{sym}", {"period": "quarter", "limit": 4}, stable=False)
     if isinstance(rq, list) and rq:
         for i, row in enumerate(rq[:4], start=1):
@@ -247,7 +236,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
                 try: out[f"P/S Q{i}"] = float(ps)
                 except: pass
 
-    # 4) Analytikerestimat – endast skriv om > 0 (logga statuskod)
+    # 4) Analytikerestimat – endast skriv om > 0
     est, est_sc = _fmp_get("analyst-estimates", {"symbol": sym, "period": "annual", "limit": 2})
     def _pick_rev(obj: dict) -> float:
         for k in ("revenueAvg", "revenueMean", "revenue", "revenueEstimateAvg"):
@@ -300,16 +289,125 @@ def hamta_valutakurser_via_fmp() -> tuple[dict, list]:
             miss.append(f"{pair} (HTTP {sc})")
     return result, miss
 
+# --- Drive-kopia (med mappstöd & vänliga fel) + städning ---
+DRIVE_BACKUP_FOLDER_ID = st.secrets.get("DRIVE_BACKUP_FOLDER_ID")  # valfritt
+
+def _build_drive_service():
+    creds = Credentials.from_service_account_info(
+        st.secrets["GOOGLE_CREDENTIALS"],
+        scopes=[
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+        ],
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def _current_backup_prefix() -> str:
+    try:
+        ss = get_spreadsheet()
+        return f"{ss.title} – BACKUP "
+    except Exception:
+        return "BACKUP "
+
+def list_drive_backups(limit: int = 500) -> list:
+    service = _build_drive_service()
+    prefix = _current_backup_prefix()
+    base_q = "mimeType='application/vnd.google-apps.spreadsheet' and 'me' in owners"
+    q = f"{base_q} and name contains '{prefix.replace(\"'\", \"\\'\")}'"
+    if DRIVE_BACKUP_FOLDER_ID:
+        q += f" and '{DRIVE_BACKUP_FOLDER_ID}' in parents"
+
+    items = []
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=q,
+            spaces="drive",
+            fields="nextPageToken, files(id,name,createdTime,size)",
+            orderBy="createdTime desc",
+            pageToken=page_token,
+            pageSize=min(1000, limit),
+        ).execute()
+        items.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token or len(items) >= limit:
+            break
+    return items
+
+def cleanup_drive_backups(keep_last: int = 5, older_than_days: int | None = None, dry_run: bool = True) -> dict:
+    from datetime import timezone, timedelta
+    service = _build_drive_service()
+    files = list_drive_backups()
+    kept = []
+    candidates = []
+
+    kept_ids = set([f["id"] for f in files[:max(0, keep_last)]])
+    for idx, f in enumerate(files):
+        f["_index"] = idx + 1  # 1-baserad (nyast=1)
+        is_old = False
+        if older_than_days is not None:
+            try:
+                ct = datetime.fromisoformat(f["createdTime"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                is_old = (datetime.now(timezone.utc) - ct) > timedelta(days=older_than_days)
+            except Exception:
+                pass
+
+        if f["id"] in kept_ids and not is_old:
+            kept.append(f)
+        else:
+            candidates.append(f)
+
+    deleted = []
+    if not dry_run:
+        for f in candidates:
+            try:
+                service.files().delete(fileId=f["id"]).execute()
+                deleted.append(f)
+            except Exception as e:
+                f["_delete_error"] = str(e)
+
+    return {"deleted": deleted, "kept": kept, "candidates": candidates}
+
+def _friendly_drive_error(e: Exception) -> str:
+    s = str(e)
+    if "The user's Drive storage quota has been exceeded" in s:
+        return "Drive-kvoten är full på servicekontot. Städa gamla kopior eller byt konto/mapp."
+    if "[403]" in s and "drive.googleapis.com" in s:
+        return "Drive API är inte aktiverat för projektet som credentials tillhör. Aktivera och försök igen."
+    return s
+
+def backup_copy_spreadsheet():
+    """
+    Skapar en komplett kopia av aktuellt kalkylark i Drive.
+    Om DRIVE_BACKUP_FOLDER_ID finns i secrets placeras kopian i den mappen.
+    """
+    ss = get_spreadsheet()
+    new_title = f"{ss.title} – BACKUP {now_stamp()} {_ts_datetime().strftime('%H%M%S')}"
+    try:
+        copied = client.copy(
+            ss.id,
+            title=new_title,
+            copy_permissions=False,
+            folder_id=DRIVE_BACKUP_FOLDER_ID,
+        )
+        try:
+            return copied.id, copied.title
+        except Exception:
+            try:
+                return copied.get("id"), copied.get("name", new_title)
+            except Exception:
+                return None, new_title
+    except Exception as e:
+        raise RuntimeError(_friendly_drive_error(e))
+
 # --- Spara data (med snapshot innan skrivning) ---
 def spara_data(df: pd.DataFrame, do_snapshot: bool = True):
-    # 1) Skapa snabb-snapshot innan skrivning
     if do_snapshot:
         try:
             snap_name = backup_snapshot_sheet(df, base_sheet_name=SHEET_NAME)
             st.sidebar.info(f"Backup-snapshot skapad: {snap_name}")
         except Exception as e:
             st.sidebar.warning(f"Backup-snapshot misslyckades: {e}")
-    # 2) Skriv till ordinarie flik
     sheet = skapa_koppling()
     _with_backoff(sheet.clear)
     _with_backoff(sheet.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
@@ -499,7 +597,6 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
             if data.get("Valuta"): df.at[i, "Valuta"] = data["Valuta"]
             else: failed_fields.append("Valuta")
 
-            # FMP-specifika kompletteringar
             if source == "FMP":
                 if data.get("Utestående aktier", 0) > 0:
                     df.at[i, "Utestående aktier"] = float(data["Utestående aktier"])
@@ -514,7 +611,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                     if data.get(key, 0) > 0:
                         df.at[i, key] = float(data[key])
 
-                # --- Analytikerestimat: skriv ENDAST om > 0; annars lämna manuella värden orörda ---
+                # --- Analytikerestimat: skriv ENDAST om > 0; annars lämna manuellt orört ---
                 ok_est = False
                 cur_est = data.get("Omsättning idag", 0.0)
                 nxt_est = data.get("Omsättning nästa år", 0.0)
@@ -524,7 +621,6 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                 if nxt_est and nxt_est > 0:
                     df.at[i, "Omsättning nästa år"] = float(nxt_est)
                     ok_est = True
-
                 if not ok_est:
                     sc = data.get("_est_status", 0)
                     estimat_miss.append(f"{tkr} (HTTP {sc})")
@@ -616,7 +712,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
             oms_next  = st.number_input("Omsättning nästa år (miljoner)", value=float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0)
 
             st.markdown("**Uppdateras automatiskt vid spara:**")
-            st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning (Yahoo), CAGR 5 år (%) (Yahoo)")
+            st.write("- Yahoo: Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%)")
             st.write("- FMP: Utestående aktier, P/S (TTM), P/S Q1–Q4, ev. omsättningsestimat (om > 0)")
             st.write("- Omsättning om 2 & 3 år, Riktkurser och P/S-snitt beräknas om")
 
@@ -653,7 +749,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
         # Hämta från vald källa
         if st.session_state["datakalla_form"] == "FMP":
             data = hamta_fmp_falt(ticker)
-            # Skriv endast fält som finns/giltiga
             if data.get("Bolagsnamn"): df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = data["Bolagsnamn"]
             if data.get("Valuta"):     df.loc[df["Ticker"]==ticker, "Valuta"] = data["Valuta"]
             if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"]==ticker, "Aktuell kurs"] = float(data["Aktuell kurs"])
@@ -877,6 +972,7 @@ def main():
     # Backup & återställning
     with st.sidebar.expander("🛟 Backup & återställning", expanded=False):
         st.caption("Skapa kopior innan större körningar/ändringar.")
+
         col_b1, col_b2 = st.columns(2)
         with col_b1:
             if st.button("📄 Snapshot (ny flik)"):
@@ -896,12 +992,59 @@ def main():
                         st.warning(f"Kopia skapad: {new_title} (okänt id)")
                 except Exception as e:
                     st.error(f"Misslyckades: {e}")
+
         st.download_button(
             "⬇️ Ladda ner CSV av aktuell data",
             data=df_to_csv_bytes(df),
             file_name=f"databas_backup_{_ts_str()}.csv",
             mime="text/csv",
         )
+
+        st.markdown("---")
+        st.subheader("🧹 Städa filkopior (Drive)")
+        keep_last = st.number_input("Behåll senaste N kopior", min_value=0, value=5, step=1)
+        older_than_days = st.number_input("...och / eller radera kopior äldre än (dagar)", min_value=0, value=0, step=1)
+        dry_run = st.checkbox("Dry-run (lista utan att radera)", value=True)
+
+        col_clean1, col_clean2 = st.columns(2)
+        with col_clean1:
+            if st.button("🔎 Förhandsgranska kandidater"):
+                res = cleanup_drive_backups(
+                    keep_last=int(keep_last),
+                    older_than_days=int(older_than_days) if older_than_days > 0 else None,
+                    dry_run=True,
+                )
+                cands = res["candidates"]
+                if not cands:
+                    st.success("Inga kandidater att radera enligt dina regler.")
+                else:
+                    df_cands = pd.DataFrame([{
+                        "Ordning": f.get("_index"),
+                        "Namn": f.get("name"),
+                        "Skapad": f.get("createdTime"),
+                        "Id": f.get("id"),
+                    } for f in cands])
+                    st.dataframe(df_cands, use_container_width=True)
+
+        with col_clean2:
+            if st.button("🗑️ Radera nu (enligt reglerna)"):
+                try:
+                    res = cleanup_drive_backups(
+                        keep_last=int(keep_last),
+                        older_than_days=int(older_than_days) if older_than_days > 0 else None,
+                        dry_run=False,
+                    )
+                    st.success(f"Raderade {len(res['deleted'])} kopior. Behöll {len(res['kept'])}.")
+                    if res["deleted"]:
+                        df_del = pd.DataFrame([{
+                            "Namn": f.get("name"),
+                            "Skapad": f.get("createdTime"),
+                            "Id": f.get("id"),
+                        } for f in res["deleted"]])
+                        st.dataframe(df_del, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Misslyckades: {_friendly_drive_error(e)}")
+
         st.markdown("""
 **Återställning (enkelt):**
 1. *Från snapshot-flik:* markera allt i snapshot-fliken → kopiera → klistra in över ordinarie blad (Blad1).

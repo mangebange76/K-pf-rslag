@@ -7,7 +7,7 @@ import time
 import requests
 from datetime import datetime
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build  # för Drive-städning m.m.
+from googleapiclient.discovery import build  # Drive-kopior/städning
 
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
@@ -33,7 +33,6 @@ SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 RATES_SHEET_NAME = "Valutakurser"
 
-# Moderna scopes
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -42,7 +41,6 @@ credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIA
 client = gspread.authorize(credentials)
 
 def _with_backoff(func, *args, **kwargs):
-    """Liten backoff-hjälpare för att mildra 429/kvotfel."""
     delays = [0, 0.5, 1.0, 2.0]
     last_err = None
     for d in delays:
@@ -75,12 +73,8 @@ def hamta_data():
     data = _with_backoff(sheet.get_all_records)
     return pd.DataFrame(data)
 
-# --- Backup: snapshot till ny flik + CSV-export ---
+# --- Snapshot-backup till ny flik + CSV-export ---
 def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME) -> str:
-    """
-    Skapar en ny flik i samma Google Sheet med allt innehåll i df.
-    Returnerar fliknamnet, t.ex. 'BACKUP_Blad1_20250922-061530'.
-    """
     ss = get_spreadsheet()
     snap_title = f"BACKUP_{base_sheet_name}_{_ts_str()}"
     rows = max(2, len(df) + 5)
@@ -95,14 +89,8 @@ def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME) -
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
-# --- Standard valutakurser till SEK (fallback) ---
-STANDARD_VALUTAKURSER = {
-    "USD": 9.75,
-    "NOK": 0.95,
-    "CAD": 7.05,
-    "EUR": 11.18,
-    "SEK": 1.0,
-}
+# --- Standardkurser (fallback) ---
+STANDARD_VALUTAKURSER = {"USD": 9.75, "NOK": 0.95, "CAD": 7.05, "EUR": 11.18, "SEK": 1.0}
 
 @st.cache_data(show_spinner=False)
 def las_sparade_valutakurser_cached(nonce: int):
@@ -140,11 +128,6 @@ FMP_BASE = st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
 FMP_KEY  = st.secrets.get("FMP_API_KEY", "")
 
 def _fmp_get(path: str, params=None, stable: bool = True):
-    """
-    path: t.ex. 'ratios-ttm' (stable) eller 'api/v3/ratios/AAPL'
-    stable=True -> PREFIX: /stable/, annars rå path
-    Returnerar (json, status_code) eller (None, status_code vid fel)
-    """
     params = params or {}
     if FMP_KEY:
         params["apikey"] = FMP_KEY
@@ -164,9 +147,6 @@ def _fmp_get(path: str, params=None, stable: bool = True):
         return None, 0
 
 def _fmp_pick_symbol(yahoo_ticker: str) -> str:
-    """
-    Försök använda samma symbol; om den inte funkar, använd search som fallback.
-    """
     sym = str(yahoo_ticker).strip()
     js, sc = _fmp_get("api/v3/quote-short", {"symbol": sym}, stable=False)
     if isinstance(js, list) and js:
@@ -179,16 +159,13 @@ def _fmp_pick_symbol(yahoo_ticker: str) -> str:
 @st.cache_data(show_spinner=False, ttl=3600)
 def hamta_fmp_falt(yahoo_ticker: str) -> dict:
     """
-    Returnerar ENDAST fält med giltiga värden:
-      Bolagsnamn, Valuta, Aktuell kurs,
-      Utestående aktier (milj), P/S (TTM), P/S Q1..Q4,
-      Omsättning idag (estimat, milj), Omsättning nästa år (estimat, milj)
-    Obs: Omsättningsfälten läggs BARA in om > 0.
+    Hämtar: Bolagsnamn, Valuta, Aktuell kurs, Utestående aktier (milj),
+    P/S (TTM), P/S Q1..Q4, ev. omsättningsestimat (milj).
+    Estimat skrivs bara om > 0.
     """
     out = {}
     sym = _fmp_pick_symbol(yahoo_ticker)
 
-    # 1) Profil (namn, valuta, pris, sharesOutstanding)
     prof, sc_prof = _fmp_get("profile", {"symbol": sym})
     if isinstance(prof, list) and prof:
         p0 = prof[0]
@@ -201,14 +178,12 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
             try: out["Utestående aktier"] = float(p0["sharesOutstanding"]) / 1e6
             except: pass
 
-    # Fallback pris
     if "Aktuell kurs" not in out:
         q, _ = _fmp_get("api/v3/quote-short", {"symbol": sym}, stable=False)
         if isinstance(q, list) and q and q[0].get("price") is not None:
             try: out["Aktuell kurs"] = float(q[0]["price"])
             except: pass
 
-    # Fallback shares outstanding via all-shares-float
     if "Utestående aktier" not in out:
         flo, _ = _fmp_get("all-shares-float", {"symbol": sym})
         if isinstance(flo, list):
@@ -221,13 +196,11 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
                     except:
                         pass
 
-    # 2) P/S TTM
     rttm, _ = _fmp_get("ratios-ttm", {"symbol": sym})
     if isinstance(rttm, list) and rttm and rttm[0].get("priceToSalesTTM") is not None:
         try: out["P/S"] = float(rttm[0]["priceToSalesTTM"])
         except: pass
 
-    # 3) P/S kvartal Q1..Q4
     rq, _ = _fmp_get(f"api/v3/ratios/{sym}", {"period": "quarter", "limit": 4}, stable=False)
     if isinstance(rq, list) and rq:
         for i, row in enumerate(rq[:4], start=1):
@@ -236,7 +209,6 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
                 try: out[f"P/S Q{i}"] = float(ps)
                 except: pass
 
-    # 4) Analytikerestimat – endast skriv om > 0
     est, est_sc = _fmp_get("analyst-estimates", {"symbol": sym, "period": "annual", "limit": 2})
     def _pick_rev(obj: dict) -> float:
         for k in ("revenueAvg", "revenueMean", "revenue", "revenueEstimateAvg"):
@@ -255,7 +227,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
     out["_est_status"] = est_sc
     return out
 
-# --- FMP valutakurser (forex par) ---
+# --- FX via FMP + fallback (ECB / exchangerate.host) ---
 def _parse_fx_mid(obj: dict) -> float:
     if not isinstance(obj, dict): return 0.0
     b = obj.get("bid"); a = obj.get("ask"); p = obj.get("price")
@@ -269,10 +241,6 @@ def _parse_fx_mid(obj: dict) -> float:
     return 0.0
 
 def hamta_valutakurser_via_fmp() -> tuple[dict, list]:
-    """
-    Hämtar USDSEK, NOKSEK, CADSEK, EURSEK via FMP Forex endpoints.
-    Returnerar (rates_dict, miss_list).
-    """
     result = {"SEK": 1.0}
     pairs = {"USD": "USDSEK", "NOK": "NOKSEK", "CAD": "CADSEK", "EUR": "EURSEK"}
     miss = []
@@ -289,7 +257,51 @@ def hamta_valutakurser_via_fmp() -> tuple[dict, list]:
             miss.append(f"{pair} (HTTP {sc})")
     return result, miss
 
-# --- Drive-kopia (med mappstöd & vänliga fel) + städning ---
+def _fx_frankfurter(base: str, quote: str) -> float:
+    try:
+        r = requests.get("https://api.frankfurter.app/latest",
+                         params={"from": base, "to": quote}, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            return float(j["rates"][quote])
+    except Exception:
+        pass
+    return 0.0
+
+def _fx_exchangerate_host(base: str, quote: str) -> float:
+    try:
+        r = requests.get("https://api.exchangerate.host/latest",
+                         params={"base": base, "symbols": quote}, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            return float(j["rates"][quote])
+    except Exception:
+        pass
+    return 0.0
+
+def hamta_valutakurser_auto() -> tuple[dict, list, str]:
+    rates, miss = hamta_valutakurser_via_fmp()
+    provider = "FMP"
+    got = [k for k in ("USD","NOK","CAD","EUR") if rates.get(k)]
+    if len(got) == 0:
+        provider = "Frankfurter (ECB)"
+        rates_out = {"SEK": 1.0}; miss2 = []
+        for cc in ("USD","NOK","CAD","EUR"):
+            rate = _fx_frankfurter(cc, "SEK")
+            if rate > 0: rates_out[cc] = rate
+            else: miss2.append(f"{cc}SEK (Frankfurter)")
+        rates, miss = rates_out, miss2
+        if not any(rates.get(k) for k in ("USD","NOK","CAD","EUR")):
+            provider = "exchangerate.host"
+            rates_out = {"SEK": 1.0}; miss3 = []
+            for cc in ("USD","NOK","CAD","EUR"):
+                rate = _fx_exchangerate_host(cc, "SEK")
+                if rate > 0: rates_out[cc] = rate
+                else: miss3.append(f"{cc}SEK (exchangerate.host)")
+            rates, miss = rates_out, miss3
+    return rates, miss, provider
+
+# --- Drive-kopior & städning ---
 DRIVE_BACKUP_FOLDER_ID = st.secrets.get("DRIVE_BACKUP_FOLDER_ID")  # valfritt
 
 def _build_drive_service():
@@ -312,10 +324,7 @@ def _current_backup_prefix() -> str:
 def list_drive_backups(limit: int = 500) -> list:
     service = _build_drive_service()
     prefix = _current_backup_prefix()
-
-    # Escapa enkla citationstecken utanför f-string-uttrycket (fix för SyntaxError)
     safe_prefix = prefix.replace("'", "\\'")
-
     base_q = "mimeType='application/vnd.google-apps.spreadsheet' and 'me' in owners"
     q = f"{base_q} and name contains '{safe_prefix}'"
     if DRIVE_BACKUP_FOLDER_ID:
@@ -325,12 +334,10 @@ def list_drive_backups(limit: int = 500) -> list:
     page_token = None
     while True:
         resp = service.files().list(
-            q=q,
-            spaces="drive",
+            q=q, spaces="drive",
             fields="nextPageToken, files(id,name,createdTime,size)",
             orderBy="createdTime desc",
-            pageToken=page_token,
-            pageSize=min(1000, limit),
+            pageToken=page_token, pageSize=min(1000, limit),
         ).execute()
         items.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
@@ -342,12 +349,11 @@ def cleanup_drive_backups(keep_last: int = 5, older_than_days: int | None = None
     from datetime import timezone, timedelta
     service = _build_drive_service()
     files = list_drive_backups()
-    kept = []
-    candidates = []
+    kept, candidates = [], []
 
     kept_ids = set([f["id"] for f in files[:max(0, keep_last)]])
     for idx, f in enumerate(files):
-        f["_index"] = idx + 1  # 1-baserad (nyast=1)
+        f["_index"] = idx + 1
         is_old = False
         if older_than_days is not None:
             try:
@@ -355,7 +361,6 @@ def cleanup_drive_backups(keep_last: int = 5, older_than_days: int | None = None
                 is_old = (datetime.now(timezone.utc) - ct) > timedelta(days=older_than_days)
             except Exception:
                 pass
-
         if f["id"] in kept_ids and not is_old:
             kept.append(f)
         else:
@@ -381,17 +386,11 @@ def _friendly_drive_error(e: Exception) -> str:
     return s
 
 def backup_copy_spreadsheet():
-    """
-    Skapar en komplett kopia av aktuellt kalkylark i Drive.
-    Om DRIVE_BACKUP_FOLDER_ID finns i secrets placeras kopian i den mappen.
-    """
     ss = get_spreadsheet()
     new_title = f"{ss.title} – BACKUP {now_stamp()} {_ts_datetime().strftime('%H%M%S')}"
     try:
         copied = client.copy(
-            ss.id,
-            title=new_title,
-            copy_permissions=False,
+            ss.id, title=new_title, copy_permissions=False,
             folder_id=DRIVE_BACKUP_FOLDER_ID,
         )
         try:
@@ -404,7 +403,7 @@ def backup_copy_spreadsheet():
     except Exception as e:
         raise RuntimeError(_friendly_drive_error(e))
 
-# --- Spara data (med snapshot innan skrivning) ---
+# --- Spara data (snapshot före skrivning) ---
 def spara_data(df: pd.DataFrame, do_snapshot: bool = True):
     if do_snapshot:
         try:
@@ -469,7 +468,7 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].astype(str)
     return df
 
-# --- CAGR från yfinance (Total Revenue, årligen) ---
+# --- CAGR via yfinance ---
 def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
     try:
         df_is = getattr(tkr, "income_stmt", None)
@@ -483,9 +482,8 @@ def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
                 return 0.0
         if series.empty or len(series) < 2:
             return 0.0
-        series = series.sort_index()  # kronologisk
-        start = float(series.iloc[0])
-        end   = float(series.iloc[-1])
+        series = series.sort_index()
+        start, end = float(series.iloc[0]), float(series.iloc[-1])
         years = max(1, len(series)-1)
         if start <= 0:
             return 0.0
@@ -494,15 +492,9 @@ def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
     except Exception:
         return 0.0
 
-# --- Hämtning från Yahoo (namn, kurs, valuta, utdelning, CAGR) ---
+# --- Yahoo: namn/kurs/valuta/utdelning/CAGR ---
 def hamta_yahoo_fält(ticker: str) -> dict:
-    out = {
-        "Bolagsnamn": "",
-        "Aktuell kurs": 0.0,
-        "Valuta": "USD",
-        "Årlig utdelning": 0.0,
-        "CAGR 5 år (%)": 0.0,
-    }
+    out = {"Bolagsnamn": "", "Aktuell kurs": 0.0, "Valuta": "USD", "Årlig utdelning": 0.0, "CAGR 5 år (%)": 0.0}
     try:
         t = yf.Ticker(ticker)
         info = {}
@@ -536,21 +528,68 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         pass
     return out
 
-# --- Beräkningar (P/S-snitt, omsättning år2/3 med clamp, riktkurser) ---
+# --- NEW: Yahoo omsättningsestimat (currentYear/nextYear) ---
+def hamta_yahoo_omsattningsestimat(ticker: str) -> dict:
+    """
+    Hämtar revenueEstimate.avg för currentYear & nextYear via yfinance.
+    Returnerar t.ex. {"Omsättning idag": 123.4, "Omsättning nästa år": 150.2} i miljoner.
+    """
+    out = {}
+    try:
+        t = yf.Ticker(ticker)
+        et = getattr(t, "earnings_trend", None)
+        if isinstance(et, pd.DataFrame) and not et.empty:
+            df = et.copy()
+            # Försök hitta flattenad kolumn "revenueEstimate.avg"
+            col_avg = None
+            for c in df.columns:
+                if isinstance(c, str) and c.lower().endswith("revenueestimate.avg"):
+                    col_avg = c
+                    break
+
+            def _pick_avg(row):
+                # 1) flattenad kolumn
+                if col_avg and col_avg in df.columns:
+                    try:
+                        return float(row[col_avg])
+                    except:
+                        pass
+                # 2) nested dict i kolumnen "revenueEstimate"
+                re_cell = row.get("revenueEstimate") if hasattr(row, "get") else None
+                if isinstance(re_cell, dict):
+                    v = re_cell.get("avg")
+                    try:
+                        return float(v)
+                    except:
+                        return 0.0
+                return 0.0
+
+            def _find_period(pname):
+                rows = df[df["period"].astype(str).str.lower() == pname.lower()]
+                if rows.empty:
+                    return 0.0
+                return _pick_avg(rows.iloc[0])
+
+            cur = _find_period("currentYear")
+            nxt = _find_period("nextYear")
+            if cur and cur > 0: out["Omsättning idag"] = float(cur) / 1e6
+            if nxt and nxt > 0: out["Omsättning nästa år"] = float(nxt) / 1e6
+    except Exception:
+        pass
+    return out
+
+# --- Beräkningar ---
 def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     for i, rad in df.iterrows():
-        # P/S-snitt: snitt av positiva Q1–Q4
         ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
         ps_clean = [float(x) for x in ps_vals if float(x) > 0]
         ps_snitt = round(np.mean(ps_clean), 2) if ps_clean else 0.0
         df.at[i, "P/S-snitt"] = ps_snitt
 
-        # CAGR clamp: >100% → 50%, <0% → 2%
         cagr = float(rad.get("CAGR 5 år (%)", 0.0))
         just_cagr = 50.0 if cagr > 100.0 else (2.0 if cagr < 0.0 else cagr)
         g = just_cagr / 100.0
 
-        # Omsättning om 2 & 3 år från "Omsättning nästa år"
         oms_next = float(rad.get("Omsättning nästa år", 0.0))
         if oms_next > 0:
             df.at[i, "Omsättning om 2 år"] = round(oms_next * (1.0 + g), 2)
@@ -559,7 +598,6 @@ def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
             df.at[i, "Omsättning om 2 år"] = float(rad.get("Omsättning om 2 år", 0.0))
             df.at[i, "Omsättning om 3 år"] = float(rad.get("Omsättning om 3 år", 0.0))
 
-        # Riktkurser (kräver Utestående aktier > 0 och P/S-snitt > 0)
         aktier_ut = float(rad.get("Utestående aktier", 0.0))
         if aktier_ut > 0 and ps_snitt > 0:
             df.at[i, "Riktkurs idag"]    = round((float(rad.get("Omsättning idag", 0.0))      * ps_snitt) / aktier_ut, 2)
@@ -570,7 +608,7 @@ def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
             df.at[i, "Riktkurs idag"] = df.at[i, "Riktkurs om 1 år"] = df.at[i, "Riktkurs om 2 år"] = df.at[i, "Riktkurs om 3 år"] = 0.0
     return df
 
-# --- Massuppdatera från vald källa (1s delay, kopierbar logg) ---
+# --- Massuppdatera från vald källa ---
 def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: str = "Yahoo") -> pd.DataFrame:
     st.sidebar.markdown("---")
     if st.sidebar.button("🔄 Uppdatera alla från " + source, key=f"{key_prefix}_massupd_btn"):
@@ -591,7 +629,6 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
 
             failed_fields = []
 
-            # Gemensamma fält (skriv bara om giltigt)
             if data.get("Bolagsnamn"): df.at[i, "Bolagsnamn"] = data["Bolagsnamn"]
             else: failed_fields.append("Bolagsnamn")
 
@@ -615,19 +652,36 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
                     if data.get(key, 0) > 0:
                         df.at[i, key] = float(data[key])
 
-                # --- Analytikerestimat: skriv ENDAST om > 0; annars lämna manuellt orört ---
+                # Estimat via FMP om tillgängligt (>0), annars Yahoo-fallback
                 ok_est = False
                 cur_est = data.get("Omsättning idag", 0.0)
                 nxt_est = data.get("Omsättning nästa år", 0.0)
                 if cur_est and cur_est > 0:
-                    df.at[i, "Omsättning idag"] = float(cur_est)
-                    ok_est = True
+                    df.at[i, "Omsättning idag"] = float(cur_est); ok_est = True
                 if nxt_est and nxt_est > 0:
-                    df.at[i, "Omsättning nästa år"] = float(nxt_est)
-                    ok_est = True
+                    df.at[i, "Omsättning nästa år"] = float(nxt_est); ok_est = True
+
                 if not ok_est:
-                    sc = data.get("_est_status", 0)
-                    estimat_miss.append(f"{tkr} (HTTP {sc})")
+                    y_est = hamta_yahoo_omsattningsestimat(tkr)
+                    y_ok = False
+                    if float(y_est.get("Omsättning idag", 0.0)) > 0:
+                        df.at[i, "Omsättning idag"] = float(y_est["Omsättning idag"]); y_ok = True
+                    if float(y_est.get("Omsättning nästa år", 0.0)) > 0:
+                        df.at[i, "Omsättning nästa år"] = float(y_est["Omsättning nästa år"]); y_ok = True
+                    if not y_ok:
+                        sc = data.get("_est_status", 0)
+                        estimat_miss.append(f"{tkr} (FMP HTTP {sc}, Yahoo saknar också)")
+
+            else:  # source == "Yahoo"
+                # Försök även estimat via Yahoo. Skriv endast om > 0.
+                y_est = hamta_yahoo_omsattningsestimat(tkr)
+                y_ok = False
+                if float(y_est.get("Omsättning idag", 0.0)) > 0:
+                    df.at[i, "Omsättning idag"] = float(y_est["Omsättning idag"]); y_ok = True
+                if float(y_est.get("Omsättning nästa år", 0.0)) > 0:
+                    df.at[i, "Omsättning nästa år"] = float(y_est["Omsättning nästa år"]); y_ok = True
+                if not y_ok:
+                    estimat_miss.append(f"{tkr} (Yahoo saknar estimat)")
 
             time.sleep(1.0)
             bar.progress((i+1)/total)
@@ -636,13 +690,11 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
         spara_data(df)
         st.sidebar.success("Klart! Alla bolag uppdaterade.")
 
-        # Loggutskrifter / nedladdning
         if misslyckade or estimat_miss:
             log_txt = []
             if misslyckade:
                 log_txt.append("[Allmänna fält som saknades]")
-                log_txt.extend(misslyckade)
-                log_txt.append("")
+                log_txt.extend(misslyckade); log_txt.append("")
             if estimat_miss:
                 log_txt.append("[Analytikerestimat saknades – fält lämnades orörda]")
                 log_txt.extend(estimat_miss)
@@ -652,7 +704,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
             st.sidebar.download_button(
                 label="⬇️ Ladda ner logg",
                 data=log_payload.encode("utf-8"),
-                file_name=f"fmp_log_{now_stamp()}.txt",
+                file_name=f"estimat_log_{now_stamp()}.txt",
                 mime="text/plain",
                 key=f"{key_prefix}_logdl"
             )
@@ -662,7 +714,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict, source: s
 # Fält som triggar datum "Senast manuellt uppdaterad"
 MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
 
-# --- Lägg till / uppdatera bolag (med källa & estimat-skydd) ---
+# --- Lägg till/uppdatera (med källval och Yahoo-estimat när Yahoo valts) ---
 def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_default: str = "Yahoo") -> pd.DataFrame:
     st.header("➕ Lägg till / uppdatera bolag")
 
@@ -693,7 +745,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
     else:
         bef = pd.Series({}, dtype=object)
 
-    # Källväljare i formuläret
     st.session_state.setdefault("datakalla_form", datakalla_default)
     st.session_state["datakalla_form"] = st.radio("Hämtningskälla", ["Yahoo","FMP"],
                                                   index=(0 if datakalla_default=="Yahoo" else 1),
@@ -716,7 +767,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
             oms_next  = st.number_input("Omsättning nästa år (miljoner)", value=float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0)
 
             st.markdown("**Uppdateras automatiskt vid spara:**")
-            st.write("- Yahoo: Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%)")
+            st.write("- Yahoo: Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%) + Omsättningsestimat (om finns)")
             st.write("- FMP: Utestående aktier, P/S (TTM), P/S Q1–Q4, ev. omsättningsestimat (om > 0)")
             st.write("- Omsättning om 2 & 3 år, Riktkurser och P/S-snitt beräknas om")
 
@@ -750,7 +801,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
         if datum_sätt:
             df.loc[df["Ticker"]==ticker, "Senast manuellt uppdaterad"] = now_stamp()
 
-        # Hämta från vald källa
         if st.session_state["datakalla_form"] == "FMP":
             data = hamta_fmp_falt(ticker)
             if data.get("Bolagsnamn"): df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = data["Bolagsnamn"]
@@ -761,11 +811,20 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
             for q in (1,2,3,4):
                 k = f"P/S Q{q}"
                 if data.get(k,0)>0: df.loc[df["Ticker"]==ticker, k] = float(data[k])
-            # Estimat: skriv endast om > 0 (annars behåll manuellt)
+            # Estimat från FMP, annars Yahoo-fallback
             if float(data.get("Omsättning idag",0.0)) > 0:
                 df.loc[df["Ticker"]==ticker, "Omsättning idag"] = float(data["Omsättning idag"])
+            else:
+                y_est = hamta_yahoo_omsattningsestimat(ticker)
+                if float(y_est.get("Omsättning idag",0.0)) > 0:
+                    df.loc[df["Ticker"]==ticker, "Omsättning idag"] = float(y_est["Omsättning idag"])
             if float(data.get("Omsättning nästa år",0.0)) > 0:
                 df.loc[df["Ticker"]==ticker, "Omsättning nästa år"] = float(data["Omsättning nästa år"])
+            else:
+                y_est = locals().get("y_est") or hamta_yahoo_omsattningsestimat(ticker)
+                if float(y_est.get("Omsättning nästa år",0.0)) > 0:
+                    df.loc[df["Ticker"]==ticker, "Omsättning nästa år"] = float(y_est["Omsättning nästa år"])
+
         else:
             data = hamta_yahoo_fält(ticker)
             if data.get("Bolagsnamn"): df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = data["Bolagsnamn"]
@@ -773,6 +832,12 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, datakalla_defa
             if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"]==ticker, "Aktuell kurs"] = data["Aktuell kurs"]
             if "Årlig utdelning" in data:    df.loc[df["Ticker"]==ticker, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
             if "CAGR 5 år (%)" in data:      df.loc[df["Ticker"]==ticker, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
+            # NEW: estimat via Yahoo om finns
+            y_est = hamta_yahoo_omsattningsestimat(ticker)
+            if float(y_est.get("Omsättning idag",0.0)) > 0:
+                df.loc[df["Ticker"]==ticker, "Omsättning idag"] = float(y_est["Omsättning idag"])
+            if float(y_est.get("Omsättning nästa år",0.0)) > 0:
+                df.loc[df["Ticker"]==ticker, "Omsättning nästa år"] = float(y_est["Omsättning nästa år"])
 
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
@@ -922,7 +987,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    # Sidopanel: valutakurser → läs sparade och visa inputs
+    # Sidopanel: valutakurser
     st.sidebar.header("💱 Valutakurser → SEK")
     saved_rates = las_sparade_valutakurser()
     usd = st.sidebar.number_input("USD → SEK", value=float(saved_rates.get("USD", STANDARD_VALUTAKURSER["USD"])), step=0.01, format="%.4f")
@@ -932,20 +997,19 @@ def main():
     user_rates = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
 
     with st.sidebar.expander("🔌 Hämta valutakurser automatiskt"):
-        if st.button("🌐 Hämta via FMP"):
-            rates, miss = hamta_valutakurser_via_fmp()
-            # Uppdatera UI-fält (behåller SEK=1.0)
-            usd = rates.get("USD", usd)
-            nok = rates.get("NOK", nok)
-            cad = rates.get("CAD", cad)
-            eur = rates.get("EUR", eur)
+        if st.button("🌐 Hämta valutakurser"):
+            rates, miss, provider = hamta_valutakurser_auto()
+            usd = rates.get("USD", usd); nok = rates.get("NOK", nok)
+            cad = rates.get("CAD", cad); eur = rates.get("EUR", eur)
             user_rates = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
             spara_valutakurser(user_rates)
             st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
             if miss:
-                st.warning("Vissa par kunde inte hämtas:\n- " + "\n- ".join(miss))
+                st.warning(f"Vissa par kunde inte hämtas via {provider}:\n- " + "\n- ".join(miss))
             else:
-                st.success("Valutakurser uppdaterade från FMP.")
+                st.success(f"Valutakurser uppdaterade via {provider}.")
+            if provider != "FMP":
+                st.info("FMP:s valutadata kan kräva högre plan. Automatisk fallback användes.")
 
     col_rates1, col_rates2 = st.sidebar.columns(2)
     with col_rates1:
@@ -967,7 +1031,7 @@ def main():
     df = hamta_data()
     if df.empty:
         df = pd.DataFrame({c: [] for c in FINAL_COLS})
-        spara_data(df, do_snapshot=False)  # första init – ingen snapshot behövs
+        spara_data(df, do_snapshot=False)
 
     df = säkerställ_kolumner(df)
     df = migrera_gamla_riktkurskolumner(df)
@@ -976,7 +1040,6 @@ def main():
     # Backup & återställning
     with st.sidebar.expander("🛟 Backup & återställning", expanded=False):
         st.caption("Skapa kopior innan större körningar/ändringar.")
-
         col_b1, col_b2 = st.columns(2)
         with col_b1:
             if st.button("📄 Snapshot (ny flik)"):
@@ -1055,11 +1118,11 @@ def main():
 2. *Från filkopia:* byt temporärt `SHEET_URL` i *Secrets* till backupfilens URL (eller kopiera tillbaka data).
 """)
 
-    # Datakälla (globala knappen)
+    # Källval
     st.sidebar.markdown("---")
     datakalla = st.sidebar.radio("Datakälla för hämtning", ["Yahoo", "FMP"], horizontal=True)
 
-    # Global massuppdateringsknapp i sidopanelen
+    # Massuppdatering
     df = massuppdatera(df, key_prefix="global", user_rates=user_rates, source=datakalla)
 
     meny = st.sidebar.radio("📌 Välj vy", ["Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"])

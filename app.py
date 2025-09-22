@@ -585,8 +585,24 @@ def _sec_latest_shares(facts: dict) -> float:
                     pass
     return 0.0
 
+# --- PATCH: korrekt kvartalsfiltrering för SEC-intäkter ----------------------
+from datetime import datetime as _dt  # används i _parse_iso
+
+def _parse_iso(d: str):
+    try:
+        # SEC kan vara 'YYYY-MM-DD' eller ISO8601 med Z
+        return _dt.fromisoformat(d.replace("Z", "+00:00")).date()
+    except Exception:
+        try:
+            return _dt.strptime(d, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
 def _sec_quarterly_revenues(facts: dict) -> list[float]:
-    """Returnerar upp till 4 senaste kvartalsintäkter (float)."""
+    """
+    Returnerar de 4 senaste *kvartalsvisa* intäkterna (3-mån), filtrerat på 10-Q
+    och varaktighet ~70–100 dagar för att utesluta 6/9/12-mån YTD.
+    """
     gaap = (facts.get("facts") or {}).get("us-gaap", {})
     cand_names = [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -596,22 +612,44 @@ def _sec_quarterly_revenues(facts: dict) -> list[float]:
     ]
     rows = []
     for name in cand_names:
-        if name in gaap:
-            pts = _pick_fact_number(gaap[name], unit_keys=("USD",), want_quarterly=True)
-            seen = set()
-            out = []
-            for end, val in pts:
-                if end in seen:
-                    continue
-                seen.add(end)
-                try:
-                    out.append(float(val))
-                except Exception:
-                    pass
-            if out:
-                rows = out
-                break
-    return rows[:4]
+        fact = gaap.get(name)
+        if not fact:
+            continue
+        units = (fact.get("units") or {}).get("USD", [])
+        for it in units:
+            form = (it.get("form") or "").upper()
+            if "10-Q" not in form:  # endast kvartalsrapporter
+                continue
+            end = _parse_iso(str(it.get("end", "")))
+            start = _parse_iso(str(it.get("start", "")))
+            val = it.get("val", None)
+            if not (end and start and val is not None):
+                continue
+            # Duration ≈ kvartal (70–100 dagar)
+            try:
+                dur = (end - start).days
+            except Exception:
+                dur = None
+            if dur is None or dur < 70 or dur > 100:
+                continue
+            try:
+                v = float(val)
+                rows.append((end, v))  # dedupe per 'end' senare
+            except Exception:
+                pass
+        if rows:
+            break  # ta första GAAP-nyckeln som gav giltiga datapunkter
+
+    if not rows:
+        return []
+
+    # Deduplicera per slutdatum och ta senaste fyra
+    dedup = {}
+    for end, v in rows:
+        if end not in dedup:
+            dedup[end] = v
+    items = sorted(dedup.items(), key=lambda t: t[0], reverse=True)[:4]
+    return [float(v) for (_, v) in items]
 
 def hamta_sec_yahoo_combo(ticker: str) -> dict:
     """

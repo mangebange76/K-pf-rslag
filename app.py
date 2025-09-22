@@ -259,12 +259,19 @@ def _fmp_pick_symbol(yahoo_ticker: str) -> str:
         return str(js[0].get("symbol", sym))
     return sym
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=1800)
 def hamta_fmp_falt(yahoo_ticker: str) -> dict:
-    out = {}
+    """
+    Hämta/beräkna P/S (TTM), P/S Q1–Q4, namn/valuta/kurs/shares och ev. omsättningsestimat.
+    Inkluderar _debug med HTTP-statusar och ps_source.
+    """
+    out = {"_debug": {}}
     sym = _fmp_pick_symbol(yahoo_ticker)
+    out["_symbol"] = sym
 
+    # Profile
     prof, sc_prof = _fmp_get("profile", {"symbol": sym})
+    out["_debug"]["profile_sc"] = sc_prof
     if isinstance(prof, list) and prof:
         p0 = prof[0]
         if p0.get("companyName"): out["Bolagsnamn"] = p0["companyName"]
@@ -276,14 +283,23 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
             try: out["Utestående aktier"] = float(p0["sharesOutstanding"]) / 1e6
             except: pass
 
-    if "Aktuell kurs" not in out:
-        q, _ = _fmp_get("api/v3/quote-short", {"symbol": sym}, stable=False)
-        if isinstance(q, list) and q and q[0].get("price") is not None:
-            try: out["Aktuell kurs"] = float(q[0]["price"])
+    # Quote (pris + marketCap)
+    qfull, sc_qfull = _fmp_get(f"api/v3/quote/{sym}", stable=False)
+    out["_debug"]["quote_sc"] = sc_qfull
+    market_cap = 0.0
+    if isinstance(qfull, list) and qfull:
+        q0 = qfull[0]
+        if "price" in q0 and "Aktuell kurs" not in out:
+            try: out["Aktuell kurs"] = float(q0["price"])
+            except: pass
+        if q0.get("marketCap") is not None:
+            try: market_cap = float(q0["marketCap"])
             except: pass
 
+    # Shares fallback
     if "Utestående aktier" not in out:
-        flo, _ = _fmp_get("all-shares-float", {"symbol": sym})
+        flo, sc_flo = _fmp_get("all-shares-float", {"symbol": sym})
+        out["_debug"]["shares_float_sc"] = sc_flo
         if isinstance(flo, list):
             for it in flo:
                 n = it.get("outstandingShares") or it.get("sharesOutstanding")
@@ -294,21 +310,73 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
                     except:
                         pass
 
-    rttm, _ = _fmp_get("ratios-ttm", {"symbol": sym})
-    if isinstance(rttm, list) and rttm and rttm[0].get("priceToSalesTTM") is not None:
-        try: out["P/S"] = float(rttm[0]["priceToSalesTTM"])
-        except: pass
+    # P/S TTM via ratios-ttm
+    rttm, sc_rttm = _fmp_get("ratios-ttm", {"symbol": sym})
+    out["_debug"]["ratios_ttm_sc"] = sc_rttm
+    ps_from_ratios = None
+    if isinstance(rttm, list) and rttm:
+        try:
+            v = rttm[0].get("priceToSalesTTM")
+            if v is None: v = rttm[0].get("priceToSalesRatioTTM")
+            if v is not None:
+                ps_from_ratios = float(v)
+        except Exception:
+            pass
+    if ps_from_ratios and ps_from_ratios > 0:
+        out["P/S"] = ps_from_ratios
+        out["_debug"]["ps_source"] = "ratios-ttm"
 
-    rq, _ = _fmp_get(f"api/v3/ratios/{sym}", {"period": "quarter", "limit": 4}, stable=False)
+    # key-metrics-ttm
+    if "P/S" not in out:
+        kttm, sc_kttm = _fmp_get(f"api/v3/key-metrics-ttm/{sym}", stable=False)
+        out["_debug"]["key_metrics_ttm_sc"] = sc_kttm
+        if isinstance(kttm, list) and kttm:
+            try:
+                v = kttm[0].get("priceToSalesRatioTTM")
+                if v is None: v = kttm[0].get("priceToSalesTTM")
+                if v and float(v) > 0:
+                    out["P/S"] = float(v)
+                    out["_debug"]["ps_source"] = "key-metrics-ttm"
+            except Exception:
+                pass
+
+    # Beräkna P/S = MarketCap / RevenueTTM
+    if "P/S" not in out and market_cap > 0:
+        isttm, sc_isttm = _fmp_get(f"api/v3/income-statement-ttm/{sym}", stable=False)
+        out["_debug"]["income_ttm_sc"] = sc_isttm
+        revenue_ttm = 0.0
+        if isinstance(isttm, list) and isttm:
+            cand = isttm[0]
+            for k in ("revenueTTM", "revenue"):
+                if cand.get(k) is not None:
+                    try:
+                        revenue_ttm = float(cand[k]); break
+                    except Exception:
+                        pass
+        if revenue_ttm > 0:
+            try:
+                ps_calc = market_cap / revenue_ttm
+                if ps_calc > 0:
+                    out["P/S"] = float(ps_calc)
+                    out["_debug"]["ps_source"] = "calc(marketCap/revenueTTM)"
+            except Exception:
+                pass
+
+    # P/S Q1–Q4 (kvartalsratios)
+    rq, sc_rq = _fmp_get(f"api/v3/ratios/{sym}", {"period": "quarter", "limit": 4}, stable=False)
+    out["_debug"]["ratios_quarter_sc"] = sc_rq
     if isinstance(rq, list) and rq:
         for i, row in enumerate(rq[:4], start=1):
             ps = row.get("priceToSalesRatio")
             if ps is not None:
-                try: out[f"P/S Q{i}"] = float(ps)
-                except: pass
+                try:
+                    out[f"P/S Q{i}"] = float(ps)
+                except:
+                    pass
 
-    # Estimat (kan kräva betald plan)
+    # Estimat (kan kräva betalplan)
     est, est_sc = _fmp_get("analyst-estimates", {"symbol": sym, "period": "annual", "limit": 2})
+    out["_debug"]["analyst_estimates_sc"] = est_sc
     def _pick_rev(obj: dict) -> float:
         for k in ("revenueAvg", "revenueMean", "revenue", "revenueEstimateAvg"):
             v = obj.get(k)
@@ -319,11 +387,11 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
     if isinstance(est, list) and est:
         cur = est[0] if len(est) >= 1 else {}
         nxt = est[1] if len(est) >= 2 else {}
-        r_cur = _pick_rev(cur)
-        r_nxt = _pick_rev(nxt)
+        r_cur = _pick_rev(cur); r_nxt = _pick_rev(nxt)
         if r_cur > 0: out["Omsättning idag"] = r_cur / 1e6
         if r_nxt > 0: out["Omsättning nästa år"] = r_nxt / 1e6
     out["_est_status"] = est_sc
+
     return out
 
 # --- FX via FMP + fallback (ECB / exchangerate.host) ---
@@ -1335,16 +1403,29 @@ def main():
             if provider != "FMP":
                 st.info("FMP:s valutadata kan kräva högre plan. Automatisk fallback användes.")
 
-    col_rates1, col_rates2 = st.sidebar.columns(2)
-    with col_rates1:
-        if st.button("💾 Spara valutakurser"):
-            spara_valutakurser(user_rates)
-            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
-            st.sidebar.success("Valutakurser sparade.")
-    with col_rates2:
-        if st.button("↻ Läs sparade kurser"):
-            st.cache_data.clear()
-            st.rerun()
+    # 🧪 FMP-hälsokoll
+    with st.sidebar.expander("🧪 FMP-hälsokoll", expanded=False):
+        test_tkr = st.text_input("Testa FMP för ticker (Yahoo-format):", key="fmp_test_ticker")
+        if st.button("Kör test", disabled=not bool(st.session_state.get("fmp_test_ticker"))):
+            d = hamta_fmp_falt(st.session_state["fmp_test_ticker"].strip())
+            st.write({
+                "symbol": d.get("_symbol"),
+                "Bolagsnamn": d.get("Bolagsnamn"),
+                "Valuta": d.get("Valuta"),
+                "Aktuell kurs": d.get("Aktuell kurs"),
+                "Utestående aktier (M)": d.get("Utestående aktier"),
+                "P/S": d.get("P/S"),
+                "ps_source": d.get("_debug", {}).get("ps_source"),
+                "est_http": d.get("_est_status"),
+                "http_statusar": {
+                    k: d.get("_debug", {}).get(k) for k in [
+                        "profile_sc","quote_sc","shares_float_sc",
+                        "ratios_ttm_sc","key_metrics_ttm_sc","income_ttm_sc","ratios_quarter_sc",
+                        "analyst_estimates_sc"
+                    ]
+                }
+            })
+            st.caption("Om P/S saknas men du har marketCap + revenueTTM (income-statement-ttm), beräknas P/S automatiskt.")
 
     st.sidebar.markdown("---")
     if st.sidebar.button("↻ Läs om data från Google Sheets"):

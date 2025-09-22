@@ -443,7 +443,7 @@ def hamta_fmp_falt(yahoo_ticker: str) -> dict:
             except Exception:
                 pass
 
-    # P/S Q1–Q4
+    # P/S Q1–Q4 (enl. FMP ratios, om tillgängligt – annars räknas via SEC/Yahoo i vår SEC-funktion)
     rq, sc_rq = _fmp_get(f"api/v3/ratios/{sym}", {"period": "quarter", "limit": 4}, stable=False)
     out["_debug"]["ratios_quarter_sc"] = sc_rq
     if isinstance(rq, list) and rq:
@@ -585,12 +585,11 @@ def _sec_latest_shares(facts: dict) -> float:
                     pass
     return 0.0
 
-# --- PATCH: korrekt kvartalsfiltrering för SEC-intäkter ----------------------
-from datetime import datetime as _dt  # används i _parse_iso
+# --- PATCH: historisk TTM-P/S per kvartal -----------------------------------
+from datetime import datetime as _dt, timedelta as _td  # för datumtolkning och prisfönster
 
 def _parse_iso(d: str):
     try:
-        # SEC kan vara 'YYYY-MM-DD' eller ISO8601 med Z
         return _dt.fromisoformat(d.replace("Z", "+00:00")).date()
     except Exception:
         try:
@@ -598,10 +597,10 @@ def _parse_iso(d: str):
         except Exception:
             return None
 
-def _sec_quarterly_revenues(facts: dict) -> list[float]:
+def _sec_quarterly_revenues_dated(facts: dict, max_quarters: int = 20) -> list[tuple]:
     """
-    Returnerar de 4 senaste *kvartalsvisa* intäkterna (3-mån), filtrerat på 10-Q
-    och varaktighet ~70–100 dagar för att utesluta 6/9/12-mån YTD.
+    Hämtar upp till max_quarters *kvartalsvisa* (3-mån) intäkter från SEC (10-Q),
+    filtrerar på duration ~70–100 dagar. Returnerar lista [(end_date, value)] sorterad nyast→äldst.
     """
     gaap = (facts.get("facts") or {}).get("us-gaap", {})
     cand_names = [
@@ -616,16 +615,16 @@ def _sec_quarterly_revenues(facts: dict) -> list[float]:
         if not fact:
             continue
         units = (fact.get("units") or {}).get("USD", [])
+        tmp = []
         for it in units:
             form = (it.get("form") or "").upper()
-            if "10-Q" not in form:  # endast kvartalsrapporter
+            if "10-Q" not in form:
                 continue
             end = _parse_iso(str(it.get("end", "")))
             start = _parse_iso(str(it.get("start", "")))
             val = it.get("val", None)
             if not (end and start and val is not None):
                 continue
-            # Duration ≈ kvartal (70–100 dagar)
             try:
                 dur = (end - start).days
             except Exception:
@@ -634,27 +633,77 @@ def _sec_quarterly_revenues(facts: dict) -> list[float]:
                 continue
             try:
                 v = float(val)
-                rows.append((end, v))  # dedupe per 'end' senare
+                tmp.append((end, v))
             except Exception:
                 pass
-        if rows:
-            break  # ta första GAAP-nyckeln som gav giltiga datapunkter
+        if tmp:
+            # dedupe per end-datum, behåll senaste
+            ded = {}
+            for end, v in tmp:
+                ded[end] = v
+            rows = sorted(ded.items(), key=lambda t: t[0], reverse=True)
+            break  # använd första GAAP-nyckeln som gav träff
+    return rows[:max_quarters]
 
-    if not rows:
-        return []
+def _sec_quarterly_revenues(facts: dict) -> list[float]:
+    """Bakåtkompatibel wrapper: returnerar bara värden (4 senaste)."""
+    rows = _sec_quarterly_revenues_dated(facts, max_quarters=4)
+    return [v for (_, v) in rows]
 
-    # Deduplicera per slutdatum och ta senaste fyra
-    dedup = {}
-    for end, v in rows:
-        if end not in dedup:
-            dedup[end] = v
-    items = sorted(dedup.items(), key=lambda t: t[0], reverse=True)[:4]
-    return [float(v) for (_, v) in items]
+def _yahoo_prices_for_dates(ticker: str, dates: list) -> dict:
+    """
+    Hämtar dagliga priser i ett fönster som täcker alla 'dates' och returnerar
+    'Close' på eller närmast FÖRE respektive datum.
+    """
+    if not dates:
+        return {}
+    dmin = min(dates) - _td(days=14)
+    dmax = max(dates) + _td(days=2)
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(start=dmin, end=dmax, interval="1d")
+        if hist is None or hist.empty:
+            return {}
+        hist = hist.sort_index()
+        out = {}
+        idx = list(hist.index.date)
+        closes = list(hist["Close"].values)
+        for d in dates:
+            price = None
+            for j in range(len(idx)-1, -1, -1):
+                if idx[j] <= d:
+                    try:
+                        price = float(closes[j])
+                    except Exception:
+                        price = None
+                    break
+            if price is not None:
+                out[d] = price
+        return out
+    except Exception:
+        return {}
+
+def _ttm_windows(values: list[tuple], need: int = 4) -> list[tuple]:
+    """
+    Tar [(end_date, kvartalsintäkt), ...] (nyast→äldst) och bygger upp till 'need' TTM-summor:
+    [(end_date0, ttm0), (end_date1, ttm1), ...] där ttm0 = sum(q0..q3), ttm1 = sum(q1..q4), osv.
+    """
+    out = []
+    if len(values) < 4:
+        return out
+    for i in range(0, min(need, len(values) - 3)):
+        end_i = values[i][0]
+        ttm_i = sum(v for (_, v) in values[i:i+4])
+        out.append((end_i, float(ttm_i)))
+    return out
 
 def hamta_sec_yahoo_combo(ticker: str) -> dict:
     """
     US-bolag: Shares + kvartalsintäkter från SEC; pris/valuta/namn från Yahoo.
-    Beräknar: Utestående aktier (M), P/S (TTM), P/S Q1–Q4.
+    Beräknar:
+      - Utestående aktier (M)
+      - P/S (TTM) med *aktuellt* pris/MCAP
+      - P/S Q1–Q4 som *historisk TTM-P/S* vid respektive kvartals slut (pris nära datumet × shares).
     """
     out = {}
     cik = _sec_cik_for(ticker)
@@ -665,12 +714,12 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
     if sc != 200 or not isinstance(facts, dict):
         return out
 
-    # Yahoo-basics
+    # Yahoo-basics (namn/valuta/aktuellt pris)
     y = hamta_yahoo_fält(ticker)
     for k in ("Bolagsnamn", "Valuta", "Aktuell kurs"):
         if y.get(k): out[k] = y[k]
 
-    # SEC shares → fallback till Yahoo om saknas
+    # Shares: SEC point-in-time → fallback Yahoo
     shares = _sec_latest_shares(facts)
     if shares <= 0:
         try:
@@ -682,25 +731,40 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
     if shares > 0:
         out["Utestående aktier"] = shares / 1e6
 
-    # Market cap från Yahoo (helst), annars price*shares
-    mcap = _yfi_get(yf.Ticker(ticker), "market_cap", "marketCap")
+    # Market cap (nu) från Yahoo (helst), annars pris*shares
+    mcap_now = _yfi_get(yf.Ticker(ticker), "market_cap", "marketCap")
     try:
-        mcap = float(mcap or 0.0)
+        mcap_now = float(mcap_now or 0.0)
     except Exception:
-        mcap = 0.0
-    if mcap <= 0 and out.get("Aktuell kurs", 0) > 0 and shares > 0:
-        mcap = float(out["Aktuell kurs"]) * shares
+        mcap_now = 0.0
+    if mcap_now <= 0 and out.get("Aktuell kurs", 0) > 0 and shares > 0:
+        mcap_now = float(out["Aktuell kurs"]) * shares
 
-    # Kvartalsintäkter från SEC → P/S TTM + per kvartal
-    q_revs = _sec_quarterly_revenues(facts)
-    ltm = sum(q_revs) if q_revs else 0.0
+    # SEC kvartalsintäkter (daterade) → TTM-lista
+    q_rows = _sec_quarterly_revenues_dated(facts, max_quarters=20)  # många för att kunna bygga 4 TTM-fönster
+    if q_rows:
+        ttm_list = _ttm_windows(q_rows, need=4)  # [(end_date, ttm_revenue), ...] nyast→
+    else:
+        ttm_list = []
 
-    if mcap > 0 and ltm > 0:
-        out["P/S"] = mcap / ltm
-    if mcap > 0 and q_revs:
-        for i, rv in enumerate(q_revs[:4], start=1):
-            if rv > 0:
-                out[f"P/S Q{i}"] = mcap / rv
+    # P/S (TTM) nu
+    if mcap_now > 0 and ttm_list:
+        ltm_now = ttm_list[0][1]  # senaste TTM
+        if ltm_now > 0:
+            out["P/S"] = mcap_now / ltm_now
+
+    # P/S Q1–Q4 = historisk TTM-P/S vid respektive kvartals slut
+    # Hämta historiska priser nära varje TTM-end
+    if shares > 0 and ttm_list:
+        q_dates = [d for (d, _) in ttm_list]  # upp till 4
+        px_map = _yahoo_prices_for_dates(ticker, q_dates)
+        for idx, (d_end, ttm_rev) in enumerate(ttm_list[:4], start=1):
+            if ttm_rev and ttm_rev > 0:
+                px = px_map.get(d_end, None)
+                if px and px > 0:
+                    mcap_hist = shares * float(px)  # approx: antar samma shares (närmast kända)
+                    ps_hist = mcap_hist / ttm_rev
+                    out[f"P/S Q{idx}"] = float(ps_hist)
 
     return out
 

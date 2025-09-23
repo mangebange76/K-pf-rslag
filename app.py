@@ -1103,7 +1103,8 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
         return hamta_yahoo_global_combo(ticker)
 
     facts, sc = _sec_companyfacts(cik)
-    if sc != 200 eller not isinstance(facts, dict):
+    if sc != 200 or not isinstance(facts, dict):
+    return hamta_yahoo_global_combo(ticker)
         return hamta_yahoo_global_combo(ticker)
 
     # Yahoo-basics

@@ -1359,6 +1359,94 @@ def auto_update_all(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = Fa
 
     return df, log
 
+# --- NYTT: snabba uppdaterare för kurs och enskilt bolag ---------------------
+
+def update_single_ticker_price(df: pd.DataFrame, ticker: str, make_snapshot: bool = False):
+    """Uppdatera endast Aktuell kurs (och ev. Valuta) för ett specifikt bolag via Yahoo."""
+    tkr = (ticker or "").strip().upper()
+    if not tkr or tkr not in set(df["Ticker"].astype(str).str.upper()):
+        return df, False
+
+    ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
+    data = hamta_yahoo_fält(tkr)
+    px = float(data.get("Aktuell kurs") or 0.0)
+    ccy = data.get("Valuta")
+
+    if px > 0:
+        df.at[ridx, "Aktuell kurs"] = px
+        if ccy:
+            df.at[ridx, "Valuta"] = str(ccy).upper()
+        _note_auto_update(df, ridx, source="Yahoo (pris)")
+        spara_data(df, do_snapshot=make_snapshot)
+        return df, True
+    return df, False
+
+def update_single_ticker_full(df: pd.DataFrame, user_rates: dict, ticker: str, make_snapshot: bool = False):
+    """Full auto för ett bolag: SEC/Yahoo → Yahoo → Finnhub → FMP + omräkningar."""
+    tkr = (ticker or "").strip().upper()
+    if not tkr or tkr not in set(df["Ticker"].astype(str).str.upper()):
+        return df, False, {}
+
+    ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
+    changes_map = {}
+    debug_all = {}
+
+    try:
+        new_vals, debug = auto_fetch_for_ticker(tkr)
+        debug_all = debug
+        changed = apply_auto_updates_to_row(
+            df, ridx, new_vals,
+            source="Auto (SEC/Yahoo→Yahoo→Finnhub→FMP)",
+            changes_map=changes_map
+        )
+        # räkna om riktkurser m.m.
+        df = uppdatera_berakningar(df, user_rates)
+        if changed:
+            spara_data(df, do_snapshot=make_snapshot)
+        return df, changed, debug_all
+    except Exception as e:
+        debug_all = {"error": str(e)}
+        return df, False, debug_all
+
+def update_prices_all(df: pd.DataFrame, make_snapshot: bool = False):
+    """
+    Snabb global prisuppdatering: hämtar ENDAST 'Aktuell kurs' (och ev. Valuta) via Yahoo per ticker.
+    """
+    tickers = [str(t).strip().upper() for t in df["Ticker"].astype(str) if str(t).strip()]
+    if not tickers:
+        return df, 0
+
+    progress = st.sidebar.progress(0)
+    status = st.sidebar.empty()
+    updated = 0
+
+    for i, tkr in enumerate(tickers):
+        try:
+            ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
+        except IndexError:
+            progress.progress((i+1)/max(1, len(tickers)))
+            continue
+
+        status.write(f"Uppdaterar kurs {i+1}/{len(tickers)}: {tkr}")
+        data = hamta_yahoo_fält(tkr)
+        px = float(data.get("Aktuell kurs") or 0.0)
+        ccy = data.get("Valuta")
+
+        if px > 0:
+            df.at[ridx, "Aktuell kurs"] = px
+            if ccy:
+                df.at[ridx, "Valuta"] = str(ccy).upper()
+            _note_auto_update(df, ridx, source="Yahoo (pris)")
+            updated += 1
+
+        progress.progress((i+1)/max(1, len(tickers)))
+
+    if updated > 0:
+        spara_data(df, do_snapshot=make_snapshot)
+    return df, updated
+
+# --- Felsökning enkelvy ------------------------------------------------------
+
 def debug_test_single_ticker(ticker: str):
     """Visar vad källorna levererar för en ticker, för felsökning."""
     st.markdown(f"### Testa datakällor för: **{ticker}**")
@@ -1719,6 +1807,35 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         spara_data(df)
         st.success("Sparat.")
 
+    # --- Snabbuppdatering för valt bolag: Kurs eller Full auto ---
+    # (använd valt 'ticker' i formuläret ovan om det finns)
+    if 'ticker' in locals() and ticker:
+        c_up1, c_up2 = st.columns(2)
+        with c_up1:
+            if st.button("📈 Uppdatera endast kurs (detta bolag)", key="btn_upd_px_one"):
+                df, ok = update_single_ticker_price(df, ticker, make_snapshot=False)
+                if ok:
+                    st.success(f"Kurs uppdaterad för {ticker}.")
+                    st.rerun()
+                else:
+                    st.info("Ingen kursändring kunde göras.")
+        with c_up2:
+            if st.button("🔁 Full auto-uppdatering (detta bolag)", key="btn_upd_full_one"):
+                df, changed, debug_one = update_single_ticker_full(df, user_rates, ticker, make_snapshot=False)
+                if changed:
+                    st.success(f"Full auto-uppdatering klar för {ticker}.")
+                    # --- AUTO-HOPPA TILL NÄSTA POST I LISTAN ---
+                    try:
+                        next_idx = min(st.session_state.edit_index + 1, len(val_lista) - 1)
+                        st.session_state.edit_index = next_idx
+                    except Exception:
+                        pass
+                else:
+                    st.info("Inga ändringar för detta bolag.")
+                with st.expander("Visa debug"):
+                    st.json(debug_one)
+                st.rerun()
+
     # --- Äldst uppdaterade (alla spårade fält) ---
     st.markdown("### ⏱️ Äldst uppdaterade (alla spårade fält, topp 10)")
     work = add_oldest_ts_col(df.copy())
@@ -1790,9 +1907,18 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("🛠️ Auto-uppdatering")
     make_snapshot = st.sidebar.checkbox("Skapa snapshot före skrivning", value=True)
+
     if st.sidebar.button("🔄 Auto-uppdatera alla (SEC/Yahoo → Yahoo → Finnhub → FMP)"):
         df, log = auto_update_all(df, user_rates, make_snapshot=make_snapshot)
         st.session_state["last_auto_log"] = log
+
+    # NY: snabb-knapp för ENBART kurs för alla tickers
+    if st.sidebar.button("📈 Enbart kurs (alla bolag)"):
+        df, n = update_prices_all(df, make_snapshot=make_snapshot)
+        if n > 0:
+            st.sidebar.success(f"Uppdaterade kurs för {n} bolag.")
+        else:
+            st.sidebar.info("Inga kurser uppdaterades.")
 
     meny = st.sidebar.radio("📌 Välj vy", ["Kontroll","Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"])
 

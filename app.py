@@ -10,6 +10,7 @@ import requests
 import time
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
+from typing import Optional
 
 # --- Lokal Stockholm-tid om pytz finns (annars systemtid) ---
 try:
@@ -237,7 +238,7 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
             if any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs","aktier","snitt"]):
                 df[kol] = 0.0
             elif kol.startswith("TS_"):
-                df[kol] = ""  # tidsstämplar i str (YYYY-MM-DD)
+                df[kol] = ""  # tidsstämplar
             elif kol in ("Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa"):
                 df[kol] = ""
             else:
@@ -283,7 +284,7 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
 
 # --- Tidsstämpelshjälpare ----------------------------------------------------
 
-def _stamp_ts_for_field(df: pd.DataFrame, row_idx: int, field: str, when: str | None = None):
+def _stamp_ts_for_field(df: pd.DataFrame, row_idx: int, field: str, when: Optional[str] = None):
     """Sätter TS-kolumnen för ett spårat fält om den finns."""
     ts_col = TS_FIELDS.get(field)
     if not ts_col:
@@ -312,7 +313,8 @@ def _note_manual_update(df: pd.DataFrame, row_idx: int):
 # Fält som triggar "Senast manuellt uppdaterad" i formuläret
 MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
 
-# --- Yahoo-hjälpare ----------------------------------------------------------
+# app.py — Del 3/7
+# --- Yahoo-hjälpare & beräkningar & merge-hjälpare ---------------------------
 
 def _yfi_get(tkr: yf.Ticker, *keys):
     """Säker hämtning ur yfinance.info med fallback på hist."""
@@ -394,8 +396,6 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         pass
     return out
 
-# --- Beräkningar -------------------------------------------------------------
-
 def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     """
     Beräknar:
@@ -435,8 +435,6 @@ def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
             df.at[i, "Riktkurs idag"] = df.at[i, "Riktkurs om 1 år"] = df.at[i, "Riktkurs om 2 år"] = df.at[i, "Riktkurs om 3 år"] = 0.0
     return df
 
-# --- Merge-hjälpare för auto-körningar --------------------------------------
-
 def apply_auto_updates_to_row(df: pd.DataFrame, row_idx: int, new_vals: dict, source: str, changes_map: dict) -> bool:
     """
     Skriver endast fält som får ett nytt (positivt/meningsfullt) värde.
@@ -467,7 +465,7 @@ def apply_auto_updates_to_row(df: pd.DataFrame, row_idx: int, new_vals: dict, so
         return True
     return False
 
-# app.py — Del 3/7
+# app.py — Del 4/7
 # --- Datakällor: FMP, SEC (US + IFRS/6-K), Yahoo global fallback, Finnhub ----
 
 # =============== FMP =========================================================
@@ -578,7 +576,7 @@ def hamta_fmp_falt_light(yahoo_ticker: str) -> dict:
 @st.cache_data(show_spinner=False, ttl=1800)
 def hamta_fmp_falt(yahoo_ticker: str) -> dict:
     """
-    Fullare variant: försök hämta namn/valuta/pris/shares, P/S (TTM, key-metrics, beräkning),
+    Fullare variant: försöker hämta namn/valuta/pris/shares, P/S (TTM, key-metrics, beräkning),
     P/S Q1–Q4 (ratios quarterly) samt analytikerestimat (om plan tillåter).
     """
     out = {"_debug": {}}
@@ -738,7 +736,7 @@ def _sec_ticker_map():
             pass
     return out
 
-def _sec_cik_for(ticker: str) -> str | None:
+def _sec_cik_for(ticker: str) -> Optional[str]:
     return _sec_ticker_map().get(str(ticker).upper())
 
 def _sec_companyfacts(cik10: str):
@@ -838,13 +836,13 @@ def _fx_rate_cached(base: str, quote: str) -> float:
     try:
         r = requests.get("https://api.frankfurter.app/latest", params={"from": base, "to": quote}, timeout=12)
         if r.status_code == 200:
-            return float((r.json() or {}).get("rates", {}).get(quote, 0.0) or 0.0) or 0.0
+            return float((r.json() or {}).get("rates", {}).get(quote, 0.0) or 0.0)
     except Exception:
         pass
     try:
         r = requests.get("https://api.exchangerate.host/latest", params={"base": base, "symbols": quote}, timeout=12)
         if r.status_code == 200:
-            return float((r.json() or {}).get("rates", {}).get(quote, 0.0) or 0.0) or 0.0
+            return float((r.json() or {}).get("rates", {}).get(quote, 0.0) or 0.0)
     except Exception:
         pass
     return 0.0
@@ -910,11 +908,11 @@ def _sec_quarterly_revenues_dated_with_unit(facts: dict, max_quarters: int = 20)
                     return rows, unit_code
     return [], None
 
-def _sec_quarterly_revenues_dated(facts: dict, max_quarters: int = 20) -> list[tuple]:
+def _sec_quarterly_revenues_dated(facts: dict, max_quarters: int = 20):
     rows, _ = _sec_quarterly_revenues_dated_with_unit(facts, max_quarters=max_quarters)
     return rows
 
-def _sec_quarterly_revenues(facts: dict) -> list[float]:
+def _sec_quarterly_revenues(facts: dict):
     rows = _sec_quarterly_revenues_dated(facts, max_quarters=4)
     return [v for (_, v) in rows]
 
@@ -950,7 +948,7 @@ def _yahoo_prices_for_dates(ticker: str, dates: list) -> dict:
     except Exception:
         return {}
 
-def _ttm_windows(values: list[tuple], need: int = 4) -> list[tuple]:
+def _ttm_windows(values: list, need: int = 4) -> list:
     """
     Tar [(end_date, kvartalsintäkt), ...] (nyast→äldst) och bygger upp till 'need' TTM-summor:
     [(end_date0, ttm0), (end_date1, ttm1), ...] där ttm0 = sum(q0..q3), ttm1 = sum(q1..q4), osv.
@@ -978,14 +976,14 @@ def _implied_shares_from_yahoo(ticker: str, price: float = None, mcap: float = N
         return mcap / price
     return 0.0
 
-# ---------- Yahoo quarterly revenues (global) --------------------------------
+# ---------- Global Yahoo fallback (icke-SEC: .TO/.V/.CN + EU/Norden) ---------
 def _yfi_info_dict(t: yf.Ticker) -> dict:
     try:
         return t.info or {}
     except Exception:
         return {}
 
-def _yfi_quarterly_revenues(t: yf.Ticker) -> list[tuple]:
+def _yfi_quarterly_revenues(t: yf.Ticker) -> list:
     """
     Försöker läsa kvartalsintäkter från Yahoo.
     Returnerar [(period_end_date, value), ...] sorterat nyast→äldst.
@@ -1031,36 +1029,30 @@ def _yfi_quarterly_revenues(t: yf.Ticker) -> list[tuple]:
     except Exception:
         pass
 
-    return []  # inget hittat
+    return []
 
-# ---------- SEC + Yahoo kombo (implied shares förstahandsval) ----------------
 def hamta_sec_yahoo_combo(ticker: str) -> dict:
     """
-    US/FPIs (inkl. Kanada listat i USA): Shares + kvartalsintäkter från SEC (US-GAAP 10-Q eller IFRS 6-K),
-    pris/valuta/namn från Yahoo. Beräknar:
-      - Utestående aktier (M) — implied (market cap / price) som förstahandsval; SEC instant robust som fallback
-      - P/S (TTM) nu (MCAP_now / TTM_rev_senaste)
-      - P/S Q1–Q4 = historisk TTM-P/S vid respektive kvartals slut (pris nära datum × shares).
-    Om CIK saknas (ej SEC-listad, t.ex. .TO/.V/.CN), faller vi tillbaka till hamta_yahoo_global_combo.
+    US/FPIs: Shares + kvartalsintäkter från SEC (US-GAAP 10-Q eller IFRS 6-K),
+    pris/valuta/namn från Yahoo. P/S (TTM) nu + P/S Q1–Q4 historik.
+    Om CIK saknas → hamta_yahoo_global_combo.
     """
     out = {}
     cik = _sec_cik_for(ticker)
     if not cik:
-        # Fallback för icke-SEC (t.ex. .TO/.V/.CN + Norden/Tyskland m.fl.)
         return hamta_yahoo_global_combo(ticker)
 
     facts, sc = _sec_companyfacts(cik)
     if sc != 200 or not isinstance(facts, dict):
-        # kunde inte läsa SEC → Yahoo global
         return hamta_yahoo_global_combo(ticker)
 
-    # Yahoo-basics (namn/valuta/aktuellt pris)
+    # Yahoo-basics
     y = hamta_yahoo_fält(ticker)
     for k in ("Bolagsnamn", "Valuta", "Aktuell kurs"):
         if y.get(k): out[k] = y[k]
     px_ccy = (out.get("Valuta") or "USD").upper()
 
-    # Shares: implied (mcap/price) → fallback SEC robust
+    # Shares: implied → fallback SEC robust
     implied = _implied_shares_from_yahoo(ticker, price=out.get("Aktuell kurs"), mcap=None)
     sec_shares = _sec_latest_shares_robust(facts)
     shares_used = 0.0
@@ -1074,18 +1066,18 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
         out["_debug_shares_source"] = "unknown"
 
     if shares_used > 0:
-        out["Utestående aktier"] = shares_used / 1e6  # i miljoner
+        out["Utestående aktier"] = shares_used / 1e6
 
-    # Market cap (nu) från Yahoo (helst), annars pris*shares
+    # Market cap (nu)
     mcap_now = _yfi_get(yf.Ticker(ticker), "market_cap", "marketCap")
     try:
         mcap_now = float(mcap_now or 0.0)
     except Exception:
         mcap_now = 0.0
     if mcap_now <= 0 and out.get("Aktuell kurs", 0) > 0 and shares_used > 0:
-        mcap_now = float(out["Aktuell kurs"]) * shares_used  # i px_ccy
+        mcap_now = float(out["Aktuell kurs"]) * shares_used
 
-    # SEC kvartalsintäkter + unit → bygg TTM och konvertera till px_ccy
+    # SEC kvartalsintäkter + unit → TTM & konvertering
     q_rows, rev_unit = _sec_quarterly_revenues_dated_with_unit(facts, max_quarters=20)
     if not q_rows or not rev_unit:
         return out
@@ -1101,7 +1093,7 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
         if ltm_now > 0:
             out["P/S"] = mcap_now / ltm_now
 
-    # P/S Q1–Q4 = historisk TTM-P/S vid respektive kvartals slut
+    # P/S Q1–Q4 historik
     if shares_used > 0 and ttm_list_px:
         q_dates = [d for (d, _) in ttm_list_px]
         px_map = _yahoo_prices_for_dates(ticker, q_dates)
@@ -1109,20 +1101,15 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
             if ttm_rev_px and ttm_rev_px > 0:
                 px = px_map.get(d_end, None)
                 if px and px > 0:
-                    mcap_hist = shares_used * float(px)  # i px_ccy
+                    mcap_hist = shares_used * float(px)
                     out[f"P/S Q{idx}"] = float(mcap_hist / ttm_rev_px)
 
     return out
 
-# ---------- Global Yahoo fallback (icke-SEC: .TO/.V/.CN + EU/Norden) ---------
 def hamta_yahoo_global_combo(ticker: str) -> dict:
     """
-    Global fallback för tickers utan SEC.
-    Räknar:
-      - Utestående aktier (implied = market cap / price; fallback sharesOutstanding)
-      - P/S (TTM) nu
-      - P/S Q1–Q4 = historisk TTM-P/S per kvartalsslut
-    med valutakonvertering från 'financialCurrency' → prisets valuta om nödvändigt.
+    Global fallback för tickers utan SEC (.TO/.V/.CN + EU/Norden m.fl.).
+    Räknar implied shares, P/S (TTM) nu, samt P/S Q1–Q4 historik.
     """
     out = {}
     t = yf.Ticker(ticker)
@@ -1141,13 +1128,12 @@ def hamta_yahoo_global_combo(ticker: str) -> dict:
     except Exception:
         mcap = 0.0
 
-    # Implied shares (förstahandsval)
+    # Implied shares → fallback sharesOutstanding
     shares = 0.0
     if mcap > 0 and px > 0:
         shares = mcap / px
         out["_debug_shares_source"] = "Yahoo implied (mcap/price)"
     else:
-        # fallback: sharesOutstanding om finns
         so = info.get("sharesOutstanding")
         try:
             so = float(so or 0.0)
@@ -1161,10 +1147,10 @@ def hamta_yahoo_global_combo(ticker: str) -> dict:
         out["Utestående aktier"] = shares / 1e6
 
     # Kvartalsintäkter → TTM
-    q_rows = _yfi_quarterly_revenues(t)  # [(date, value)]
+    q_rows = _yfi_quarterly_revenues(t)
     if not q_rows or len(q_rows) < 4:
-        return out  # inget mer vi kan göra
-    ttm_list = _ttm_windows(q_rows, need=4)  # [(end, ttm_rev)]
+        return out
+    ttm_list = _ttm_windows(q_rows, need=4)
 
     # Valutakonvertering om financialCurrency != prisvaluta
     fin_ccy = str(info.get("financialCurrency") or px_ccy).upper()
@@ -1183,7 +1169,7 @@ def hamta_yahoo_global_combo(ticker: str) -> dict:
         if ltm_now > 0:
             out["P/S"] = mcap / ltm_now
 
-    # P/S Q1–Q4 (historisk TTM-P/S)
+    # P/S Q1–Q4 (historisk)
     if shares > 0 and ttm_list_px:
         q_dates = [d for (d, _) in ttm_list_px]
         px_map = _yahoo_prices_for_dates(ticker, q_dates)
@@ -1200,8 +1186,8 @@ FINNHUB_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 
 def hamta_finnhub_revenue_estimates(ticker: str) -> dict:
     """
-    Kräver FINNHUB_API_KEY i secrets.
-    Hämtar annual revenue estimates: current FY + next FY (om finns).
+    Kräver FINNHUB_API_KEY i secrets. Hämtar annual revenue estimates:
+    current FY + next FY (om finns).
     """
     if not FINNHUB_KEY:
         return {}
@@ -1238,8 +1224,8 @@ def hamta_finnhub_revenue_estimates(ticker: str) -> dict:
     except Exception:
         return {}
 
-# app.py — Del 4/7
-# --- Snapshots, auto-uppdatering och hjälpare --------------------------------
+# app.py — Del 5/7
+# --- Snapshots, auto-uppdatering, test & kontrollvy -------------------------
 
 def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME):
     """
@@ -1257,12 +1243,10 @@ def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME):
     except Exception as e:
         st.warning(f"Misslyckades skapa snapshot-flik: {e}")
 
-# --- TS & sorteringshjälpare -------------------------------------------------
-
-def oldest_any_ts(row: pd.Series) -> pd.Timestamp | pd.NaT:
+def oldest_any_ts(row: pd.Series) -> Optional[pd.Timestamp]:
     """
     Returnerar äldsta (minsta) tidsstämpeln bland alla TS_-kolumner för en rad.
-    NaT om inga tidsstämplar.
+    None om inga tidsstämplar.
     """
     dates = []
     for c in TS_FIELDS.values():
@@ -1273,24 +1257,21 @@ def oldest_any_ts(row: pd.Series) -> pd.Timestamp | pd.NaT:
                     dates.append(d)
             except Exception:
                 pass
-    if not dates:
-        return pd.NaT
-    return min(dates)
+    return min(dates) if dates else None
 
 def add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
     df["_oldest_any_ts"] = df.apply(oldest_any_ts, axis=1)
+    df["_oldest_any_ts"] = pd.to_datetime(df["_oldest_any_ts"], errors="coerce")
     df["_oldest_any_ts_fill"] = df["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
     return df
 
-# --- Auto-källa: SEC/Yahoo + global Yahoo-fallback (+ Finnhub + FMP-light) ---
-
-def auto_fetch_for_ticker(ticker: str) -> tuple[dict, dict]:
+def auto_fetch_for_ticker(ticker: str):
     """
-    Hämtar nya värden för ett ticker via primär pipeline:
-        1) SEC + Yahoo (med implied shares) eller Yahoo global fallback
-        2) Finnhub (estimat) om saknas
-        3) FMP light (P/S) om saknas
-    Returnerar (vals, debug) där vals endast innehåller fält som hittats.
+    Pipeline:
+      1) SEC + Yahoo (implied shares) eller Yahoo global fallback
+      2) Finnhub (estimat) om saknas
+      3) FMP light (P/S) om saknas
+    Returnerar (vals, debug)
     """
     debug = {"ticker": ticker}
     vals = {}
@@ -1327,7 +1308,6 @@ def auto_fetch_for_ticker(ticker: str) -> tuple[dict, dict]:
                 v = fmpl.get(k)
                 if v not in (None, "", 0, 0.0):
                     vals[k] = v
-            # använd inte FMP-shares om vi redan har implied/SEC; bara om allt annat saknas
             if ("Utestående aktier" not in vals) and (fmpl.get("Utestående aktier") not in (None, "", 0, 0.0)):
                 vals["Utestående aktier"] = fmpl["Utestående aktier"]
     except Exception as e:
@@ -1335,13 +1315,10 @@ def auto_fetch_for_ticker(ticker: str) -> tuple[dict, dict]:
 
     return vals, debug
 
-def auto_update_all(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = False) -> tuple[pd.DataFrame, dict]:
+def auto_update_all(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = False):
     """
-    Kör auto-uppdatering för alla rader.
-    - Skriver endast fält som får *meningsfulla* nya värden (övriga lämnas orörda).
-    - Tidsstämplar TS_-kolumner för fält som ändrats, samt 'Senast auto-uppdaterad'/'källa'.
-    - Återberäknar derived kolumner och sparar df (med snapshot om begärt).
-    Returnerar (df, log) med log innehållande ändringar per ticker och missar.
+    Kör auto-uppdatering för alla rader. Skriver endast fält med meningsfulla nya värden.
+    Stämplar TS_ per fält, samt 'Senast auto-uppdaterad' + källa.
     """
     log = {"changed": {}, "misses": {}, "debug_first_20": []}
     progress = st.sidebar.progress(0)
@@ -1360,7 +1337,6 @@ def auto_update_all(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = Fa
         status.write(f"Uppdaterar {i+1}/{total}: {tkr}")
         try:
             new_vals, debug = auto_fetch_for_ticker(tkr)
-            # skriv bara meningsfulla värden
             changed = apply_auto_updates_to_row(df, idx, new_vals, source="Auto (SEC/Yahoo→Yahoo→Finnhub→FMP)", changes_map=log["changed"])
             if not changed:
                 log["misses"][tkr] = list(new_vals.keys()) if new_vals else ["(inga nya fält)"]
@@ -1375,7 +1351,6 @@ def auto_update_all(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = Fa
     # Efter loop — räkna om & spara
     df = uppdatera_berakningar(df, user_rates)
 
-    # Endast skapa snapshot och spara om något faktiskt ändrats
     if any_changed:
         spara_data(df, do_snapshot=make_snapshot)
         st.sidebar.success("Klart! Ändringar sparade.")
@@ -1384,12 +1359,8 @@ def auto_update_all(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = Fa
 
     return df, log
 
-# --- Enskild test för felsökning ---------------------------------------------
-
 def debug_test_single_ticker(ticker: str):
-    """
-    Visar vad de olika källorna levererar för en ticker, för felsökning.
-    """
+    """Visar vad källorna levererar för en ticker, för felsökning."""
     st.markdown(f"### Testa datakällor för: **{ticker}**")
     cols = st.columns(2)
 
@@ -1423,14 +1394,13 @@ def debug_test_single_ticker(ticker: str):
         except Exception as e:
             st.error(f"Finnhub fel: {e}")
 
-# --- Hjälplistor för Kontroll-vy --------------------------------------------
+# --- Hjälplistor & Kontroll-vy ----------------------------------------------
 
 def build_requires_manual_df(df: pd.DataFrame, older_than_days: int = 365) -> pd.DataFrame:
     """
-    Returnerar bolag som sannolikt kräver manuell hantering:
-    - saknar någon av kärnfälten (P/S, P/S Q1..Q4, Utestående aktier, Omsättning idag/nästa år)
-      ELLER har ingen TS för minst ett av dessa,
-    - och den äldsta TS eller manuella uppdateringen är äldre än 'older_than_days'.
+    Bolag som sannolikt kräver manuell hantering:
+    - saknar någon av kärnfälten eller TS,
+    - och äldsta TS är äldre än 'older_than_days'.
     """
     need_cols = ["Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
     ts_cols = [TS_FIELDS[c] for c in TS_FIELDS if c in need_cols]
@@ -1455,9 +1425,6 @@ def build_requires_manual_df(df: pd.DataFrame, older_than_days: int = 365) -> pd
             })
 
     return pd.DataFrame(out_rows)
-
-# app.py — Del 5/7
-# --- Kontroll-vy (översikt, äldst-lista, “kräver manuell”, loggar, test) ----
 
 def kontrollvy(df: pd.DataFrame) -> None:
     st.header("🧭 Kontroll")
@@ -1508,15 +1475,8 @@ def kontrollvy(df: pd.DataFrame) -> None:
         st.markdown("**Debug (första 20)**")
         st.json(log.get("debug_first_20", []))
 
-    st.divider()
-
-    # 4) Testa enskild ticker
-    st.subheader("🧪 Testa datakällor för en ticker")
-    tkr = st.text_input("Ticker (Yahoo-format)", value="AAPL")
-    if st.button("Kör test", type="secondary"):
-        debug_test_single_ticker(tkr)
-
-# --- Analys-vy ----------------------------------------------------------------
+# app.py — Del 6/7
+# --- Analys, Portfölj & Investeringsförslag ----------------------------------
 
 def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
     st.header("📈 Analys")
@@ -1547,14 +1507,10 @@ def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
         "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
         "CAGR 5 år (%)","Antal aktier","Årlig utdelning",
         "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa",
-        # visa TS-spår
         "TS_Utestående aktier","TS_P/S","TS_P/S Q1","TS_P/S Q2","TS_P/S Q3","TS_P/S Q4","TS_Omsättning idag","TS_Omsättning nästa år"
     ]
     cols = [c for c in cols if c in df.columns]
     st.dataframe(pd.DataFrame([r[cols].to_dict()]), use_container_width=True, hide_index=True)
-
-# app.py — Del 6/7
-# --- Portfölj & Investeringsförslag ------------------------------------------
 
 def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     st.header("📦 Min portfölj")
@@ -1643,7 +1599,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 
     st.subheader(f"{rad['Bolagsnamn']} ({rad['Ticker']})")
 
-    # Bygg markdown utan trippelcitat (för att undvika syntaxfel)
+    # Bygg markdown utan trippelcitat
     lines = [
         f"- **Aktuell kurs:** {round(rad['Aktuell kurs'],2)} {rad['Valuta']}",
         f"- **Riktkurs idag:** {round(rad['Riktkurs idag'],2)} {rad['Valuta']}" + (" **⬅ vald**" if riktkurs_val == "Riktkurs idag" else ""),
@@ -1657,7 +1613,8 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     ]
     st.markdown("\n".join(lines))
 
-# --- Lägg till / uppdatera bolag (form) -------------------------------------
+# app.py — Del 7/7
+# --- Lägg till/uppdatera + MAIN ---------------------------------------------
 
 def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     st.header("➕ Lägg till / uppdatera bolag")
@@ -1749,7 +1706,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             for f in changed_manual_fields:
                 _stamp_ts_for_field(df, ridx, f)
 
-        # Hämta basfält från Yahoo (namn/valuta/kurs/utdelning/CAGR) utan att överrida ifall None/0
+        # Hämta basfält från Yahoo
         data = hamta_yahoo_fält(ticker)
         ridx = df.index[df["Ticker"]==ticker][0]
         if data.get("Bolagsnamn"): df.loc[ridx, "Bolagsnamn"] = data["Bolagsnamn"]
@@ -1762,12 +1719,11 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         spara_data(df)
         st.success("Sparat.")
 
-    # --- Ny lista: äldst uppdaterade baserat på ALLA spårade fält (manuell/auto) ---
+    # --- Äldst uppdaterade (alla spårade fält) ---
     st.markdown("### ⏱️ Äldst uppdaterade (alla spårade fält, topp 10)")
     work = add_oldest_ts_col(df.copy())
     topp = work.sort_values(by=["_oldest_any_ts_fill","Bolagsnamn"], ascending=[True, True]).head(10)
 
-    # Visa även några nyckel-TS så man förstår varför posten är “gammal”
     visa_kol = ["Ticker","Bolagsnamn"]
     for k in ["TS_Utestående aktier","TS_P/S","TS_P/S Q1","TS_P/S Q2","TS_P/S Q3","TS_P/S Q4",
               "TS_Omsättning idag","TS_Omsättning nästa år"]:
@@ -1779,13 +1735,12 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
 
     return df
 
-# app.py — Del 7/7
 # --- MAIN --------------------------------------------------------------------
 
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    # Sidopanel: valutakurser → läs sparade och visa inputs
+    # Sidopanel: valutakurser
     st.sidebar.header("💱 Valutakurser → SEK")
     saved_rates = las_sparade_valutakurser()
     usd = st.sidebar.number_input("USD → SEK", value=float(saved_rates.get("USD", STANDARD_VALUTAKURSER["USD"])), step=0.01, format="%.4f")
@@ -1827,7 +1782,7 @@ def main():
         df = säkerställ_kolumner(df)
         spara_data(df)
 
-    # Säkerställ schema, migrera ev. äldre kolumner och typer
+    # Säkerställ schema, migrera och typer
     df = säkerställ_kolumner(df)
     df = migrera_gamla_riktkurskolumner(df)
     df = konvertera_typer(df)

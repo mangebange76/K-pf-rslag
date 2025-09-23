@@ -1103,7 +1103,7 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
         return hamta_yahoo_global_combo(ticker)
 
     facts, sc = _sec_companyfacts(cik)
-    if sc != 200 or not isinstance(facts, dict):
+    if sc != 200 eller not isinstance(facts, dict):
         return hamta_yahoo_global_combo(ticker)
 
     # Yahoo-basics
@@ -1854,13 +1854,13 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     with col_prev:
         if st.button("⬅️ Föregående"):
             st.session_state.edit_index = max(0, st.session_state.edit_index - 1)
-            st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
+            st.rerun()
     with col_pos:
         st.write(f"Post {st.session_state.edit_index}/{max(1, len(val_lista)-1)}")
     with col_next:
         if st.button("➡️ Nästa"):
             st.session_state.edit_index = min(len(val_lista)-1, st.session_state.edit_index + 1)
-            st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
+            st.rerun()
 
     if valt_label and valt_label in namn_map:
         bef = df[df["Ticker"] == namn_map[valt_label]].iloc[0]
@@ -1872,7 +1872,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     # Snabbknappar för valt bolag: Kurs-only & Full auto
     if current_ticker:
         st.markdown("### ⚙️ Snabbåtgärder för valt bolag")
-        bcol1, bcol2, bcol3 = st.columns([1,1,2])
+        bcol1, bcol2, _ = st.columns([1,1,2])
         with bcol1:
             if st.button("🔁 Uppdatera **KURS** (denna)"):
                 ch = update_price_only_for_ticker(df, current_ticker)
@@ -1894,7 +1894,8 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                 if changed:
                     df = uppdatera_berakningar(df, user_rates)
                     spara_data(df)
-                    st.success(f"Auto-uppdaterade {current_ticker}: {', '.join(changes_map.get(current_ticker, []))}")
+                    flds = ", ".join(changes_map.get(current_ticker, [])) or "fält"
+                    st.success(f"Auto-uppdaterade {current_ticker}: {flds}")
                 else:
                     st.info("Inga fält att uppdatera för detta bolag.")
 
@@ -1962,14 +1963,19 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             for f in changed_manual_fields:
                 _stamp_ts_for_field(df, ridx, f)
 
-        # Hämta basfält från Yahoo
+        # Hämta basfält från Yahoo (namn/valuta/kurs/utdelning/CAGR)
         data = hamta_yahoo_fält(ticker)
         ridx = df.index[df["Ticker"]==ticker][0]
-        if data.get("Bolagsnamn"): df.loc[ridx, "Bolagsnamn"] = data["Bolagsnamn"]
-        if data.get("Valuta"):     df.loc[ridx, "Valuta"] = data["Valuta"]
-        if data.get("Aktuell kurs",0)>0: df.loc[ridx, "Aktuell kurs"] = data["Aktuell kurs"]
-        if "Årlig utdelning" in data and data.get("Årlig utdelning") is not None: df.loc[ridx, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
-        if "CAGR 5 år (%)" in data and data.get("CAGR 5 år (%)") is not None:     df.loc[ridx, "CAGR 5 år (%)")   ] = float(data.get("CAGR 5 år (%)") or 0.0)
+        if data.get("Bolagsnamn"):
+            df.loc[ridx, "Bolagsnamn"] = data["Bolagsnamn"]
+        if data.get("Valuta"):
+            df.loc[ridx, "Valuta"] = data["Valuta"]
+        if data.get("Aktuell kurs", 0) > 0:
+            df.loc[ridx, "Aktuell kurs"] = data["Aktuell kurs"]
+        if "Årlig utdelning" in data and data.get("Årlig utdelning") is not None:
+            df.loc[ridx, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
+        if "CAGR 5 år (%)" in data and data.get("CAGR 5 år (%)") is not None:
+            df.loc[ridx, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
 
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
@@ -1998,8 +2004,10 @@ def main():
 
     # Sidopanel: skydd mot destruktiva skrivningar
     with st.sidebar.expander("🛡️ Google Sheets-skydd", expanded=False):
-        st.session_state["destructive_ok"] = st.checkbox("Tillåt destruktiva skrivningar (rensa helt)", value=False,
-                                                         help="Lämna AV för att skydda mot att hela arket skrivs med 0 rader.")
+        st.session_state["destructive_ok"] = st.checkbox(
+            "Tillåt destruktiva skrivningar (rensa helt)", value=False,
+            help="Lämna AV för att skydda mot att hela arket skrivs med 0 rader."
+        )
 
     # Sidopanel: valutakurser
     st.sidebar.header("💱 Valutakurser → SEK")
@@ -2041,10 +2049,8 @@ def main():
     if df.empty:
         df = pd.DataFrame({c: [] for c in FINAL_COLS})
         df = säkerställ_kolumner(df)
-        # OBS: skriv INTE tom DF här – låt användaren lägga till första post
-        # spara_data(df)  # med skydd aktiverat riskerar detta blockeras ändå
+        # Skriv inte tom DF vid första start; låt användaren lägga till första post.
     else:
-        # Säkerställ schema, migrera och typer
         df = säkerställ_kolumner(df)
         df = migrera_gamla_riktkurskolumner(df)
         df = konvertera_typer(df)

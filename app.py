@@ -1104,13 +1104,13 @@ def hamta_sec_yahoo_combo(ticker: str) -> dict:
 
     facts, sc = _sec_companyfacts(cik)
     if sc != 200 or not isinstance(facts, dict):
-    return hamta_yahoo_global_combo(ticker)
         return hamta_yahoo_global_combo(ticker)
 
     # Yahoo-basics
     y = hamta_yahoo_fält(ticker)
     for k in ("Bolagsnamn", "Valuta", "Aktuell kurs"):
-        if y.get(k): out[k] = y[k]
+        if y.get(k):
+            out[k] = y[k]
     px_ccy = (out.get("Valuta") or "USD").upper()
 
     # Shares: implied → fallback SEC robust
@@ -1497,7 +1497,7 @@ def _reset_step_queue():
 def step_auto_run(df: pd.DataFrame, user_rates: dict, batch_size: int = 10, make_snapshot_first_save: bool = False):
     """
     Bearbetar nästa 'batch_size' tickers från kön. Sparar DF om något ändrats i batchen.
-    Lämnar eventuella missar i logg men återför dem inte till kön (enligt önskemål).
+    Lämnar eventuella missar i logg men återför dem inte till kön.
     """
     if "step_queue" not in st.session_state:
         _init_step_queue(df)
@@ -1889,16 +1889,19 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                     ridx = df.index[df["Ticker"].str.upper() == current_ticker.upper()][0]
                 except Exception:
                     ridx = None
-                vals, dbg = auto_fetch_for_ticker(current_ticker)
-                changes_map = {}
-                changed = apply_auto_updates_to_row(df, ridx, vals, source="Auto (Enskild)", changes_map=changes_map)
-                if changed:
-                    df = uppdatera_berakningar(df, user_rates)
-                    spara_data(df)
-                    flds = ", ".join(changes_map.get(current_ticker, [])) or "fält"
-                    st.success(f"Auto-uppdaterade {current_ticker}: {flds}")
+                if ridx is None:
+                    st.error("Kunde inte hitta raden för tickern i databasen.")
                 else:
-                    st.info("Inga fält att uppdatera för detta bolag.")
+                    vals, dbg = auto_fetch_for_ticker(current_ticker)
+                    changes_map = {}
+                    changed = apply_auto_updates_to_row(df, ridx, vals, source="Auto (Enskild)", changes_map=changes_map)
+                    if changed:
+                        df = uppdatera_berakningar(df, user_rates)
+                        spara_data(df)
+                        flds = ", ".join(changes_map.get(current_ticker, [])) or "fält"
+                        st.success(f"Auto-uppdaterade {current_ticker}: {flds}")
+                    else:
+                        st.info("Inga fält att uppdatera för detta bolag.")
 
     # Visa TS-etiketter / sammanfattning för nuvarande post
     if not bef.empty:
@@ -2048,10 +2051,11 @@ def main():
     # Läs data
     df = hamta_data()
     if df.empty:
+        # Första start: skapa tom DF med schema men skriv inte till arket (skydd mot clearing).
         df = pd.DataFrame({c: [] for c in FINAL_COLS})
         df = säkerställ_kolumner(df)
-        # Skriv inte tom DF vid första start; låt användaren lägga till första post.
     else:
+        # Säkerställ schema, migrera och typer
         df = säkerställ_kolumner(df)
         df = migrera_gamla_riktkurskolumner(df)
         df = konvertera_typer(df)

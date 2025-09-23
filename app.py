@@ -8,6 +8,7 @@ import gspread
 import yfinance as yf
 import requests
 import time
+import random
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 from typing import Optional
@@ -38,16 +39,28 @@ credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIA
 client = gspread.authorize(credentials)
 
 def _with_backoff(func, *args, **kwargs):
-    """Liten backoff-hjälpare för att mildra 429/kvotfel."""
-    delays = [0, 0.5, 1.0, 2.0]
+    """Backoff med stöd för Retry-After + jitter, för att undvika 429-spikar."""
+    delays = [0.0, 0.8, 1.6, 3.2, 6.4]  # exponentiellt
     last_err = None
-    for d in delays:
-        if d:
-            time.sleep(d)
+    for i, base in enumerate(delays):
+        if i > 0:
+            time.sleep(base + random.uniform(0, 0.4))
         try:
             return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            try:
+                sc = getattr(e.response, "status_code", 0)
+                ra = getattr(e.response, "headers", {}).get("Retry-After")
+                if ra:
+                    # respektera Retry-After i sekunder
+                    time.sleep(float(ra))
+            except Exception:
+                pass
+            continue
         except Exception as e:
             last_err = e
+            continue
     raise last_err
 
 def get_spreadsheet():
@@ -71,6 +84,9 @@ def hamta_data():
     data = _with_backoff(sheet.get_all_records)
     return pd.DataFrame(data)
 
+# Frivillig svalpaus efter skrivning (sekunder). Sätt i secrets om du vill, t.ex. 0.5
+SHEETS_WRITE_COOLDOWN = float(st.secrets.get("SHEETS_WRITE_COOLDOWN", 0.0))
+
 def spara_data(df: pd.DataFrame, do_snapshot: bool = False):
     """Skriv hela DataFrame till huvudbladet. Optionellt: skapa snapshot-flik först."""
     if do_snapshot:
@@ -81,6 +97,8 @@ def spara_data(df: pd.DataFrame, do_snapshot: bool = False):
     sheet = skapa_koppling()
     _with_backoff(sheet.clear)
     _with_backoff(sheet.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
+    if SHEETS_WRITE_COOLDOWN > 0:
+        time.sleep(SHEETS_WRITE_COOLDOWN)
 
 # --- Tids-/utility ---
 def _ts_str():
@@ -313,6 +331,28 @@ def _note_manual_update(df: pd.DataFrame, row_idx: int):
 # Fält som triggar "Senast manuellt uppdaterad" i formuläret
 MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
 
+# --- Etikett för fältens TS (visas under inputs) -----------------------------
+
+def _field_ts_label(row: pd.Series, field: str) -> str:
+    """
+    Returnerar etikett: '📅 Senast: YYYY-MM-DD (auto/manuellt)' när möjligt, annars '—'.
+    """
+    try:
+        ts_col = TS_FIELDS.get(field, "")
+        ts = str(row.get(ts_col, "")).strip() if ts_col else ""
+        if not ts:
+            return "—"
+        auto = str(row.get("Senast auto-uppdaterad", "")).strip()
+        manu = str(row.get("Senast manuellt uppdaterad", "")).strip()
+        tag = ""
+        if auto and ts == auto:
+            tag = " (auto)"
+        elif manu and ts == manu:
+            tag = " (manuellt)"
+        return f"📅 Senast: {ts}{tag}"
+    except Exception:
+        return "—"
+
 # app.py — Del 3/7
 # --- Yahoo-hjälpare & beräkningar & merge-hjälpare ---------------------------
 
@@ -399,8 +439,8 @@ def hamta_yahoo_fält(ticker: str) -> dict:
 def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     """
     Beräknar:
-      - P/S-snitt som snitt av positiva Q1–Q4
-      - Omsättning 2 & 3 år från 'Omsättning nästa år' med CAGR clamp
+      - P/S-snitt (Q1–Q4 > 0)
+      - Omsättning om 2 & 3 år från 'Omsättning nästa år' (CAGR clamp)
       - Riktkurser idag/1/2/3 beroende på P/S-snitt och Utestående aktier
     """
     for i, rad in df.iterrows():
@@ -494,8 +534,9 @@ def _fmp_get(path: str, params=None, stable: bool = True):
 
     for extra_sleep in delays:
         try:
+            # skonsam bas-delay + liten jitter
             if FMP_CALL_DELAY > 0:
-                time.sleep(FMP_CALL_DELAY)
+                time.sleep(FMP_CALL_DELAY + (0.2 * np.random.rand()))
             r = requests.get(url, params=params, timeout=20)
             sc = r.status_code
             last_sc = sc
@@ -509,7 +550,16 @@ def _fmp_get(path: str, params=None, stable: bool = True):
                 return j, sc
 
             if sc == 429:
-                st.session_state["fmp_block_until"] = _ts_datetime() + timedelta(minutes=FMP_BLOCK_MINUTES)
+                # respektera ev Retry-After
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        wait_s = float(ra)
+                        st.session_state["fmp_block_until"] = _ts_datetime() + timedelta(seconds=max(wait_s, 30))
+                    except Exception:
+                        st.session_state["fmp_block_until"] = _ts_datetime() + timedelta(minutes=FMP_BLOCK_MINUTES)
+                else:
+                    st.session_state["fmp_block_until"] = _ts_datetime() + timedelta(minutes=FMP_BLOCK_MINUTES)
                 time.sleep(extra_sleep)
                 continue
 
@@ -1224,46 +1274,7 @@ def hamta_finnhub_revenue_estimates(ticker: str) -> dict:
     except Exception:
         return {}
 
-# app.py — Del 5/7
-# --- Snapshots, auto-uppdatering, test & kontrollvy -------------------------
-
-def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME):
-    """
-    Skapar en snapshot-flik i samma Google Sheet: 'Snapshot-YYYYMMDD-HHMMSS'
-    och fyller den med hela df. Kräver endast Sheets (inte Drive).
-    """
-    ss = get_spreadsheet()
-    snap_name = f"Snapshot-{_ts_str()}"
-    try:
-        ss.add_worksheet(title=snap_name, rows=max(1000, len(df)+10), cols=max(50, len(df.columns)+2))
-        ws = ss.worksheet(snap_name)
-        _with_backoff(ws.clear)
-        _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
-        st.success(f"Snapshot skapad: {snap_name}")
-    except Exception as e:
-        st.warning(f"Misslyckades skapa snapshot-flik: {e}")
-
-def oldest_any_ts(row: pd.Series) -> Optional[pd.Timestamp]:
-    """
-    Returnerar äldsta (minsta) tidsstämpeln bland alla TS_-kolumner för en rad.
-    None om inga tidsstämplar.
-    """
-    dates = []
-    for c in TS_FIELDS.values():
-        if c in row and str(row[c]).strip():
-            try:
-                d = pd.to_datetime(str(row[c]).strip(), errors="coerce")
-                if pd.notna(d):
-                    dates.append(d)
-            except Exception:
-                pass
-    return min(dates) if dates else None
-
-def add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
-    df["_oldest_any_ts"] = df.apply(oldest_any_ts, axis=1)
-    df["_oldest_any_ts"] = pd.to_datetime(df["_oldest_any_ts"], errors="coerce")
-    df["_oldest_any_ts_fill"] = df["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
-    return df
+# --- Hjälp-funktioner som bygger den gemensamma auto-pipelinen --------------
 
 def auto_fetch_for_ticker(ticker: str):
     """
@@ -1315,137 +1326,214 @@ def auto_fetch_for_ticker(ticker: str):
 
     return vals, debug
 
-def auto_update_all(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = False):
+# app.py — Del 5/7
+# --- Snapshots, auto-uppdatering (stegvis), pris-only, test & kontrollvy ----
+
+def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME):
     """
-    Kör auto-uppdatering för alla rader. Skriver endast fält med meningsfulla nya värden.
-    Stämplar TS_ per fält, samt 'Senast auto-uppdaterad' + källa.
+    Skapar en snapshot-flik i samma Google Sheet: 'Snapshot-YYYYMMDD-HHMMSS'
+    och fyller den med hela df. Kräver endast Sheets (inte Drive).
     """
-    log = {"changed": {}, "misses": {}, "debug_first_20": []}
+    ss = get_spreadsheet()
+    snap_name = f"Snapshot-{_ts_str()}"
+    try:
+        ss.add_worksheet(title=snap_name, rows=max(1000, len(df)+10), cols=max(50, len(df.columns)+2))
+        ws = ss.worksheet(snap_name)
+        _with_backoff(ws.clear)
+        _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
+        st.success(f"Snapshot skapad: {snap_name}")
+    except Exception as e:
+        st.warning(f"Misslyckades skapa snapshot-flik: {e}")
+
+def oldest_any_ts(row: pd.Series) -> Optional[pd.Timestamp]:
+    """
+    Returnerar äldsta (minsta) tidsstämpeln bland alla TS_-kolumner för en rad.
+    None om inga tidsstämplar.
+    """
+    dates = []
+    for c in TS_FIELDS.values():
+        if c in row and str(row[c]).strip():
+            try:
+                d = pd.to_datetime(str(row[c]).strip(), errors="coerce")
+                if pd.notna(d):
+                    dates.append(d)
+            except Exception:
+                pass
+    return min(dates) if dates else None
+
+def add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
+    df["_oldest_any_ts"] = df.apply(oldest_any_ts, axis=1)
+    df["_oldest_any_ts"] = pd.to_datetime(df["_oldest_any_ts"], errors="coerce")
+    df["_oldest_any_ts_fill"] = df["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
+    return df
+
+# ------------------- Lätt-körningar (pris) -----------------------------------
+
+def update_price_for_ticker(df: pd.DataFrame, ticker: str, changes_map: dict) -> bool:
+    """
+    Uppdaterar endast 'Aktuell kurs' (och Valuta om den följer med från Yahoo) för en ticker.
+    Sätter 'Senast auto-uppdaterad' + källa. Returnerar True om något ändrades.
+    """
+    ticker = str(ticker).strip().upper()
+    if not ticker:
+        return False
+    idx_list = df.index[df["Ticker"].str.upper() == ticker].tolist()
+    if not idx_list:
+        return False
+    ridx = idx_list[0]
+
+    y = hamta_yahoo_fält(ticker)
+    new_vals = {}
+    if y.get("Aktuell kurs", 0) > 0:
+        new_vals["Aktuell kurs"] = float(y["Aktuell kurs"])
+    if y.get("Valuta"):
+        new_vals["Valuta"] = str(y["Valuta"]).upper()
+
+    return apply_auto_updates_to_row(
+        df, ridx, new_vals, source="Kurs (Yahoo)", changes_map=changes_map
+    )
+
+def update_prices_all(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Kör pris-only för alla tickers i listan. Sparar bara om något ändrades.
+    """
+    log = {"changed": {}, "misses": []}
     progress = st.sidebar.progress(0)
     status = st.sidebar.empty()
 
-    total = len(df)
+    tickers = [str(t).strip().upper() for t in df["Ticker"].fillna("") if str(t).strip()]
+    total = len(tickers)
     any_changed = False
 
-    for i, row in df.reset_index().iterrows():
-        idx = row["index"]
-        tkr = str(row["Ticker"]).strip().upper()
-        if not tkr:
-            progress.progress((i+1)/max(total,1))
-            continue
-
-        status.write(f"Uppdaterar {i+1}/{total}: {tkr}")
+    for i, tkr in enumerate(tickers, start=1):
+        status.write(f"Uppdaterar kurs {i}/{total}: {tkr}")
         try:
-            new_vals, debug = auto_fetch_for_ticker(tkr)
-            changed = apply_auto_updates_to_row(df, idx, new_vals, source="Auto (SEC/Yahoo→Yahoo→Finnhub→FMP)", changes_map=log["changed"])
+            changed = update_price_for_ticker(df, tkr, log["changed"])
             if not changed:
-                log["misses"][tkr] = list(new_vals.keys()) if new_vals else ["(inga nya fält)"]
+                log["misses"].append(tkr)
             any_changed = any_changed or changed
-            if i < 20:
-                log["debug_first_20"].append({tkr: debug})
         except Exception as e:
-            log["misses"][tkr] = [f"error: {e}"]
+            log["misses"].append(f"{tkr} (fel: {e})")
+        progress.progress(i / max(total, 1))
 
-        progress.progress((i+1)/max(total,1))
-
-    # Efter loop — räkna om & spara
-    df = uppdatera_berakningar(df, user_rates)
+    # Pris påverkar inte våra beräkningar direkt, men kör ändå för säkerhets skull (no-op).
+    df = uppdatera_berakningar(df, user_rates={})
 
     if any_changed:
-        spara_data(df, do_snapshot=make_snapshot)
-        st.sidebar.success("Klart! Ändringar sparade.")
+        spara_data(df, do_snapshot=False)
+        st.sidebar.success("Kurser uppdaterade och sparade.")
     else:
-        st.sidebar.info("Ingen faktisk ändring upptäcktes – ingen skrivning/snapshot gjordes.")
+        st.sidebar.info("Inga kursändringar upptäcktes.")
 
     return df, log
 
-# --- NYTT: snabba uppdaterare för kurs och enskilt bolag ---------------------
+# ------------------- Full uppdatering för EN ticker --------------------------
 
-def update_single_ticker_price(df: pd.DataFrame, ticker: str, make_snapshot: bool = False):
-    """Uppdatera endast Aktuell kurs (och ev. Valuta) för ett specifikt bolag via Yahoo."""
-    tkr = (ticker or "").strip().upper()
-    if not tkr or tkr not in set(df["Ticker"].astype(str).str.upper()):
-        return df, False
-
-    ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
-    data = hamta_yahoo_fält(tkr)
-    px = float(data.get("Aktuell kurs") or 0.0)
-    ccy = data.get("Valuta")
-
-    if px > 0:
-        df.at[ridx, "Aktuell kurs"] = px
-        if ccy:
-            df.at[ridx, "Valuta"] = str(ccy).upper()
-        _note_auto_update(df, ridx, source="Yahoo (pris)")
-        spara_data(df, do_snapshot=make_snapshot)
-        return df, True
-    return df, False
-
-def update_single_ticker_full(df: pd.DataFrame, user_rates: dict, ticker: str, make_snapshot: bool = False):
-    """Full auto för ett bolag: SEC/Yahoo → Yahoo → Finnhub → FMP + omräkningar."""
-    tkr = (ticker or "").strip().upper()
-    if not tkr or tkr not in set(df["Ticker"].astype(str).str.upper()):
-        return df, False, {}
-
-    ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
-    changes_map = {}
-    debug_all = {}
-
-    try:
-        new_vals, debug = auto_fetch_for_ticker(tkr)
-        debug_all = debug
-        changed = apply_auto_updates_to_row(
-            df, ridx, new_vals,
-            source="Auto (SEC/Yahoo→Yahoo→Finnhub→FMP)",
-            changes_map=changes_map
-        )
-        # räkna om riktkurser m.m.
-        df = uppdatera_berakningar(df, user_rates)
-        if changed:
-            spara_data(df, do_snapshot=make_snapshot)
-        return df, changed, debug_all
-    except Exception as e:
-        debug_all = {"error": str(e)}
-        return df, False, debug_all
-
-def update_prices_all(df: pd.DataFrame, make_snapshot: bool = False):
+def full_auto_update_ticker(df: pd.DataFrame, ticker: str, user_rates: dict, make_snapshot: bool = False) -> tuple[pd.DataFrame, dict, bool]:
     """
-    Snabb global prisuppdatering: hämtar ENDAST 'Aktuell kurs' (och ev. Valuta) via Yahoo per ticker.
+    Kör hela pipelinen för en specifik ticker (SEC/Yahoo→Yahoo→Finnhub→FMP).
+    Sparar och räknar om endast vid ändringar.
     """
-    tickers = [str(t).strip().upper() for t in df["Ticker"].astype(str) if str(t).strip()]
-    if not tickers:
-        return df, 0
+    ticker = str(ticker).strip().upper()
+    out_log = {"ticker": ticker, "changed": {}, "misses": []}
+    if not ticker:
+        return df, out_log, False
 
+    idx_list = df.index[df["Ticker"].str.upper() == ticker].tolist()
+    if not idx_list:
+        return df, out_log, False
+    ridx = idx_list[0]
+
+    vals, debug = auto_fetch_for_ticker(ticker)
+    out_log["debug"] = debug
+    changed = apply_auto_updates_to_row(
+        df, ridx, vals, source="Auto (SEC/Yahoo→Yahoo→Finnhub→FMP)", changes_map=out_log["changed"]
+    )
+    if not changed:
+        out_log["misses"] = list(vals.keys()) if vals else ["(inga nya fält)"]
+        return df, out_log, False
+
+    # Räkna om & spara
+    df = uppdatera_berakningar(df, user_rates)
+    spara_data(df, do_snapshot=make_snapshot)
+    return df, out_log, True
+
+# --------------- Stegvis auto-uppdatering (3 pass) ---------------------------
+
+def _stage_fetch(ticker: str, stage: int) -> dict:
+    """
+    Returnerar endast de fält som hör till respektive steg.
+      1: SEC/Yahoo→Yahoo (Utestående aktier, P/S, P/S Q1–Q4, Aktuell kurs, Valuta, Bolagsnamn)
+      2: Finnhub (Omsättning idag, Omsättning nästa år)
+      3: FMP light (P/S, Utestående aktier – om saknas)
+    """
+    if stage == 1:
+        base = hamta_sec_yahoo_combo(ticker)
+        allow = {"Bolagsnamn","Valuta","Aktuell kurs","Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4"}
+        return {k: v for k, v in base.items() if k in allow}
+    elif stage == 2:
+        fh = hamta_finnhub_revenue_estimates(ticker)
+        allow = {"Omsättning idag","Omsättning nästa år"}
+        return {k: v for k, v in fh.items() if k in allow}
+    elif stage == 3:
+        fmpl = hamta_fmp_falt_light(ticker)
+        out = {}
+        if fmpl.get("P/S"):
+            out["P/S"] = fmpl["P/S"]
+        if fmpl.get("Utestående aktier"):
+            out["Utestående aktier"] = fmpl["Utestående aktier"]
+        return out
+    return {}
+
+def process_auto_stage(df: pd.DataFrame, tickers: list[str], stage: int, user_rates: dict, make_snapshot: bool = False):
+    """
+    Kör ett enda steg (1..3) över given lista av tickers.
+    Skriver endast om något ändras. Returnerar (df, next_pending, log, any_changed).
+    """
+    tag = {1: "Stage1 SEC/Yahoo→Yahoo", 2: "Stage2 Finnhub", 3: "Stage3 FMP light"}.get(stage, f"Stage{stage}")
+    log = {"stage": stage, "tag": tag, "changed": {}, "misses": {}}
     progress = st.sidebar.progress(0)
     status = st.sidebar.empty()
-    updated = 0
 
-    for i, tkr in enumerate(tickers):
-        try:
-            ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
-        except IndexError:
-            progress.progress((i+1)/max(1, len(tickers)))
+    total = len(tickers)
+    any_changed = False
+    next_pending = []
+
+    for i, tkr in enumerate(tickers, start=1):
+        t = str(tkr).strip().upper()
+        status.write(f"{tag}: {i}/{total} – {t}")
+        idx_list = df.index[df["Ticker"].str.upper() == t].tolist()
+        if not idx_list:
+            log["misses"].setdefault(t, []).append("saknas i tabellen")
+            next_pending.append(t)
+            progress.progress(i / max(total, 1))
             continue
 
-        status.write(f"Uppdaterar kurs {i+1}/{len(tickers)}: {tkr}")
-        data = hamta_yahoo_fält(tkr)
-        px = float(data.get("Aktuell kurs") or 0.0)
-        ccy = data.get("Valuta")
+        ridx = idx_list[0]
+        try:
+            vals = _stage_fetch(t, stage)
+            changed = apply_auto_updates_to_row(df, ridx, vals, source=tag, changes_map=log["changed"])
+            if not changed:
+                log["misses"].setdefault(t, []).append("inga nya fält")
+                next_pending.append(t)
+            any_changed = any_changed or changed
+        except Exception as e:
+            log["misses"].setdefault(t, []).append(f"fel: {e}")
+            next_pending.append(t)
 
-        if px > 0:
-            df.at[ridx, "Aktuell kurs"] = px
-            if ccy:
-                df.at[ridx, "Valuta"] = str(ccy).upper()
-            _note_auto_update(df, ridx, source="Yahoo (pris)")
-            updated += 1
+        progress.progress(i / max(total, 1))
 
-        progress.progress((i+1)/max(1, len(tickers)))
-
-    if updated > 0:
+    # Räkna om och spara endast om något faktiskt ändrades i detta steg
+    df = uppdatera_berakningar(df, user_rates)
+    if any_changed:
         spara_data(df, do_snapshot=make_snapshot)
-    return df, updated
+        st.sidebar.success(f"{tag}: ändringar sparade.")
+    else:
+        st.sidebar.info(f"{tag}: inga ändringar att spara.")
 
-# --- Felsökning enkelvy ------------------------------------------------------
+    return df, next_pending, log, any_changed
+
+# --------------------------- Debug & Kontrollvy ------------------------------
 
 def debug_test_single_ticker(ticker: str):
     """Visar vad källorna levererar för en ticker, för felsökning."""
@@ -1541,27 +1629,24 @@ def kontrollvy(df: pd.DataFrame) -> None:
 
     st.divider()
 
-    # 3) Senaste körlogg (om du nyss körde Auto)
-    st.subheader("📒 Senaste körlogg (Auto)")
-    log = st.session_state.get("last_auto_log")
-    if not log:
-        st.info("Ingen auto-körning körd i denna session ännu.")
-    else:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Ändringar** (ticker → fält)")
-            if log.get("changed"):
-                st.json(log["changed"])
-            else:
-                st.write("–")
-        with col2:
-            st.markdown("**Missar** (ticker → fält som ej uppdaterades)")
-            if log.get("misses"):
-                st.json(log["misses"])
-            else:
-                st.write("–")
-        st.markdown("**Debug (första 20)**")
-        st.json(log.get("debug_first_20", []))
+    # 3) Senaste körloggar (stegvis & pris-only)
+    st.subheader("📒 Senaste körloggar")
+    log_stage = st.session_state.get("last_stage_log")
+    log_price = st.session_state.get("last_price_log")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Stegvis uppdatering**")
+        if log_stage:
+            st.json(log_stage)
+        else:
+            st.write("–")
+    with col2:
+        st.markdown("**Pris-only**")
+        if log_price:
+            st.json(log_price)
+        else:
+            st.write("–")
 
 # app.py — Del 6/7
 # --- Analys, Portfölj & Investeringsförslag ----------------------------------
@@ -1702,9 +1787,9 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     st.markdown("\n".join(lines))
 
 # app.py — Del 7/7
-# --- Lägg till/uppdatera + MAIN ---------------------------------------------
+# --- Lägg till/uppdatera (med per-bolag-knappar) + MAIN ----------------------
 
-def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
+def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict, make_snapshot: bool = False) -> pd.DataFrame:
     st.header("➕ Lägg till / uppdatera bolag")
 
     sort_val = st.selectbox("Sortera för redigering", ["A–Ö (bolagsnamn)","Äldst uppdaterade först (alla fält)"])
@@ -1716,39 +1801,100 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
 
     namn_map = {f"{r['Bolagsnamn']} ({r['Ticker']})": r['Ticker'] for _, r in vis_df.iterrows()}
     val_lista = [""] + list(namn_map.keys())
-    if "edit_index" not in st.session_state: st.session_state.edit_index = 0
+    if "edit_index" not in st.session_state:
+        st.session_state.edit_index = 0
+    st.session_state.edit_index = min(st.session_state.edit_index, max(0, len(val_lista)-1))
 
-    valt_label = st.selectbox("Välj bolag (lämna tomt för nytt)", val_lista, index=min(st.session_state.edit_index, len(val_lista)-1))
-    col_prev, col_pos, col_next = st.columns([1,2,1])
-    with col_prev:
+    valt_label = st.selectbox("Välj bolag (lämna tomt för nytt)", val_lista, index=st.session_state.edit_index)
+
+    # Bläddra + per-bolag-knappar
+    c_prev, c_btns, c_next = st.columns([1,2,1])
+    with c_prev:
         if st.button("⬅️ Föregående"):
             st.session_state.edit_index = max(0, st.session_state.edit_index - 1)
-    with col_pos:
-        st.write(f"Post {st.session_state.edit_index}/{max(1, len(val_lista)-1)}")
-    with col_next:
+            st.rerun()
+    with c_next:
         if st.button("➡️ Nästa"):
             st.session_state.edit_index = min(len(val_lista)-1, st.session_state.edit_index + 1)
+            st.rerun()
 
-    if valt_label and valt_label in namn_map:
+    # Hämta nuvarande rad (om vald)
+    if valt_label and valt_label in namn_map and not df.empty:
         bef = df[df["Ticker"] == namn_map[valt_label]].iloc[0]
     else:
         bef = pd.Series({}, dtype=object)
 
+    # Per-bolag-uppdatering: Kurs-only + Full auto
+    with c_btns:
+        colk, colf = st.columns(2)
+        with colk:
+            if st.button("📉 Uppdatera kurs (vald)"):
+                if not bef.empty:
+                    t = str(bef.get("Ticker","")).upper().strip()
+                    log = {"changed": {}}
+                    try:
+                        changed = update_price_for_ticker(df, t, log["changed"])
+                        if changed:
+                            spara_data(df, do_snapshot=False)
+                            st.success(f"Kurs uppdaterad för {t}.")
+                        else:
+                            st.info("Ingen kursändring.")
+                    except Exception as e:
+                        st.error(f"Kursuppdatering misslyckades: {e}")
+                    st.rerun()
+                else:
+                    st.warning("Välj först ett befintligt bolag.")
+        with colf:
+            if st.button("✨ Full auto-uppdatering (vald)"):
+                if not bef.empty:
+                    t = str(bef.get("Ticker","")).upper().strip()
+                    try:
+                        df, out_log, changed = full_auto_update_ticker(df, t, user_rates, make_snapshot=make_snapshot)
+                        st.session_state["last_single_log"] = out_log
+                        if changed:
+                            st.success(f"Auto-uppdaterade {t} och sparade.")
+                        else:
+                            st.info("Inga nya fält för vald ticker.")
+                    except Exception as e:
+                        st.error(f"Auto-uppdatering misslyckades: {e}")
+                    st.rerun()
+                else:
+                    st.warning("Välj först ett befintligt bolag.")
+
+    # Visa liten statusrad för vald rad
+    if not bef.empty:
+        col_info1, col_info2 = st.columns(2)
+        with col_info1:
+            st.caption(f"🕒 Senast auto: {bef.get('Senast auto-uppdaterad','') or '—'} • Källa: {bef.get('Senast uppdaterad källa','') or '—'}")
+        with col_info2:
+            st.caption(f"📝 Senast manuellt: {bef.get('Senast manuellt uppdaterad','') or '—'}")
+
+    # --- Formulär för inmatning/ändring ---
     with st.form("form_bolag"):
         c1, c2 = st.columns(2)
         with c1:
             ticker = st.text_input("Ticker (Yahoo-format)", value=bef.get("Ticker","") if not bef.empty else "").upper()
             utest = st.number_input("Utestående aktier (miljoner)", value=float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "Utestående aktier") if not bef.empty else "—")
+
             antal = st.number_input("Antal aktier du äger", value=float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0)
 
             ps  = st.number_input("P/S",   value=float(bef.get("P/S",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "P/S") if not bef.empty else "—")
             ps1 = st.number_input("P/S Q1", value=float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "P/S Q1") if not bef.empty else "—")
             ps2 = st.number_input("P/S Q2", value=float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "P/S Q2") if not bef.empty else "—")
             ps3 = st.number_input("P/S Q3", value=float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "P/S Q3") if not bef.empty else "—")
             ps4 = st.number_input("P/S Q4", value=float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "P/S Q4") if not bef.empty else "—")
+
         with c2:
             oms_idag  = st.number_input("Omsättning idag (miljoner)",  value=float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "Omsättning idag") if not bef.empty else "—")
             oms_next  = st.number_input("Omsättning nästa år (miljoner)", value=float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0)
+            st.caption(_field_ts_label(bef, "Omsättning nästa år") if not bef.empty else "—")
 
             st.markdown("**Vid spara uppdateras också automatiskt (utan att skriva över manuella 0-värden):**")
             st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%) via Yahoo")
@@ -1788,15 +1934,14 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             df = pd.concat([df, pd.DataFrame([tom])], ignore_index=True)
 
         # Sätt manuell TS + TS_ per fält
+        ridx = df.index[df["Ticker"]==ticker][0]
         if datum_sätt:
-            ridx = df.index[df["Ticker"]==ticker][0]
             _note_manual_update(df, ridx)
             for f in changed_manual_fields:
                 _stamp_ts_for_field(df, ridx, f)
 
         # Hämta basfält från Yahoo
         data = hamta_yahoo_fält(ticker)
-        ridx = df.index[df["Ticker"]==ticker][0]
         if data.get("Bolagsnamn"): df.loc[ridx, "Bolagsnamn"] = data["Bolagsnamn"]
         if data.get("Valuta"):     df.loc[ridx, "Valuta"] = data["Valuta"]
         if data.get("Aktuell kurs",0)>0: df.loc[ridx, "Aktuell kurs"] = data["Aktuell kurs"]
@@ -1806,35 +1951,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
         st.success("Sparat.")
-
-    # --- Snabbuppdatering för valt bolag: Kurs eller Full auto ---
-    # (använd valt 'ticker' i formuläret ovan om det finns)
-    if 'ticker' in locals() and ticker:
-        c_up1, c_up2 = st.columns(2)
-        with c_up1:
-            if st.button("📈 Uppdatera endast kurs (detta bolag)", key="btn_upd_px_one"):
-                df, ok = update_single_ticker_price(df, ticker, make_snapshot=False)
-                if ok:
-                    st.success(f"Kurs uppdaterad för {ticker}.")
-                    st.rerun()
-                else:
-                    st.info("Ingen kursändring kunde göras.")
-        with c_up2:
-            if st.button("🔁 Full auto-uppdatering (detta bolag)", key="btn_upd_full_one"):
-                df, changed, debug_one = update_single_ticker_full(df, user_rates, ticker, make_snapshot=False)
-                if changed:
-                    st.success(f"Full auto-uppdatering klar för {ticker}.")
-                    # --- AUTO-HOPPA TILL NÄSTA POST I LISTAN ---
-                    try:
-                        next_idx = min(st.session_state.edit_index + 1, len(val_lista) - 1)
-                        st.session_state.edit_index = next_idx
-                    except Exception:
-                        pass
-                else:
-                    st.info("Inga ändringar för detta bolag.")
-                with st.expander("Visa debug"):
-                    st.json(debug_one)
-                st.rerun()
+        st.rerun()
 
     # --- Äldst uppdaterade (alla spårade fält) ---
     st.markdown("### ⏱️ Äldst uppdaterade (alla spårade fält, topp 10)")
@@ -1849,10 +1966,8 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     visa_kol.append("_oldest_any_ts")
 
     st.dataframe(topp[visa_kol], use_container_width=True, hide_index=True)
-
     return df
 
-# --- MAIN --------------------------------------------------------------------
 
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
@@ -1904,22 +2019,54 @@ def main():
     df = migrera_gamla_riktkurskolumner(df)
     df = konvertera_typer(df)
 
+    # --------------------- Auto-uppdatering (nya lätta knappar) ----------------
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🛠️ Auto-uppdatering")
+    st.sidebar.subheader("🛠️ Auto-uppdatering (lätt & stegvis)")
     make_snapshot = st.sidebar.checkbox("Skapa snapshot före skrivning", value=True)
 
-    if st.sidebar.button("🔄 Auto-uppdatera alla (SEC/Yahoo → Yahoo → Finnhub → FMP)"):
-        df, log = auto_update_all(df, user_rates, make_snapshot=make_snapshot)
-        st.session_state["last_auto_log"] = log
+    # Pris-only (alla)
+    if st.sidebar.button("📉 Uppdatera bara kurser (alla)"):
+        df, log = update_prices_all(df)
+        st.session_state["last_price_log"] = log
 
-    # NY: snabb-knapp för ENBART kurs för alla tickers
-    if st.sidebar.button("📈 Enbart kurs (alla bolag)"):
-        df, n = update_prices_all(df, make_snapshot=make_snapshot)
-        if n > 0:
-            st.sidebar.success(f"Uppdaterade kurs för {n} bolag.")
-        else:
-            st.sidebar.info("Inga kurser uppdaterades.")
+    # Stegvis pass 1 → 3
+    all_tickers = [str(t).strip().upper() for t in df["Ticker"].fillna("") if str(t).strip()]
 
+    st.sidebar.caption(f"🎯 Totala tickers: {len(all_tickers)}")
+    st.sidebar.caption(f"⏭️ Kandidater steg 2: {len(st.session_state.get('stage2_candidates', []))}")
+    st.sidebar.caption(f"⏭️ Kandidater steg 3: {len(st.session_state.get('stage3_candidates', []))}")
+
+    if st.sidebar.button("1) Kör SEC/Yahoo→Yahoo (alla)"):
+        df, pending2, log1, changed1 = process_auto_stage(df, all_tickers, stage=1, user_rates=user_rates, make_snapshot=make_snapshot)
+        st.session_state["stage2_candidates"] = pending2
+        st.session_state["last_stage_log"] = {"stage1": log1}
+
+    if st.sidebar.button("2) Kör Finnhub (kvarvarande)"):
+        tickers2 = st.session_state.get("stage2_candidates", all_tickers)
+        df, pending3, log2, changed2 = process_auto_stage(df, tickers2, stage=2, user_rates=user_rates, make_snapshot=make_snapshot)
+        st.session_state["stage3_candidates"] = pending3
+        # append logs
+        logs = st.session_state.get("last_stage_log", {})
+        logs["stage2"] = log2
+        st.session_state["last_stage_log"] = logs
+
+    if st.sidebar.button("3) Kör FMP light (kvarvarande)"):
+        tickers3 = st.session_state.get("stage3_candidates", st.session_state.get("stage2_candidates", all_tickers))
+        df, pending_done, log3, changed3 = process_auto_stage(df, tickers3, stage=3, user_rates=user_rates, make_snapshot=make_snapshot)
+        # final pending list (de som inte gick att uppdatera i steg 1–3)
+        st.session_state["stage3_candidates"] = pending_done
+        logs = st.session_state.get("last_stage_log", {})
+        logs["stage3"] = log3
+        st.session_state["last_stage_log"] = logs
+        if pending_done:
+            st.sidebar.warning(f"Kvar efter steg 3: {len(pending_done)} tickers som ev. kräver manuell hantering.")
+
+    if st.sidebar.button("🧹 Återställ körstatus"):
+        for k in ["stage2_candidates","stage3_candidates","last_stage_log","last_price_log","last_auto_log","fmp_block_until"]:
+            st.session_state.pop(k, None)
+        st.sidebar.success("Körstatus återställd.")
+
+    # -------------------------- Meny / Vyval -----------------------------------
     meny = st.sidebar.radio("📌 Välj vy", ["Kontroll","Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"])
 
     if meny == "Kontroll":
@@ -1927,13 +2074,14 @@ def main():
     elif meny == "Analys":
         analysvy(df, user_rates)
     elif meny == "Lägg till / uppdatera bolag":
-        df = lagg_till_eller_uppdatera(df, user_rates)
+        df = lagg_till_eller_uppdatera(df, user_rates, make_snapshot=make_snapshot)
     elif meny == "Investeringsförslag":
         df = uppdatera_berakningar(df, user_rates)
         visa_investeringsforslag(df, user_rates)
     elif meny == "Portfölj":
         df = uppdatera_berakningar(df, user_rates)
         visa_portfolj(df, user_rates)
+
 
 if __name__ == "__main__":
     main()

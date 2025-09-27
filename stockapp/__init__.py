@@ -1,6 +1,6 @@
 # stockapp/__init__.py
 """
-Håll paketets __init__ helt minimal för att undvika cirkulära importer.
-Importera INTE views här. Låt app.py importera från stockapp.views.
+Håll __init__ minimal för att undvika cirkulära importer.
+Importera inte views här – app.py importerar från stockapp.views.
 """
 __all__ = []

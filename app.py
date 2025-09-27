@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 
-# Vyer + Batch
+# ----- Vyer + Batch -----
 from stockapp.views import (
     kontrollvy, analysvy, lagg_till_eller_uppdatera, visa_investeringsforslag, visa_portfolj
 )
@@ -18,8 +18,9 @@ from stockapp.batch import sidebar_batch_controls
 try:
     from stockapp.calc import uppdatera_berakningar
 except Exception:
-    def uppdatera_berakningar(df, user_rates):  # minimal fallback
-        if "P/S Q1" in df and "P/S Q2" in df and "P/S Q3" in df and "P/S Q4" in df:
+    def uppdatera_berakningar(df, user_rates):
+        # Minimal fallback om calc-modulen inte laddas.
+        if {"P/S Q1","P/S Q2","P/S Q3","P/S Q4"}.issubset(df.columns):
             ps_cols = ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]
             vals = df[ps_cols].replace({None:0}).astype(float)
             df["P/S-snitt"] = vals[vals>0].mean(axis=1).fillna(0.0).round(2)
@@ -138,6 +139,9 @@ def spara_valutakurser(rates: dict):
     _with_backoff(ws.update, body)
 
 def hamta_valutakurser_auto():
+    """
+    Automatisk hämtning: Frankfurter → exchangerate.host. Fyller luckor med sparade/standard.
+    """
     misses = []
     rates = {}
     provider = None
@@ -271,7 +275,7 @@ def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME):
         st.warning(f"Misslyckades skapa snapshot-flik: {e}")
 
 # ------------------------------
-# SIDOPANEL: Valutakurser (säker)
+# SIDOPANEL: Valutakurser (callbacks)
 # ------------------------------
 def _sidebar_rates() -> dict:
     st.sidebar.header("💱 Valutakurser → SEK")
@@ -281,48 +285,57 @@ def _sidebar_rates() -> dict:
     if "rate_eur_input" not in st.session_state: st.session_state.rate_eur_input = STANDARD_VALUTAKURSER["EUR"]
     if "rate_cad_input" not in st.session_state: st.session_state.rate_cad_input = STANDARD_VALUTAKURSER["CAD"]
     if "rate_nok_input" not in st.session_state: st.session_state.rate_nok_input = STANDARD_VALUTAKURSER["NOK"]
+    if "rates_msg" not in st.session_state: st.session_state.rates_msg = ""
 
-    # widgets (bara key – inga direkta .value-assigns efter att widgets skapats)
+    # hjälpare för att sätta widget-state INNE I callbacks
+    def _set_rates_in_state(rates: dict):
+        st.session_state.rate_usd_input = float(rates.get("USD", st.session_state.rate_usd_input))
+        st.session_state.rate_eur_input = float(rates.get("EUR", st.session_state.rate_eur_input))
+        st.session_state.rate_cad_input = float(rates.get("CAD", st.session_state.rate_cad_input))
+        st.session_state.rate_nok_input = float(rates.get("NOK", st.session_state.rate_nok_input))
+
+    def _auto_rates_cb():
+        auto_rates, misses, provider = hamta_valutakurser_auto()
+        _set_rates_in_state(auto_rates)
+        msg = f"Valutakurser hämtade (källa: {provider})."
+        if misses:
+            msg += " Missar: " + ", ".join(misses)
+        st.session_state.rates_msg = msg
+
+    def _save_rates_cb():
+        rates = {
+            "USD": float(st.session_state.rate_usd_input),
+            "EUR": float(st.session_state.rate_eur_input),
+            "CAD": float(st.session_state.rate_cad_input),
+            "NOK": float(st.session_state.rate_nok_input),
+            "SEK": 1.0,
+        }
+        spara_valutakurser(rates)
+        st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
+        st.session_state.rates_msg = "Valutakurser sparade."
+
+    def _load_saved_cb():
+        saved = las_sparade_valutakurser()
+        _set_rates_in_state(saved)
+        st.session_state.rates_msg = "Sparade kurser laddade."
+
+    # widgets
     st.sidebar.number_input("USD → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_usd_input")
     st.sidebar.number_input("EUR → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_eur_input")
     st.sidebar.number_input("CAD → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_cad_input")
     st.sidebar.number_input("NOK → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_nok_input")
 
     col_rates1, col_rates2 = st.sidebar.columns(2)
-
     with col_rates1:
-        if st.button("🌐 Hämta kurser automatiskt"):
-            auto_rates, misses, provider = hamta_valutakurser_auto()
-            # uppdatera widget-state (tillåtet)
-            st.session_state.rate_usd_input = float(auto_rates.get("USD", st.session_state.rate_usd_input))
-            st.session_state.rate_eur_input = float(auto_rates.get("EUR", st.session_state.rate_eur_input))
-            st.session_state.rate_cad_input = float(auto_rates.get("CAD", st.session_state.rate_cad_input))
-            st.session_state.rate_nok_input = float(auto_rates.get("NOK", st.session_state.rate_nok_input))
-            st.sidebar.success(f"Valutakurser (källa: {provider}) hämtade.")
-            if misses:
-                st.sidebar.warning("Vissa par kunde inte hämtas:\n- " + "\n- ".join(misses))
-
+        st.button("🌐 Hämta kurser automatiskt", on_click=_auto_rates_cb)
     with col_rates2:
-        if st.button("💾 Spara kurser"):
-            rates = {
-                "USD": float(st.session_state.rate_usd_input),
-                "EUR": float(st.session_state.rate_eur_input),
-                "CAD": float(st.session_state.rate_cad_input),
-                "NOK": float(st.session_state.rate_nok_input),
-                "SEK": 1.0,
-            }
-            spara_valutakurser(rates)
-            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
-            st.sidebar.success("Valutakurser sparade.")
+        st.button("💾 Spara kurser", on_click=_save_rates_cb)
 
     st.sidebar.markdown("---")
-    if st.sidebar.button("↻ Läs om sparade kurser"):
-        saved = las_sparade_valutakurser()
-        st.session_state.rate_usd_input = float(saved.get("USD", st.session_state.rate_usd_input))
-        st.session_state.rate_eur_input = float(saved.get("EUR", st.session_state.rate_eur_input))
-        st.session_state.rate_cad_input = float(saved.get("CAD", st.session_state.rate_cad_input))
-        st.session_state.rate_nok_input = float(saved.get("NOK", st.session_state.rate_nok_input))
-        st.sidebar.success("Kurser laddade.")
+    st.sidebar.button("↻ Läs om sparade kurser", on_click=_load_saved_cb)
+
+    if st.session_state.rates_msg:
+        st.sidebar.info(st.session_state.rates_msg)
 
     return {
         "USD": float(st.session_state.rate_usd_input),
@@ -376,7 +389,10 @@ def main():
 
     # 5) Meny
     st.sidebar.markdown("---")
-    meny = st.sidebar.radio("📌 Välj vy", ["Kontroll","Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"])
+    meny = st.sidebar.radio(
+        "📌 Välj vy",
+        ["Kontroll","Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"]
+    )
 
     if meny == "Kontroll":
         kontrollvy(df)

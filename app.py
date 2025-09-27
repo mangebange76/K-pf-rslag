@@ -8,22 +8,32 @@ import time
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 
-# ----- Vyer + Batch -----
+# ----- Vyer + Batch + Runner -----
 from stockapp.views import (
     kontrollvy, analysvy, lagg_till_eller_uppdatera, visa_investeringsforslag, visa_portfolj
 )
 from stockapp.batch import sidebar_batch_controls
+from stockapp.sources import update_price_only_runner  # <-- standard-runnern (pris-only)
 
 # Om du har en calc-modul – använd den. Annars fallback.
 try:
     from stockapp.calc import uppdatera_berakningar
 except Exception:
     def uppdatera_berakningar(df, user_rates):
-        # Minimal fallback om calc-modulen inte laddas.
-        if {"P/S Q1","P/S Q2","P/S Q3","P/S Q4"}.issubset(df.columns):
-            ps_cols = ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]
-            vals = df[ps_cols].replace({None:0}).astype(float)
-            df["P/S-snitt"] = vals[vals>0].mean(axis=1).fillna(0.0).round(2)
+        """Minimal fallback: beräkna P/S-snitt = medel av positiva Q1–Q4."""
+        if df is None or df.empty:
+            return df
+        need = {"P/S Q1","P/S Q2","P/S Q3","P/S Q4"}
+        if need.issubset(df.columns):
+            vals = df[list(need)].replace({None:0}).astype(float)
+            # medel på rader > 0
+            def _row_mean_pos(row):
+                arr = [x for x in row.tolist() if x and x > 0]
+                return round(float(np.mean(arr)),2) if arr else 0.0
+            df["P/S-snitt"] = vals.apply(_row_mean_pos, axis=1)
+        else:
+            if "P/S-snitt" not in df.columns:
+                df["P/S-snitt"] = 0.0
         return df
 
 # --- Lokal Stockholm-tid om pytz finns (annars systemtid) ---
@@ -86,7 +96,7 @@ def hamta_data():
     return pd.DataFrame(data)
 
 def spara_data(df: pd.DataFrame, do_snapshot: bool = False):
-    """Skriv hela DataFrame till huvudbladet. (Snapshot valfritt – av som default i batch.)"""
+    """Skriv hela DataFrame till huvudbladet. (Snapshot valfritt – normalt False i batch.)"""
     if do_snapshot:
         try:
             backup_snapshot_sheet(df, base_sheet_name=SHEET_NAME)
@@ -287,7 +297,6 @@ def _sidebar_rates() -> dict:
     if "rate_nok_input" not in st.session_state: st.session_state.rate_nok_input = STANDARD_VALUTAKURSER["NOK"]
     if "rates_msg" not in st.session_state: st.session_state.rates_msg = ""
 
-    # hjälpare för att sätta widget-state INNE I callbacks
     def _set_rates_in_state(rates: dict):
         st.session_state.rate_usd_input = float(rates.get("USD", st.session_state.rate_usd_input))
         st.session_state.rate_eur_input = float(rates.get("EUR", st.session_state.rate_eur_input))
@@ -349,14 +358,19 @@ def _sidebar_rates() -> dict:
 # Sidopanel: Batch (koppling till batch-modul)
 # --------------------------------------------
 def _sidebar_batch_and_actions(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
-    # callbacks som batch-panelen använder
     def _save_cb(df_new: pd.DataFrame):
         spara_data(df_new, do_snapshot=False)
 
     def _recompute_cb(df_new: pd.DataFrame) -> pd.DataFrame:
         return uppdatera_berakningar(df_new, user_rates)
 
-    df_out = sidebar_batch_controls(df, user_rates, save_cb=_save_cb, recompute_cb=_recompute_cb)
+    df_out = sidebar_batch_controls(
+        df,
+        user_rates,
+        save_cb=_save_cb,
+        recompute_cb=_recompute_cb,
+        runner=st.session_state.get("run_update_for_ticker")  # <-- injicera runnern
+    )
     return df_out
 
 # -------------
@@ -384,6 +398,10 @@ def main():
     df = migrera_gamla_riktkurskolumner(df)
     df = konvertera_typer(df)
 
+    # >>> Registrera standard-runnern (pris-only) om ingen är satt
+    if "run_update_for_ticker" not in st.session_state:
+        st.session_state["run_update_for_ticker"] = update_price_only_runner
+
     # 4) Batch-panel i sidopanelen (kan returnera uppdaterat df)
     df = _sidebar_batch_and_actions(df, user_rates)
 
@@ -401,7 +419,6 @@ def main():
     elif meny == "Lägg till / uppdatera bolag":
         df2 = lagg_till_eller_uppdatera(df, user_rates)
         if df2 is not None and isinstance(df2, pd.DataFrame) and not df2.equals(df):
-            # Spara direkt om användaren ändrade och sparade
             spara_data(df2, do_snapshot=False)
             df = df2
     elif meny == "Investeringsförslag":

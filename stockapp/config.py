@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-from typing import Dict, List
 
-# TS-spårning
-TS_FIELDS: Dict[str, str] = {
+# --- TS-fält som ska tidsstämplas när de ändras/auto-uppdateras -------------
+TS_FIELDS = {
     "Utestående aktier": "TS_Utestående aktier",
     "P/S": "TS_P/S",
     "P/S Q1": "TS_P/S Q1",
@@ -13,48 +12,59 @@ TS_FIELDS: Dict[str, str] = {
     "Omsättning nästa år": "TS_Omsättning nästa år",
 }
 
-# Standardkolumner
-FINAL_COLS: List[str] = [
-    "Ticker","Bolagsnamn","Valuta","Aktuell kurs",
-    "Utestående aktier","Antal aktier","GAV SEK",
-    "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
-    "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
-    "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
-    "Årlig utdelning","CAGR 5 år (%)",
-    "Market Cap (valuta)","Market Cap (SEK)","MCAP Q1","MCAP Q2","MCAP Q3","MCAP Q4",
-    "Sector","Industry","Risklabel",
-    "Debt/Equity","Gross Margin (%)","Net Margin (%)",
+# --- Full kolumnlista som vi vill ha i databasen ----------------------------
+FINAL_COLS = [
+    # Grund
+    "Ticker", "Bolagsnamn", "Utestående aktier",
+    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+    "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+    "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+    "Antal aktier", "Valuta", "Årlig utdelning", "Aktuell kurs",
+    "CAGR 5 år (%)", "P/S-snitt",
+
+    # Extra nyckeltal
+    "Sector","Industry",
     "EV","EBITDA","EV/EBITDA",
-    "Cash & Equivalents","Free Cash Flow","FCF Margin (%)","Monthly Burn","Runway (quarters)",
-    "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa",
+    "Market Cap (valuta)","Market Cap (SEK)",
+    "Debt/Equity","Gross Margin (%)","Net Margin (%)",
+    "Cash & Equivalents","Free Cash Flow","FCF Margin (%)",
+    "Monthly Burn","Runway (quarters)",
+    "MCAP Q1","MCAP Q2","MCAP Q3","MCAP Q4",
+    "GAV SEK",  # användarens GAV i SEK
+
+    # Tidsstämplar & källor
+    "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa",
+
+    # TS-kolumner
     TS_FIELDS["Utestående aktier"],
     TS_FIELDS["P/S"], TS_FIELDS["P/S Q1"], TS_FIELDS["P/S Q2"], TS_FIELDS["P/S Q3"], TS_FIELDS["P/S Q4"],
     TS_FIELDS["Omsättning idag"], TS_FIELDS["Omsättning nästa år"],
 ]
 
-# Valutor (fallback)
-STANDARD_VALUTAKURSER = {"USD": 9.75, "NOK": 0.95, "CAD": 7.05, "EUR": 11.18, "SEK": 1.0}
+# Standard valutakurser (fallback/startvärden)
+STANDARD_VALUTAKURSER = {"USD": 10.00, "NOK": 1.0, "CAD": 7.5, "EUR": 11.0, "SEK": 1.0}
 
-# Risklabel band (i mcap, prisvaluta – visning formatters via utils)
-RISK_BANDS = [
-    ("Nano", 0, 50e6),
-    ("Micro", 50e6, 300e6),
-    ("Small", 300e6, 2e9),
-    ("Mid", 2e9, 10e9),
-    ("Large", 10e9, 200e9),
-    ("Mega", 200e9, 1e99),
-]
-
-# Scoring-vikter (default – sektorspecifika justeringar i scoring.py)
+# Scoring-vikter
 SCORING_WEIGHTS_GROWTH = {
-    "valuation": 0.35,
-    "growth":    0.35,
-    "quality":   0.20,
-    "safety":    0.10,
+    "valuation": 0.35,   # P/S-gap + riktkursgap
+    "growth":    0.30,   # CAGR
+    "quality":   0.20,   # marginaler
+    "safety":    0.15,   # runway, skuldsättning
 }
+
 SCORING_WEIGHTS_DIVIDEND = {
     "yield":     0.45,
-    "safety":    0.30,
-    "quality":   0.15,
-    "valuation": 0.10,
+    "safety":    0.30,   # payout mot FCF, D/E
+    "quality":   0.15,   # FCF-marginal
+    "valuation": 0.10,   # ps-gap
 }
+
+# Cap-klasser (SEK) – används för risklabel/filter
+CAP_BOUNDS_SEK = [
+    ("Nano",   0,            1e9),
+    ("Micro",  1e9,          3e9),
+    ("Small",  3e9,          30e9),
+    ("Mid",    30e9,         200e9),
+    ("Large",  200e9,        1000e9),
+    ("Mega",   1000e9,       9e12),
+]

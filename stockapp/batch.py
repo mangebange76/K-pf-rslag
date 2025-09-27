@@ -1,7 +1,8 @@
+# stockapp/batch.py
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # -----------------------------------
 # Hjälpare: hitta "äldst TS" per rad
@@ -15,11 +16,9 @@ def _parse_date_safe(s: str):
             return datetime.strptime(s, fmt)
         except Exception:
             continue
-    # Pandas sista chans
     try:
         d = pd.to_datetime(s, errors="coerce")
         if pd.notna(d):
-            # returnera naive datetime
             return d.to_pydatetime()
     except Exception:
         pass
@@ -35,7 +34,8 @@ def _oldest_ts_value(row: pd.Series):
     return min(dates) if dates else None
 
 def _add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+    if df is None or df.empty:
+        df = (df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame())
         df["_oldest_any_ts"] = pd.NaT
         df["_oldest_any_ts_fill"] = pd.Timestamp.max
         return df
@@ -49,13 +49,12 @@ def _add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
 # Plocka ordning för batch-listan
 # -----------------------------------
 def _pick_order(df: pd.DataFrame, sort_mode: str) -> pd.DataFrame:
-    if df.empty:
+    if df is None or df.empty:
         return df
     if sort_mode.startswith("Äldst"):
         work = _add_oldest_ts_col(df)
         return work.sort_values(by=["_oldest_any_ts_fill","Bolagsnamn","Ticker"])
     else:
-        # A–Ö på bolagsnamn, därefter ticker
         return df.sort_values(by=["Bolagsnamn","Ticker"])
 
 # -----------------------------------
@@ -72,8 +71,8 @@ def run_batch_update(df: pd.DataFrame,
     Kör en uppdatering på en lista tickers.
 
     - runner(df, ticker, user_rates) -> (df_updated, changed_fields|None, error|None)
-      Om runner saknas försöker vi anropa st.session_state["run_update_for_ticker"].
-      Finns inget → ingen faktisk uppdatering görs (endast recompute_cb).
+      Om runner saknas används st.session_state["run_update_for_ticker"].
+      Finns inget → ingen fetch görs (endast ev. recompute_cb/spara).
 
     - save_cb(df): spara till Sheets
     - recompute_cb(df) -> df: räkna om beräkningar (P/S-snitt etc)
@@ -111,7 +110,6 @@ def run_batch_update(df: pd.DataFrame,
             except Exception as e:
                 log["misses"][tkr_s] = [f"error: {e}"]
         else:
-            # ingen runner – hoppa över logiskt men tillämpa recompute
             log["misses"][tkr_s] = ["runner saknas (ingen fetch)"]
 
         pb.progress(i/total, text=f"Kör: {i}/{total}")
@@ -201,7 +199,7 @@ def sidebar_batch_controls(df: pd.DataFrame,
             df_new, log = run_batch_update(
                 df, user_rates, to_run,
                 make_snapshot=False,
-                runner=runner,  # ev. override
+                runner=runner if runner is not None else st.session_state.get("run_update_for_ticker"),
                 save_cb=save_cb,
                 recompute_cb=recompute_cb
             )

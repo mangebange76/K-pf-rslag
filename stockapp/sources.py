@@ -44,11 +44,9 @@ def _yahoo_last_price_currency_name(ticker: str):
         info = t.info or {}
     except Exception:
         info = {}
-
     px = _safe_float(info.get("regularMarketPrice"))
     cur = info.get("currency")
     nm = info.get("shortName") or info.get("longName")
-
     if px:
         return px, cur, nm
 
@@ -71,14 +69,12 @@ def update_price_only_runner(df: pd.DataFrame, ticker: str, user_rates: dict):
 
     - Uppdaterar 'Aktuell kurs' (och 'Valuta'/'Bolagsnamn' om vi hittar dem).
     - Sätter alltid 'Senast auto-uppdaterad' + 'Senast uppdaterad källa'.
-    - Returnerar 'Aktuell kurs' i changed_fields även om värdet är detsamma.
-
-    Parametern user_rates används ej här (men finns med för kompatibilitet).
+    - Returnerar 'Aktuell kurs' i changed_fields även om värdet är detsamma
+      (så batch-loggen inte blir "miss" i onödan).
     """
     if df is None or df.empty or "Ticker" not in df.columns:
         return df, [], f"Ingen data eller saknar kolumnen 'Ticker'."
 
-    # hitta raden
     mask = df["Ticker"].astype(str).str.upper() == str(ticker).strip().upper()
     idx_list = df.index[mask].tolist()
     if not idx_list:
@@ -93,21 +89,19 @@ def update_price_only_runner(df: pd.DataFrame, ticker: str, user_rates: dict):
 
     changed = []
 
-    # pris
+    # pris (räkna alltid som ändrat om vi fick ett pris)
     if price is not None and price > 0:
-        # alltid skriv + rapportera som ändrad
         df.at[ridx, "Aktuell kurs"] = float(price)
         changed.append("Aktuell kurs")
 
-    # valuta (om hittas)
-    if currency:
+    # valuta
+    if currency and "Valuta" in df.columns:
         cur_up = str(currency).upper()
-        if "Valuta" in df.columns:
-            if str(df.at[ridx, "Valuta"]).upper() != cur_up:
-                df.at[ridx, "Valuta"] = cur_up
-                changed.append("Valuta")
+        if str(df.at[ridx, "Valuta"]).upper() != cur_up:
+            df.at[ridx, "Valuta"] = cur_up
+            changed.append("Valuta")
 
-    # bolagsnamn (sätt bara om tomt eller annat)
+    # bolagsnamn
     if name and "Bolagsnamn" in df.columns:
         if str(df.at[ridx, "Bolagsnamn"]).strip() != str(name).strip():
             df.at[ridx, "Bolagsnamn"] = str(name).strip()
@@ -119,8 +113,6 @@ def update_price_only_runner(df: pd.DataFrame, ticker: str, user_rates: dict):
     if "Senast uppdaterad källa" in df.columns:
         df.at[ridx, "Senast uppdaterad källa"] = "Auto (Yahoo/yfinance: price-only)"
 
-    # om inget ändrades (t.ex. pris saknas), returnera en “miss”
     if not changed:
         return df, [], "Ingen ny kurs hittades."
-
     return df, changed, None

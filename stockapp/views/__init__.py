@@ -1,3 +1,4 @@
+# stockapp/views/__init__.py
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
@@ -12,7 +13,7 @@ def _fallback(name):
         return df
     return _view
 
-# Försök importera riktiga vyer
+# Försök importera riktiga vyer (om du redan har dem)
 try:
     from .analysis import analysvy  # noqa: F401
 except Exception:
@@ -60,18 +61,9 @@ try:
     from .control import kontrollvy  # noqa: F401
 except Exception:
     def kontrollvy(df, *args, **kwargs):
-        st.warning("Vyn 'Kontroll' saknas. Fallback visar de 20 äldsta TS (om finns TS_*-kolumner).")
+        st.warning("Vyn 'Kontroll' saknas. Fallback visar de 20 första raderna.")
         if isinstance(df, pd.DataFrame) and not df.empty:
-            ts_cols = [c for c in df.columns if str(c).startswith("TS_")]
-            if ts_cols:
-                work = df.copy()
-                def _pick_oldest(row):
-                    for c in ts_cols:
-                        v = row.get(c, "")
-                        return v
-                st.dataframe(work.head(20), use_container_width=True)
-            else:
-                st.dataframe(df.head(20), use_container_width=True)
+            st.dataframe(df.head(20), use_container_width=True)
         else:
             st.info("Ingen data att visa.")
         return df

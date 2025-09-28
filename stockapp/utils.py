@@ -1,231 +1,177 @@
 # stockapp/utils.py
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
 from typing import Optional, Dict, List
-from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 
-# ------------------------------------------------------------
-# Tidsstämplade fält (kolumn -> TS-kolumn)
-# ------------------------------------------------------------
-TS_FIELDS: Dict[str, str] = {
-    "Utestående aktier": "TS_Utestående aktier",
-    "P/S": "TS_P/S",
-    "P/S Q1": "TS_P/S Q1",
-    "P/S Q2": "TS_P/S Q2",
-    "P/S Q3": "TS_P/S Q3",
-    "P/S Q4": "TS_P/S Q4",
-    "Omsättning idag": "TS_Omsättning idag",
-    "Omsättning nästa år": "TS_Omsättning nästa år",
-}
+# Importera ditt kolumnschema
+try:
+    from .config import FINAL_COLS, TS_FIELDS
+except Exception:
+    # Fallback om config inte hunnit laddas i miljön ännu
+    FINAL_COLS = [
+        "Ticker", "Bolagsnamn", "Utestående aktier",
+        "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+        "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+        "Antal aktier", "Valuta", "Årlig utdelning", "Aktuell kurs",
+        "CAGR 5 år (%)", "P/S-snitt",
+        "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa",
+        "TS_Utestående aktier","TS_P/S","TS_P/S Q1","TS_P/S Q2","TS_P/S Q3","TS_P/S Q4",
+        "TS_Omsättning idag","TS_Omsättning nästa år"
+    ]
+    TS_FIELDS = {
+        "Utestående aktier":"TS_Utestående aktier",
+        "P/S":"TS_P/S","P/S Q1":"TS_P/S Q1","P/S Q2":"TS_P/S Q2","P/S Q3":"TS_P/S Q3","P/S Q4":"TS_P/S Q4",
+        "Omsättning idag":"TS_Omsättning idag","Omsättning nästa år":"TS_Omsättning nästa år",
+    }
 
-# ------------------------------------------------------------
-# Slutlig kolumnlista (minimikrav för appen)
-# Obs: fler kolumner kan finnas i databasen; appen klarar det.
-# ------------------------------------------------------------
-FINAL_COLS: List[str] = [
-    # Grund
-    "Ticker", "Bolagsnamn", "Utestående aktier",
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+# ----------------------------
+# Tid/nyttodelar (enkla)
+# ----------------------------
+def now_stamp() -> str:
+    try:
+        import pytz
+        from datetime import datetime
+        tz = pytz.timezone("Europe/Stockholm")
+        return datetime.now(tz).strftime("%Y-%m-%d")
+    except Exception:
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d")
+
+# ----------------------------
+# Schema & typer
+# ----------------------------
+_NUM_COLS = [
+    "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier", "Valuta", "Årlig utdelning", "Aktuell kurs",
-    "CAGR 5 år (%)", "P/S-snitt",
-
-    # Portfölj-relaterat
-    "GAV (SEK)",
-
-    # Tidsstämplar & källor
-    "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa",
-
-    # TS-kolumner (en per spårat fält)
-    TS_FIELDS["Utestående aktier"],
-    TS_FIELDS["P/S"], TS_FIELDS["P/S Q1"], TS_FIELDS["P/S Q2"], TS_FIELDS["P/S Q3"], TS_FIELDS["P/S Q4"],
-    TS_FIELDS["Omsättning idag"], TS_FIELDS["Omsättning nästa år"],
+    "Antal aktier", "Årlig utdelning", "Aktuell kurs", "CAGR 5 år (%)", "P/S-snitt"
 ]
 
-# ------------------------------------------------------------
-# Datum-hjälpare
-# ------------------------------------------------------------
-def _today_str() -> str:
-    # Appen kör i Stockholm; förenklad lokal tid utan pytz (ok för stämplar YYYY-MM-DD)
-    return datetime.now().strftime("%Y-%m-%d")
+_STR_COLS = ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa"]
 
-
-# ------------------------------------------------------------
-# Schemahjälpare
-# ------------------------------------------------------------
 def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Säkerställ att minimikolumner finns och fyll med rimliga defaultvärden.
-    Tar bort dubblett-kolumner och returnerar en kopia.
-    """
+    """Säkerställ att alla förväntade kolumner finns."""
     df = df.copy()
-
-    for kol in FINAL_COLS:
-        if kol not in df.columns:
-            # Numeriska default?
-            if any(x in kol.lower() for x in [
-                "kurs", "omsättning", "p/s", "utdelning", "cagr", "antal", "riktkurs", "aktier", "snitt", "gav", "mcap"
-            ]):
-                df[kol] = 0.0
-            elif kol.startswith("TS_"):
-                df[kol] = ""  # tidsstämplar
-            elif kol in ("Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa"):
-                df[kol] = ""
+    for c in FINAL_COLS:
+        if c not in df.columns:
+            if c.startswith("TS_") or c in _STR_COLS:
+                df[c] = ""
+            elif c in _NUM_COLS:
+                df[c] = 0.0
             else:
-                df[kol] = ""
-
-    # Ta bort dubbletter och behåll första
+                df[c] = ""
+    # Ta bort ev. duplikat-kolumner
     df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
 
-
-def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Migrera ev. äldre namn på riktkurskolumner till de nya.
-    """
-    df = df.copy()
-    mapping = {
-        "Riktkurs 2026": "Riktkurs om 1 år",
-        "Riktkurs 2027": "Riktkurs om 2 år",
-        "Riktkurs 2028": "Riktkurs om 3 år",
-        "Riktkurs om idag": "Riktkurs idag",
-    }
-    for old, new in mapping.items():
-        if old in df.columns:
-            if new not in df.columns:
-                df[new] = 0.0
-            new_vals = pd.to_numeric(df[new], errors="coerce").fillna(0.0)
-            old_vals = pd.to_numeric(df[old], errors="coerce").fillna(0.0)
-            mask = (new_vals == 0.0) & (old_vals > 0.0)
-            df.loc[mask, new] = old_vals[mask]
-            df = df.drop(columns=[old])
-    return df
-
-
 def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Säkerställ numeriska/sträng-typer enligt förväntan.
-    """
+    """Konvertera kolumn-typer defensivt."""
     df = df.copy()
-
-    num_cols = [
-        "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-        "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-        "Antal aktier", "Årlig utdelning", "Aktuell kurs", "CAGR 5 år (%)", "P/S-snitt",
-        "GAV (SEK)"
-    ]
-    for c in num_cols:
+    for c in _NUM_COLS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-
-    for c in ["Ticker", "Bolagsnamn", "Valuta", "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa"]:
+    for c in _STR_COLS:
         if c in df.columns:
             df[c] = df[c].astype(str)
-
     for c in df.columns:
         if str(c).startswith("TS_"):
             df[c] = df[c].astype(str)
-
     return df
 
-# ------------------------------------------------------------
-# Tidsstämplar – äldsta TS över spårade fält
-# ------------------------------------------------------------
+# ----------------------------
+# Äldsta TS-hjälp
+# ----------------------------
 def oldest_any_ts(row: pd.Series) -> Optional[pd.Timestamp]:
-    """
-    Returnerar äldsta (minsta) tidsstämpeln bland alla TS_-kolumner för en rad.
-    None om inga tidsstämplar finns eller ej parsbara.
-    """
     dates = []
     for c in TS_FIELDS.values():
         if c in row and str(row[c]).strip():
-            try:
-                d = pd.to_datetime(str(row[c]).strip(), errors="coerce")
-                if pd.notna(d):
-                    dates.append(d)
-            except Exception:
-                pass
+            d = pd.to_datetime(str(row[c]).strip(), errors="coerce")
+            if pd.notna(d):
+                dates.append(d)
     return min(dates) if dates else None
 
-
 def add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Lägger till hjälpkolumner:
-      - _oldest_any_ts (Timestamp eller NaT)
-      - _oldest_any_ts_fill (för sortering: NaT ersätts med framtidsdatum)
-    """
     df = df.copy()
     df["_oldest_any_ts"] = df.apply(oldest_any_ts, axis=1)
-    df["_oldest_any_ts"] = pd.to_datetime(df["_oldest_any_ts"], errors="coerce")
     df["_oldest_any_ts_fill"] = df["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
     return df
 
-# ------------------------------------------------------------
-# Beräkningar (P/S-snitt, riktkurser, framtida omsättning)
-# ------------------------------------------------------------
-def uppdatera_berakningar(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
+# ----------------------------
+# Kärnberäkningar (robusta)
+# ----------------------------
+def _num(v) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+def uppdatera_berakningar(df: pd.DataFrame, user_rates: Dict[str, float] | None = None) -> pd.DataFrame:
     """
-    Beräknar:
-      - P/S-snitt som snitt av positiva Q1–Q4
-      - Omsättning om 2 & 3 år från 'Omsättning nästa år' med CAGR clamp (>100% → 50%, <0% → 2%)
-      - Riktkurser (idag/1/2/3 år) utifrån P/S-snitt och Utestående aktier
-    Not: user_rates tas med för signaturkompatibilitet, används ej här.
+    Räknar:
+      - P/S-snitt = snitt av positiva P/S Q1–Q4
+      - Omsättning om 2 & 3 år från 'Omsättning nästa år' med CAGR clamp ( >100%→50%, <0%→2% )
+      - Riktkurser idag/1/2/3 = (Omsättning * P/S-snitt) / Utestående aktier
+    Robust mot saknade kolumner och konstiga typer.
     """
-    df = df.copy()
-    for i, rad in df.iterrows():
-        # P/S-snitt – använd endast positiva
-        ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
-        try:
-            ps_clean = [float(x) for x in ps_vals if pd.notna(x) and float(x) > 0]
-        except Exception:
-            ps_clean = []
+    df = ensure_schema(df)
+    df = konvertera_typer(df)
+
+    # Säkerställ kolumner som vi fyller
+    for c in ["P/S-snitt","Omsättning om 2 år","Omsättning om 3 år","Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"]:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    # Gå rad för rad
+    for i in range(len(df)):
+        # P/S-snitt
+        ps_vals = [
+            _num(df.at[i, "P/S Q1"]) if "P/S Q1" in df.columns else 0.0,
+            _num(df.at[i, "P/S Q2"]) if "P/S Q2" in df.columns else 0.0,
+            _num(df.at[i, "P/S Q3"]) if "P/S Q3" in df.columns else 0.0,
+            _num(df.at[i, "P/S Q4"]) if "P/S Q4" in df.columns else 0.0,
+        ]
+        ps_clean = [x for x in ps_vals if x and x > 0]
         ps_snitt = round(float(np.mean(ps_clean)), 2) if ps_clean else 0.0
         df.at[i, "P/S-snitt"] = ps_snitt
 
         # CAGR clamp
-        try:
-            cagr = float(rad.get("CAGR 5 år (%)", 0.0))
-        except Exception:
-            cagr = 0.0
-        just_cagr = 50.0 if cagr > 100.0 else (2.0 if cagr < 0.0 else cagr)
+        cagr = _num(df.at[i, "CAGR 5 år (%)"]) if "CAGR 5 år (%)" in df.columns else 0.0
+        if cagr > 100.0:
+            just_cagr = 50.0
+        elif cagr < 0.0:
+            just_cagr = 2.0
+        else:
+            just_cagr = cagr
         g = just_cagr / 100.0
 
-        # Omsättning om 2 & 3 år
-        try:
-            oms_next = float(rad.get("Omsättning nästa år", 0.0))
-        except Exception:
-            oms_next = 0.0
+        # Omsättningar
+        oms_next = _num(df.at[i, "Omsättning nästa år"]) if "Omsättning nästa år" in df.columns else 0.0
         if oms_next > 0:
             df.at[i, "Omsättning om 2 år"] = round(oms_next * (1.0 + g), 2)
             df.at[i, "Omsättning om 3 år"] = round(oms_next * ((1.0 + g) ** 2), 2)
         else:
-            # behåll befintliga om finns, annars 0
-            df.at[i, "Omsättning om 2 år"] = float(rad.get("Omsättning om 2 år", 0.0) or 0.0)
-            df.at[i, "Omsättning om 3 år"] = float(rad.get("Omsättning om 3 år", 0.0) or 0.0)
+            # Lämna ev. tidigare värden orörda (de är redan konverterade till numeriska)
+            pass
 
-        # Riktkurser – kräver Utestående aktier (miljoner) och P/S-snitt
-        try:
-            aktier_ut_milj = float(rad.get("Utestående aktier", 0.0))
-        except Exception:
-            aktier_ut_milj = 0.0
+        # Riktkurser
+        aktier_ut_m = _num(df.at[i, "Utestående aktier"]) if "Utestående aktier" in df.columns else 0.0  # i miljoner
+        # konvertera till styck om >0
+        aktier_ut = aktier_ut_m * 1e6 if aktier_ut_m > 0 else 0.0
 
-        if aktier_ut_milj > 0 and ps_snitt > 0:
-            denom = aktier_ut_milj  # omsättningar antas vara i "miljoner" i databasen
-            def _rk(val: float) -> float:
-                try:
-                    v = float(val)
-                    return round((v * ps_snitt) / denom, 2) if v > 0 else 0.0
-                except Exception:
-                    return 0.0
+        if aktier_ut > 0 and ps_snitt > 0:
+            oms_idag  = _num(df.at[i, "Omsättning idag"]) if "Omsättning idag" in df.columns else 0.0
+            oms_1     = _num(df.at[i, "Omsättning nästa år"]) if "Omsättning nästa år" in df.columns else 0.0
+            oms_2     = _num(df.at[i, "Omsättning om 2 år"]) if "Omsättning om 2 år" in df.columns else 0.0
+            oms_3     = _num(df.at[i, "Omsättning om 3 år"]) if "Omsättning om 3 år" in df.columns else 0.0
 
-            df.at[i, "Riktkurs idag"]    = _rk(rad.get("Omsättning idag", 0.0))
-            df.at[i, "Riktkurs om 1 år"] = _rk(rad.get("Omsättning nästa år", 0.0))
-            df.at[i, "Riktkurs om 2 år"] = _rk(df.at[i, "Omsättning om 2 år"])
-            df.at[i, "Riktkurs om 3 år"] = _rk(df.at[i, "Omsättning om 3 år"])
+            df.at[i, "Riktkurs idag"]    = round((oms_idag * ps_snitt) / aktier_ut, 4) if oms_idag > 0 else 0.0
+            df.at[i, "Riktkurs om 1 år"] = round((oms_1   * ps_snitt) / aktier_ut, 4) if oms_1   > 0 else 0.0
+            df.at[i, "Riktkurs om 2 år"] = round((oms_2   * ps_snitt) / aktier_ut, 4) if oms_2   > 0 else 0.0
+            df.at[i, "Riktkurs om 3 år"] = round((oms_3   * ps_snitt) / aktier_ut, 4) if oms_3   > 0 else 0.0
         else:
             df.at[i, "Riktkurs idag"] = 0.0
             df.at[i, "Riktkurs om 1 år"] = 0.0

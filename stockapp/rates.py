@@ -1,124 +1,124 @@
 # -*- coding: utf-8 -*-
-import requests
-import streamlit as st
-from .sheets import read_saved_rates, save_rates
-from .config import STANDARD_VALUTAKURSER
+from __future__ import annotations
 
-def _fetch_auto_rates():
+import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
+import requests
+
+from .utils import with_backoff
+
+# Egen flik för växelkurser
+RATES_SHEET_NAME = "Valutakurser"
+
+# Samma auth som i storage.py (secrets krävs)
+SHEET_URL = st.secrets["SHEET_URL"]
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
+client = gspread.authorize(credentials)
+
+STANDARD_VALUTAKURSER = {
+    "USD": 9.75,
+    "NOK": 0.95,
+    "CAD": 7.05,
+    "EUR": 11.18,
+    "SEK": 1.0,
+}
+
+def _get_spreadsheet():
+    return client.open_by_url(SHEET_URL)
+
+def _rates_ws():
+    ss = _get_spreadsheet()
+    try:
+        return ss.worksheet(RATES_SHEET_NAME)
+    except Exception:
+        ss.add_worksheet(title=RATES_SHEET_NAME, rows=10, cols=5)
+        ws = ss.worksheet(RATES_SHEET_NAME)
+        with_backoff(ws.update, [["Valuta","Kurs"]])
+        return ws
+
+def las_sparade_valutakurser() -> dict:
+    try:
+        ws = _rates_ws()
+        rows = with_backoff(ws.get_all_records)
+        out = {}
+        for r in rows:
+            cur = str(r.get("Valuta","")).upper().strip()
+            val = str(r.get("Kurs","")).replace(",", ".").strip()
+            try:
+                out[cur] = float(val)
+            except:
+                pass
+        return out
+    except Exception:
+        return {}
+
+def spara_valutakurser(rates: dict):
+    ws = _rates_ws()
+    body = [["Valuta","Kurs"]]
+    for k in ["USD","NOK","CAD","EUR","SEK"]:
+        v = rates.get(k, STANDARD_VALUTAKURSER.get(k, 1.0))
+        body.append([k, str(v)])
+    with_backoff(ws.clear)
+    with_backoff(ws.update, body)
+
+def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
+    if not valuta:
+        return 1.0
+    return float(user_rates.get(valuta.upper(), STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0)))
+
+def hamta_valutakurser_auto():
+    """
+    Försöker i tur och ordning: Frankfurter (ECB) → exchangerate.host.
+    Returnerar (rates, misses, provider).
+    """
     misses = []
     rates = {}
     provider = None
 
-    # 1) FMP (om key finns)
-    fmp_key = st.secrets.get("FMP_API_KEY", "")
-    if fmp_key:
+    # Frankfurter
+    provider = "Frankfurter"
+    for base_ccy in ("USD","EUR","CAD","NOK"):
         try:
-            base = st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
-            def _pair(pair):
-                url = f"{base}/api/v3/fx/{pair}"
-                r = requests.get(url, params={"apikey": fmp_key}, timeout=15)
-                if r.status_code != 200:
-                    return None, r.status_code
-                j = r.json() or {}
-                px = j.get("price")
-                return float(px) if px is not None else None, 200
-            provider = "FMP"
-            for pair in ("USDSEK","NOKSEK","CADSEK","EURSEK"):
-                v, sc = _pair(pair)
-                if v and v > 0: rates[pair[:3]] = float(v)
-                else: misses.append(f"{pair} (HTTP {sc if sc else '??'})")
+            r2 = requests.get("https://api.frankfurter.app/latest",
+                              params={"from": base_ccy, "to": "SEK"}, timeout=12)
+            if r2.status_code == 200:
+                rr = r2.json() or {}
+                v = (rr.get("rates") or {}).get("SEK")
+                if v:
+                    rates[base_ccy] = float(v)
+                else:
+                    misses.append(f"{base_ccy}SEK (Frankfurter)")
+            else:
+                misses.append(f"{base_ccy}SEK (HTTP {r2.status_code})")
         except Exception:
-            pass
+            misses.append(f"{base_ccy}SEK (Frankfurter fel)")
 
-    # 2) Frankfurter
-    if len(rates) < 4:
-        provider = "Frankfurter"
-        for base_ccy in ("USD","EUR","CAD","NOK"):
-            try:
-                r2 = requests.get("https://api.frankfurter.app/latest",
-                                  params={"from": base_ccy, "to": "SEK"}, timeout=10)
-                if r2.status_code == 200:
-                    v = (r2.json() or {}).get("rates", {}).get("SEK")
-                    if v: rates[base_ccy] = float(v)
-            except Exception:
-                pass
-
-    # 3) exchangerate.host
+    # exchangerate.host (fyll luckor)
     if len(rates) < 4:
         provider = "exchangerate.host"
         for base_ccy in ("USD","EUR","CAD","NOK"):
+            if base_ccy in rates: 
+                continue
             try:
                 r = requests.get("https://api.exchangerate.host/latest",
-                                 params={"base": base_ccy, "symbols": "SEK"}, timeout=10)
+                                 params={"base": base_ccy, "symbols": "SEK"}, timeout=12)
                 if r.status_code == 200:
                     v = (r.json() or {}).get("rates", {}).get("SEK")
-                    if v: rates[base_ccy] = float(v)
+                    if v:
+                        rates[base_ccy] = float(v)
+                    else:
+                        misses.append(f"{base_ccy}SEK (exchangerate.host)")
+                else:
+                    misses.append(f"{base_ccy}SEK (HTTP {r.status_code})")
             except Exception:
-                pass
+                misses.append(f"{base_ccy}SEK (exchangerate.host fel)")
 
-    # fyll luckor
-    saved = read_saved_rates()
+    # Fyll ev. luckor med sparat/standard
+    saved = las_sparade_valutakurser()
     for base_ccy in ("USD","EUR","CAD","NOK"):
         if base_ccy not in rates:
             rates[base_ccy] = float(saved.get(base_ccy, STANDARD_VALUTAKURSER.get(base_ccy, 1.0)))
 
     return rates, misses, (provider or "okänd")
-
-def sidebar_rates() -> dict:
-    st.sidebar.header("💱 Valutakurser → SEK")
-    saved = read_saved_rates()
-
-    # permanenta state
-    for k in ("USD","NOK","CAD","EUR"):
-        key = f"rate_{k.lower()}"
-        if key not in st.session_state:
-            st.session_state[key] = float(saved.get(k, STANDARD_VALUTAKURSER[k]))
-        key_in = f"{key}_input"
-        if key_in not in st.session_state:
-            st.session_state[key_in] = st.session_state[key]
-
-    info_msg = None; warn_list = None
-
-    # knappar FÖRE widgets
-    if st.sidebar.button("🌐 Hämta kurser automatiskt"):
-        auto_rates, misses, provider = _fetch_auto_rates()
-        for k in ("USD","NOK","CAD","EUR"):
-            st.session_state[f"rate_{k.lower()}_input"] = float(auto_rates.get(k, st.session_state[f"rate_{k.lower()}_input"]))
-        info_msg = f"Valutakurser uppdaterade (källa: {provider})."
-        warn_list = misses
-
-    if st.sidebar.button("↻ Läs sparade kurser"):
-        sr = read_saved_rates()
-        for k in ("USD","NOK","CAD","EUR"):
-            st.session_state[f"rate_{k.lower()}_input"] = float(sr.get(k, st.session_state[f"rate_{k.lower()}_input"]))
-        info_msg = "Läste sparade kurser."
-
-    if info_msg: st.sidebar.success(info_msg)
-    if warn_list: st.sidebar.warning("Kunde inte hämta:\n- " + "\n- ".join(warn_list))
-
-    # widgets (skapas efter ev. state-uppdateringar)
-    st.sidebar.number_input("USD → SEK", value=float(st.session_state.rate_usd_input), step=0.01, format="%.4f", key="rate_usd_input")
-    st.sidebar.number_input("NOK → SEK", value=float(st.session_state.rate_nok_input), step=0.01, format="%.4f", key="rate_nok_input")
-    st.sidebar.number_input("CAD → SEK", value=float(st.session_state.rate_cad_input), step=0.01, format="%.4f", key="rate_cad_input")
-    st.sidebar.number_input("EUR → SEK", value=float(st.session_state.rate_eur_input), step=0.01, format="%.4f", key="rate_eur_input")
-
-    if st.sidebar.button("💾 Spara kurser"):
-        for k in ("usd","nok","cad","eur"):
-            st.session_state[f"rate_{k}"] = float(st.session_state[f"rate_{k}_input"])
-        to_save = {
-            "USD": st.session_state.rate_usd,
-            "NOK": st.session_state.rate_nok,
-            "CAD": st.session_state.rate_cad,
-            "EUR": st.session_state.rate_eur,
-            "SEK": 1.0,
-        }
-        save_rates(to_save)
-        st.sidebar.success("Valutakurser sparade.")
-
-    return {
-        "USD": float(st.session_state.rate_usd_input),
-        "NOK": float(st.session_state.rate_nok_input),
-        "CAD": float(st.session_state.rate_cad_input),
-        "EUR": float(st.session_state.rate_eur_input),
-        "SEK": 1.0,
-    }

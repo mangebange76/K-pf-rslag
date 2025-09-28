@@ -1,6 +1,3 @@
-# stockapp/__init__.py
-"""
-Håll __init__ minimal för att undvika cirkulära importer.
-Importera inte views här – app.py importerar från stockapp.views.
-"""
-__all__ = []
+# -*- coding: utf-8 -*-
+# Gör katalogen till ett Python-paket.
+# Exporter valfria; vi håller detta minimalt för att undvika cirkulära imports.

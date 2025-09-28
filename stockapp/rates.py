@@ -1,3 +1,4 @@
+# stockapp/rates.py
 # -*- coding: utf-8 -*-
 """
 Valutafunktioner:
@@ -5,33 +6,49 @@ Valutafunktioner:
 - spara_valutakurser(rates)
 - hamta_valutakurser_auto()    (FMP -> Frankfurter -> exchangerate.host)
 - hamta_valutakurs(valuta, user_rates)
+Fristående: öppnar Google Sheet själv (ingen import från storage).
 """
 
 from __future__ import annotations
-import time
+from typing import Dict, Tuple, List
+
 import requests
 import streamlit as st
 
-from typing import Dict, Tuple, List
+# Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
 
-# Beroenden i ditt projekt
-from .config import STANDARD_VALUTAKURSER, RATES_SHEET_NAME  # STANDARD_VALUTAKURSER, "Valutakurser"
-from .storage import get_spreadsheet
+from .config import STANDARD_VALUTAKURSER, RATES_SHEET_NAME  # t.ex. "Valutakurser"
 from .utils import with_backoff
 
+
 # ---------------------------------------------------------------------
-# Hjälpare: hämta/skapaa "Valutakurser"-arket i samma Google Sheet
+# Lokal Sheets-koppling (fristående från storage)
 # ---------------------------------------------------------------------
+def _gspread_client():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
+    return gspread.authorize(credentials)
+
+def _get_spreadsheet():
+    client = _gspread_client()
+    return client.open_by_url(st.secrets["SHEET_URL"])
+
 def _get_rates_ws():
-    ss = get_spreadsheet()
+    """
+    Hämtar/Skapar arbetsbladet för valutakurser.
+    """
+    ss = _get_spreadsheet()
     try:
         return ss.worksheet(RATES_SHEET_NAME)
     except Exception:
-        # Skapa arket om det saknas
+        # Skapa bladet om det saknas
         ss.add_worksheet(title=RATES_SHEET_NAME, rows=50, cols=5)
         ws = ss.worksheet(RATES_SHEET_NAME)
         with_backoff(ws.update, [["Valuta", "Kurs"]])
         return ws
+
 
 # ---------------------------------------------------------------------
 # Publika API-funktioner

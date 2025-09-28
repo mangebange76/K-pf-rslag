@@ -87,6 +87,25 @@ def _save_df(df: pd.DataFrame, do_snapshot: bool = False):
     st.session_state["_df_ref"] = df
 
 
+def _normalize_runner_result_app(res, df_fallback: pd.DataFrame):
+    """Normalisera runner-retur i appens snabbknappar."""
+    df_out = df_fallback
+    changed = []
+    msg = ""
+    if isinstance(res, tuple):
+        if len(res) == 3:
+            df_out, changed, msg = res
+        elif len(res) == 2:
+            df_out, msg = res
+        elif len(res) == 1:
+            df_out = res[0]
+    elif isinstance(res, pd.DataFrame):
+        df_out = res
+    else:
+        msg = str(res)
+    return df_out, changed, msg
+
+
 # ============= Sidopanel: Valutor + Batch + Snabb-uppdatering ================
 
 def _sidebar_rates() -> dict:
@@ -96,8 +115,6 @@ def _sidebar_rates() -> dict:
     auto_click = st.sidebar.button("🌐 Hämta kurser automatiskt")
     if auto_click:
         auto_rates, misses, provider = hamta_valutakurser_auto()
-        # Uppdatera state-nycklar (de *är* widgetkeys, men vi sätter dem
-        # och gör en rerun direkt efter – säkert mönster i Streamlit)
         st.session_state.rate_usd_input = float(auto_rates.get("USD", st.session_state.rate_usd_input))
         st.session_state.rate_nok_input = float(auto_rates.get("NOK", st.session_state.rate_nok_input))
         st.session_state.rate_cad_input = float(auto_rates.get("CAD", st.session_state.rate_cad_input))
@@ -106,15 +123,21 @@ def _sidebar_rates() -> dict:
         st.session_state["_rates_misses"] = misses
         st.rerun()
 
-    usd = st.sidebar.number_input("USD → SEK", value=float(st.session_state.rate_usd_input), step=0.01, format="%.4f", key="rate_usd_input")
-    nok = st.sidebar.number_input("NOK → SEK", value=float(st.session_state.rate_nok_input), step=0.01, format="%.4f", key="rate_nok_input")
-    cad = st.sidebar.number_input("CAD → SEK", value=float(st.session_state.rate_cad_input), step=0.01, format="%.4f", key="rate_cad_input")
-    eur = st.sidebar.number_input("EUR → SEK", value=float(st.session_state.rate_eur_input), step=0.01, format="%.4f", key="rate_eur_input")
+    st.sidebar.number_input("USD → SEK", value=float(st.session_state.rate_usd_input), step=0.01, format="%.4f", key="rate_usd_input")
+    st.sidebar.number_input("NOK → SEK", value=float(st.session_state.rate_nok_input), step=0.01, format="%.4f", key="rate_nok_input")
+    st.sidebar.number_input("CAD → SEK", value=float(st.session_state.rate_cad_input), step=0.01, format="%.4f", key="rate_cad_input")
+    st.sidebar.number_input("EUR → SEK", value=float(st.session_state.rate_eur_input), step=0.01, format="%.4f", key="rate_eur_input")
 
     col_rates1, col_rates2 = st.sidebar.columns(2)
     with col_rates1:
         if st.button("💾 Spara kurser"):
-            to_save = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
+            to_save = {
+                "USD": float(st.session_state.rate_usd_input),
+                "NOK": float(st.session_state.rate_nok_input),
+                "CAD": float(st.session_state.rate_cad_input),
+                "EUR": float(st.session_state.rate_eur_input),
+                "SEK": 1.0
+            }
             spara_valutakurser(to_save)
             st.success("Valutakurser sparade.")
     with col_rates2:
@@ -152,7 +175,8 @@ def _sidebar_batch_and_actions(df: pd.DataFrame, user_rates: dict) -> pd.DataFra
             if not tkr:
                 st.sidebar.warning("Ange en ticker.")
             else:
-                df2, changed, msg = runner(df.copy(), user_rates, tkr)
+                res = runner(df.copy(), user_rates, tkr)
+                df2, changed, msg = _normalize_runner_result_app(res, df.copy())
                 _save_df(df2, do_snapshot=False)
                 if changed:
                     st.sidebar.success(msg)
@@ -165,7 +189,8 @@ def _sidebar_batch_and_actions(df: pd.DataFrame, user_rates: dict) -> pd.DataFra
             if not tkr:
                 st.sidebar.warning("Ange en ticker.")
             else:
-                df2, changed, msg = run_update_price_only(df.copy(), user_rates, tkr)
+                res = run_update_price_only(df.copy(), user_rates, tkr)
+                df2, changed, msg = _normalize_runner_result_app(res, df.copy())
                 _save_df(df2, do_snapshot=False)
                 if changed:
                     st.sidebar.success(msg)
@@ -175,17 +200,15 @@ def _sidebar_batch_and_actions(df: pd.DataFrame, user_rates: dict) -> pd.DataFra
     # Batchkontroller
     st.sidebar.markdown("---")
     st.sidebar.subheader("📦 Batch-körning")
-    # sidebar_batch_controls renderar UI och returnerar ev. uppdaterad df
-    # Vi skickar in runner så den vet vad den ska köra
+
     df_out = sidebar_batch_controls(
         df=df,
         user_rates=user_rates,
         save_cb=lambda d, snap: _save_df(d, do_snapshot=snap),
-        recompute_cb=None,   # runners sätter P/S-snitt själva; vill du central recompute, skicka funktion här
-        runner=runner        # viktigt: använd vald runner
+        recompute_cb=None,      # runners beräknar P/S-snitt själva; vill du räkna centralt, skicka funktion
+        runner=runner
     )
     if df_out is not None:
-        # Om batch-kontrollen returnerar en uppdaterad df, spara & lägg i state
         _save_df(df_out, do_snapshot=False)
         return df_out
     return df
@@ -211,9 +234,10 @@ def main():
 
     # Meny
     st.sidebar.markdown("---")
-    meny = st.sidebar.radio("📌 Välj vy", ["Kontroll","Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"], index=0)
+    meny = st.sidebar.radio("📌 Välj vy",
+                            ["Kontroll", "Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"], index=0)
 
-    # Visa vyer (de jobbar mot df i RAM; vyer som sparar data ska kalla spara_data via sina egna knappar)
+    # Visa vyer
     if meny == "Kontroll":
         kontrollvy(df)
     elif meny == "Analys":
@@ -228,7 +252,6 @@ def main():
     elif meny == "Portfölj":
         visa_portfolj(df, user_rates)
 
-    # Liten footer-info
     st.caption(f"Datablad: {SHEET_NAME} • Senast läst: {now_stamp()}")
 
 

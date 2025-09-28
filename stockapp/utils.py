@@ -1,159 +1,250 @@
+# stockapp/utils.py
 # -*- coding: utf-8 -*-
-import time
-from datetime import datetime, timedelta
+from __future__ import annotations
+
+from datetime import datetime
+from typing import List, Tuple, Optional, Dict
+
 import pandas as pd
 import numpy as np
-import requests
-import streamlit as st
 
-try:
-    import pytz
-    TZ = pytz.timezone("Europe/Stockholm")
-    def now_dt(): return datetime.now(TZ)
-except Exception:
-    def now_dt(): return datetime.now()
 
-def now_stamp() -> str:
-    return now_dt().strftime("%Y-%m-%d")
-
-def _ts_str(): return now_dt().strftime("%Y%m%d-%H%M%S")
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-def with_backoff(func, *args, **kwargs):
-    delays = [0, 0.4, 0.8, 1.6]
-    last = None
-    for d in delays:
-        if d: time.sleep(d)
+# ------------------------------------------------------------
+# Datum / tidsstämplar
+# ------------------------------------------------------------
+def safe_parse_date(x: str) -> Optional[pd.Timestamp]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m-%d %H:%M:%S"):
         try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            last = e
-    raise last
-
-def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
-    if not valuta: return 1.0
-    return float(user_rates.get(valuta.upper(), 1.0))
-
-def auto_rates_fetch():
-    """Frankfurter → exchangerate.host fallback."""
-    out = {}
-    try:
-        for base in ("USD","NOK","CAD","EUR"):
-            r = requests.get("https://api.frankfurter.app/latest",
-                             params={"from": base, "to": "SEK"}, timeout=12)
-            if r.status_code == 200:
-                v = (r.json() or {}).get("rates", {}).get("SEK")
-                if v: out[base] = float(v)
-    except Exception:
-        pass
-    if len(out) < 4:
-        try:
-            for base in ("USD","NOK","CAD","EUR"):
-                r = requests.get("https://api.exchangerate.host/latest",
-                                 params={"base": base, "symbols": "SEK"}, timeout=12)
-                if r.status_code == 200:
-                    v = (r.json() or {}).get("rates", {}).get("SEK")
-                    if v: out[base] = float(v)
+            return pd.to_datetime(datetime.strptime(s, fmt))
         except Exception:
             pass
+    try:
+        # sista utväg
+        return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        return None
+
+
+def add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
+    """Beräkna äldsta tidsstämpel bland alla TS_-kolumner."""
+    df = df.copy()
+    ts_cols = [c for c in df.columns if str(c).startswith("TS_")]
+    def _oldest(row):
+        ds = []
+        for c in ts_cols:
+            v = str(row.get(c, "")).strip()
+            if not v:
+                continue
+            d = safe_parse_date(v)
+            if d is not None and not pd.isna(d):
+                ds.append(d)
+        if not ds:
+            return pd.NaT
+        return min(ds)
+    df["_oldest_any_ts"] = df.apply(_oldest, axis=1)
+    df["_oldest_any_ts_fill"] = df["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
+    return df
+
+
+# ------------------------------------------------------------
+# Tickerhjälp + dubbletter
+# ------------------------------------------------------------
+def ensure_ticker_col(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim/upper Ticker och ta bort helt tomma rader."""
+    df = df.copy()
+    if "Ticker" not in df.columns:
+        df["Ticker"] = ""
+    df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
+    # sortera stabilt på Bolagsnamn, Ticker om de finns
+    sort_cols = [c for c in ["Bolagsnamn", "Ticker"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(by=sort_cols).reset_index(drop=True)
+    return df
+
+
+def find_duplicate_tickers(df: pd.DataFrame) -> pd.DataFrame:
+    """Returnera ev. dubbletter (Ticker) för användarvarning."""
+    if "Ticker" not in df.columns:
+        return pd.DataFrame(columns=["Ticker","count"])
+    s = df["Ticker"].astype(str).str.strip().str.upper()
+    grp = s.value_counts()
+    dups = grp[grp > 1]
+    if dups.empty:
+        return pd.DataFrame(columns=["Ticker","count"])
+    out = dups.rename_axis("Ticker").reset_index(name="count")
     return out
 
-def oldest_any_ts(row: pd.Series, ts_fields_map: dict) -> pd.Timestamp|None:
-    dates = []
-    for c in ts_fields_map.values():
-        if c in row and str(row[c]).strip():
-            try:
-                d = pd.to_datetime(str(row[c]).strip(), errors="coerce")
-                if pd.notna(d): dates.append(d)
-            except Exception:
-                pass
-    return min(dates) if dates else None
 
-def add_oldest_ts_col(df: pd.DataFrame, ts_fields_map: dict) -> pd.DataFrame:
-    work = df.copy()
-    work["_oldest_any_ts"] = work.apply(lambda r: oldest_any_ts(r, ts_fields_map), axis=1)
-    work["_oldest_any_ts"] = pd.to_datetime(work["_oldest_any_ts"], errors="coerce")
-    work["_oldest_any_ts_fill"] = work["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
-    return work
+# ------------------------------------------------------------
+# Formatering
+# ------------------------------------------------------------
+def human_money(x: float, unit: str = "", decimals: int = 2) -> str:
+    """
+    Snygg formattering av stora tal (market cap etc).
+    Ex: 4_250_000_000_000 -> '4.25 T' (trillion), 123_000_000_000 -> '123.00 B', 45_600_000 -> '45.6 M'
+    """
+    try:
+        v = float(x)
+    except Exception:
+        return f"0 {unit}".strip()
 
-def make_pretty_money(x: float, unit: str = "") -> str:
-    try: v = float(x)
-    except: return "-"
-    abs_v = abs(v)
-    if abs_v >= 1e12: s = f"{v/1e12:.2f} T"
-    elif abs_v >= 1e9: s = f"{v/1e9:.2f} B"
-    elif abs_v >= 1e6: s = f"{v/1e6:.2f} M"
-    else: s = f"{v:.0f}"
-    return f"{s} {unit}".strip()
+    sign = "-" if v < 0 else ""
+    v = abs(v)
 
-def risklabel_from_mcap_sek(mcap_sek: float) -> str:
-    from .config import CAP_BOUNDS_SEK
-    try: v = float(mcap_sek)
-    except: v = 0.0
-    for name, lo, hi in CAP_BOUNDS_SEK:
-        if lo <= v < hi: return name
-    return "Mega"
+    if v >= 1e12:
+        val, suf = v / 1e12, "T"
+    elif v >= 1e9:
+        val, suf = v / 1e9, "B"
+    elif v >= 1e6:
+        val, suf = v / 1e6, "M"
+    elif v >= 1e3:
+        val, suf = v / 1e3, "K"
+    else:
+        val, suf = v, ""
 
-def säkerställ_kolumner(df: pd.DataFrame, final_cols: list) -> pd.DataFrame:
+    if decimals is None:
+        s_val = f"{val}"
+    else:
+        s_val = f"{val:.{decimals}f}".rstrip("0").rstrip(".")
+
+    return f"{sign}{s_val} {suf}{(' ' + unit) if unit else ''}".strip()
+
+
+# ------------------------------------------------------------
+# P/S-snittsberäkning + riktkurser (robust)
+# ------------------------------------------------------------
+def compute_ps_average(row: pd.Series) -> float:
+    vals = []
+    for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]:
+        try:
+            v = float(row.get(k, 0.0))
+            if v > 0:
+                vals.append(v)
+        except Exception:
+            pass
+    if not vals:
+        try:
+            v = float(row.get("P/S", 0.0))
+            return round(v, 2) if v > 0 else 0.0
+        except Exception:
+            return 0.0
+    return round(float(np.mean(vals)), 2)
+
+
+def recompute_derived(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    - P/S-snitt = genomsnitt av Q1..Q4 (>0)
+    - Market Cap (nu) = Aktuell kurs * Utestående aktier(M) * 1e6
+    - Riktkurs* = (Omsättning* * P/S-snitt) / Utestående aktier(M)   (allt i samma valuta som 'Aktuell kurs')
+    - Runway (mån) heuristik = max(0, Kassa / max(1, |FCF TTM|/12))
+    """
+    if df.empty:
+        return df
     df = df.copy()
-    for kol in final_cols:
-        if kol not in df.columns:
-            if any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs","aktier","snitt","ev","cap","equity","margin","cash","flow","burn","runway","mcap","gav"]):
-                df[kol] = 0.0
-            elif kol.startswith("TS_"):
-                df[kol] = ""
-            elif kol in ("Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa","Sector","Industry"):
-                df[kol] = ""
-            else:
-                df[kol] = ""
-    # ta bort ev dubletter
-    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # P/S-snitt
+    df["P/S-snitt"] = df.apply(compute_ps_average, axis=1)
+
+    # Market cap (nu)
+    def _mcap(row):
+        try:
+            px = float(row.get("Aktuell kurs", 0.0))
+            shares_m = float(row.get("Utestående aktier", 0.0))  # i miljoner
+            return px * shares_m * 1e6 if px > 0 and shares_m > 0 else 0.0
+        except Exception:
+            return 0.0
+    df["Market Cap (nu)"] = df.apply(_mcap, axis=1)
+
+    # Riktkurser
+    def _target(rev, ps, sh_m):
+        try:
+            rev = float(rev); ps = float(ps); sh_m = float(sh_m)
+            if rev > 0 and ps > 0 and sh_m > 0:
+                return round((rev * ps) / sh_m, 2)
+            return 0.0
+        except Exception:
+            return 0.0
+
+    for col_src, col_tgt in [
+        ("Omsättning idag","Riktkurs idag"),
+        ("Omsättning nästa år","Riktkurs om 1 år"),
+        ("Omsättning om 2 år","Riktkurs om 2 år"),
+        ("Omsättning om 3 år","Riktkurs om 3 år"),
+    ]:
+        df[col_tgt] = [
+            _target(row.get(col_src, 0.0), row.get("P/S-snitt", 0.0), row.get("Utestående aktier", 0.0))
+            for _, row in df.iterrows()
+        ]
+
+    # Runway heuristik (mån)
+    def _runway(row):
+        try:
+            cash = float(row.get("Kassa (valuta)", 0.0))
+            fcf = float(row.get("FCF TTM (valuta)", 0.0))
+            if cash <= 0:
+                return 0.0
+            burn = abs(fcf) / 12.0 if fcf < 0 else 0.0
+            if burn <= 0:
+                # Ingen negativ FCF => "oändlig" runway … vi cappar till 999
+                return 999.0
+            return round(cash / burn, 1)
+        except Exception:
+            return 0.0
+
+    if "Runway (mån)" in df.columns:
+        df["Runway (mån)"] = [ _runway(row) for _, row in df.iterrows() ]
+
     return df
 
-def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
-    num_cols = [
-        "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-        "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-        "Antal aktier", "Årlig utdelning", "Aktuell kurs", "CAGR 5 år (%)", "P/S-snitt",
-        "EV","EBITDA","EV/EBITDA","Market Cap (valuta)","Market Cap (SEK)",
-        "Debt/Equity","Gross Margin (%)","Net Margin (%)",
-        "Cash & Equivalents","Free Cash Flow","FCF Margin (%)",
-        "Monthly Burn","Runway (quarters)","MCAP Q1","MCAP Q2","MCAP Q3","MCAP Q4",
-        "GAV SEK"
-    ]
-    df = df.copy()
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    for c in ["Ticker","Bolagsnamn","Valuta","Sector","Industry","Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-    for c in df.columns:
-        if str(c).startswith("TS_"):
-            df[c] = df[c].astype(str)
-    return df
 
-def build_requires_manual_df(df: pd.DataFrame, older_than_days: int, ts_map: dict) -> pd.DataFrame:
-    need_cols = ["Omsättning idag","Omsättning nästa år"]
-    ts_cols = [ts_map[c] for c in ts_map if c in need_cols]
-    out_rows = []
-    cutoff = now_dt() - timedelta(days=older_than_days)
+# ------------------------------------------------------------
+# Små utiliteter till vyer/batch
+# ------------------------------------------------------------
+def top_missing_by_ts(df: pd.DataFrame, fields: List[str], limit: int = 20) -> pd.DataFrame:
+    """
+    Returnera en lista över bolag där angivna fält INTE har TS_ eller där TS är äldst.
+    Sorterar på äldsta TS för dessa fält.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["Ticker","Bolagsnamn","Fält","TS"])
 
+    rows = []
     for _, r in df.iterrows():
-        missing_val = any((float(r.get(c, 0.0)) <= 0.0) for c in need_cols)
-        missing_ts  = any((not str(r.get(ts, "")).strip()) for ts in ts_cols if ts in r)
-        oldest = oldest_any_ts(r, ts_map)
-        oldest_dt = pd.to_datetime(oldest).to_pydatetime() if pd.notna(oldest) else None
-        too_old = (oldest_dt is not None and oldest_dt < cutoff)
-
-        if missing_val or missing_ts or too_old:
-            out_rows.append({
+        for f in fields:
+            ts_col = f"TS_{f}"
+            ts_val = str(r.get(ts_col, "")).strip()
+            d = safe_parse_date(ts_val)
+            rows.append({
                 "Ticker": r.get("Ticker",""),
                 "Bolagsnamn": r.get("Bolagsnamn",""),
-                "TS_Omsättning idag": r.get(ts_map["Omsättning idag"], ""),
-                "TS_Omsättning nästa år": r.get(ts_map["Omsättning nästa år"], ""),
+                "Fält": f,
+                "TS": d if d is not None else pd.NaT
             })
-    return pd.DataFrame(out_rows)
+    out = pd.DataFrame(rows)
+    out = out.sort_values(by=["TS","Bolagsnamn"]).head(limit)
+    return out
+
+
+def ps_consistency_flag(row: pd.Series) -> str:
+    """
+    En enkel sanity-check-flaggning för extrema P/S.
+    """
+    try:
+        ps = float(row.get("P/S", 0.0))
+        psn = float(row.get("P/S-snitt", 0.0))
+    except Exception:
+        return "?"
+    vals = [v for v in [ps, psn] if v and v > 0]
+    if not vals:
+        return "?"
+    mx = max(vals)
+    if mx > 1e4:
+        return "⚠️ extrem"
+    if mx > 200:
+        return "⚠️ hög"
+    return "ok"

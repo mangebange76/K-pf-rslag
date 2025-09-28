@@ -1,131 +1,135 @@
+# stockapp/sources.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import math
+from typing import List, Tuple, Dict, Optional
+
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, date
 import yfinance as yf
 
-from .config import TS_FIELDS, MANUELL_FALT_FOR_DATUM
+from .config import TS_FIELDS
+from .utils import now_stamp
 
-# ====== Små helpers ==========================================================
+# ---------------------------------------------------------------------
+# Hjälpmetoder för uppdatering & stämpling
+# ---------------------------------------------------------------------
 
-def _now_date_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+AUTO_SOURCE_PRICE = "Auto (yfinance: price/basic)"
+AUTO_SOURCE_FULL  = "Auto (yfinance: price+financials)"
 
-def _find_row_index(df: pd.DataFrame, ticker: str):
-    mask = (df["Ticker"].astype(str).str.upper() == str(ticker).upper())
-    idxs = df.index[mask].tolist()
-    return idxs[0] if idxs else None
-
-def _stamp_ts(df: pd.DataFrame, ridx: int, field: str, when: str | None = None):
+def _stamp_ts(df: pd.DataFrame, row_idx: int, field: str, date_str: Optional[str] = None):
+    """Sätt TS-kolumn för ett spårat fält om det finns i TS_FIELDS."""
     ts_col = TS_FIELDS.get(field)
-    if ts_col and ts_col in df.columns:
-        df.at[ridx, ts_col] = when or _now_date_str()
+    if not ts_col:
+        return
+    try:
+        df.at[row_idx, ts_col] = date_str or now_stamp()
+    except Exception:
+        pass
 
-def _note_auto(df: pd.DataFrame, ridx: int, source: str):
-    if "Senast auto-uppdaterad" in df.columns:
-        df.at[ridx, "Senast auto-uppdaterad"] = _now_date_str()
-    if "Senast uppdaterad källa" in df.columns:
-        df.at[ridx, "Senast uppdaterad källa"] = source
+def _note_auto_update(df: pd.DataFrame, row_idx: int, source: str):
+    """Uppdatera 'Senast auto-uppdaterad' & 'Senast uppdaterad källa'."""
+    try:
+        df.at[row_idx, "Senast auto-uppdaterad"] = now_stamp()
+        df.at[row_idx, "Senast uppdaterad källa"] = source
+    except Exception:
+        pass
 
-def _safe_float(x, default=0.0):
+def _safe_set(df: pd.DataFrame, row_idx: int, field: str, value, changed: List[str], force_stamp: bool = True):
+    """
+    Sätt fältet, registrera 'changed' om värdet faktiskt ändras.
+    TS stämplas alltid (force_stamp=True), även om värdet inte ändras – enligt din preferens.
+    """
+    if field not in df.columns:
+        return
+    old = df.at[row_idx, field]
+    same = False
+    try:
+        same = (pd.isna(old) and pd.isna(value)) or (str(old) == str(value))
+    except Exception:
+        same = False
+
+    df.at[row_idx, field] = value
+    if not same:
+        changed.append(field)
+
+    if force_stamp and field in TS_FIELDS:
+        _stamp_ts(df, row_idx, field)
+
+def _coerce_float(x, default=0.0) -> float:
     try:
         return float(x)
     except Exception:
-        return default
+        return float(default)
 
-def _fmt_changes(changed: list[str]) -> str:
-    return ", ".join(changed) if changed else "inga fält"
+def _mean_pos(values: List[float]) -> float:
+    clean = [float(v) for v in values if _coerce_float(v, 0.0) > 0]
+    return round(float(np.mean(clean)), 2) if clean else 0.0
 
-# ====== Yahoo helpers ========================================================
+# ---------------------------------------------------------------------
+# yfinance-hjälpare
+# ---------------------------------------------------------------------
 
-def _yfi_info(tkr: yf.Ticker) -> dict:
+def _yfi_info(ticker: str) -> dict:
     try:
-        return tkr.info or {}
+        return yf.Ticker(ticker).info or {}
     except Exception:
         return {}
 
-def _yfi_price_currency_name_div(ticker: str) -> dict:
-    out = {"Aktuell kurs": 0.0, "Valuta": "USD", "Bolagsnamn": "", "Årlig utdelning": 0.0}
+def _yfi_history_close_on_or_before(ticker: str, date: pd.Timestamp) -> Optional[float]:
+    """Hämta dagsstängning på eller närmast FÖRE 'date'."""
+    try:
+        start = (pd.to_datetime(date) - pd.Timedelta(days=30)).date()
+        end   = (pd.to_datetime(date) + pd.Timedelta(days=2)).date()
+        hist = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
+        if hist is None or hist.empty:
+            return None
+        hist = hist.sort_index()
+        idx_dates = list(hist.index.date)
+        closes = list(hist["Close"].values)
+        for j in range(len(idx_dates)-1, -1, -1):
+            if idx_dates[j] <= pd.to_datetime(date).date():
+                try:
+                    return float(closes[j])
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+def _yfi_quarterly_revenue_rows(ticker: str) -> List[Tuple[pd.Timestamp, float]]:
+    """
+    Läser quarterly_financials och letar efter en rad som motsvarar 'Total Revenue' eller motsv.
+    Returnerar [(period_end, revenue_value), ...] sorterat nyast→äldst.
+    """
     t = yf.Ticker(ticker)
-
-    info = _yfi_info(t)
-    # Price
-    px = info.get("regularMarketPrice")
-    if px is None:
-        try:
-            h = t.history(period="1d")
-            if not h.empty and "Close" in h.columns:
-                px = float(h["Close"].iloc[-1])
-        except Exception:
-            px = None
-    if px is not None:
-        out["Aktuell kurs"] = _safe_float(px, 0.0)
-
-    # Currency & name
-    ccy = info.get("currency") or "USD"
-    out["Valuta"] = str(ccy).upper()
-    out["Bolagsnamn"] = info.get("shortName") or info.get("longName") or ""
-
-    # Dividend (annualized)
-    div_rate = info.get("dividendRate")
-    if div_rate is not None:
-        out["Årlig utdelning"] = _safe_float(div_rate, 0.0)
-
-    return out
-
-def _yfi_marketcap_and_shares(ticker: str, price_hint: float | None = None) -> tuple[float, float]:
-    """Return (market_cap, shares) in absolute units (shares in *pieces*)."""
-    t = yf.Ticker(ticker)
-    info = _yfi_info(t)
-
-    mcap = _safe_float(info.get("marketCap"), 0.0)
-    # implied shares from mcap/price if needed
-    px = price_hint if price_hint is not None else _safe_float(info.get("regularMarketPrice"), 0.0)
-
-    shares = 0.0
-    so = _safe_float(info.get("sharesOutstanding"), 0.0)
-    if so > 0:
-        shares = so
-    elif mcap > 0 and px > 0:
-        shares = mcap / px
-
-    # If mcap missing but we have shares+price, compute
-    if mcap <= 0 and shares > 0 and px > 0:
-        mcap = shares * px
-
-    return mcap, shares
-
-def _quarterly_revenue_rows(ticker: str) -> list[tuple[date, float]]:
-    """[(period_end_date, revenue)], newest→oldest"""
-    t = yf.Ticker(ticker)
-
-    # Preferred: quarterly_financials
+    # 1) quarterly_financials
     try:
         qf = t.quarterly_financials
         if isinstance(qf, pd.DataFrame) and not qf.empty:
-            # try several revenue row names
-            for key in [
-                "Total Revenue", "TotalRevenue", "Revenues", "Revenue",
-                "Sales", "Revenues from contracts with customers"
-            ]:
-                if key in qf.index:
+            idx = [str(x).strip() for x in qf.index]
+            cand_rows = [
+                "Total Revenue","TotalRevenue","Revenues","Revenue","Sales",
+                "Total revenue","Revenues from contracts with customers"
+            ]
+            for key in cand_rows:
+                if key in idx:
                     row = qf.loc[key].dropna()
                     out = []
                     for c, v in row.items():
                         try:
-                            d = c.date() if hasattr(c, "date") else pd.to_datetime(c).date()
-                            out.append((d, _safe_float(v, 0.0)))
+                            d = (c.to_pydatetime() if hasattr(c, "to_pydatetime") else pd.to_datetime(c)).normalize()
+                            out.append((d, float(v)))
                         except Exception:
                             pass
                     out.sort(key=lambda x: x[0], reverse=True)
-                    if out:
-                        return out
+                    return out
     except Exception:
         pass
 
-    # Fallback: income_stmt (quarterly-flavored in some yfinance versions)
+    # 2) fallback: income_stmt quarterly via v1-api (kan ibland finnas)
     try:
         df_is = getattr(t, "income_stmt", None)
         if isinstance(df_is, pd.DataFrame) and not df_is.empty and "Total Revenue" in df_is.index:
@@ -133,21 +137,23 @@ def _quarterly_revenue_rows(ticker: str) -> list[tuple[date, float]]:
             out = []
             for c, v in ser.items():
                 try:
-                    d = c.date() if hasattr(c, "date") else pd.to_datetime(c).date()
-                    out.append((d, _safe_float(v, 0.0)))
+                    d = (c.to_pydatetime() if hasattr(c, "to_pydatetime") else pd.to_datetime(c)).normalize()
+                    out.append((d, float(v)))
                 except Exception:
                     pass
             out.sort(key=lambda x: x[0], reverse=True)
-            if out:
-                return out
+            return out
     except Exception:
         pass
 
     return []
 
-def _ttm_windows(values: list[tuple[date, float]], need: int = 4) -> list[tuple[date, float]]:
-    """values is [(end_date, quarterly_val)] newest→oldest; build up to `need` TTM sums."""
-    out = []
+def _ttm_windows(values: List[Tuple[pd.Timestamp, float]], need: int = 4) -> List[Tuple[pd.Timestamp, float]]:
+    """
+    Ta [(end_date, q_rev), ...] (nyast→äldst) och bygg TTM-summor:
+    [(end_date0, ttm0), (end_date1, ttm1), ...] där ttm0 = q0+q1+q2+q3, ttm1 = q1+q2+q3+q4, osv.
+    """
+    out: List[Tuple[pd.Timestamp, float]] = []
     if len(values) < 4:
         return out
     for i in range(0, min(need, len(values) - 3)):
@@ -156,152 +162,224 @@ def _ttm_windows(values: list[tuple[date, float]], need: int = 4) -> list[tuple[
         out.append((end_i, float(ttm_i)))
     return out
 
-def _prices_on_or_before(ticker: str, dates: list[date]) -> dict[date, float]:
-    """Get Close on or before each date."""
-    if not dates:
-        return {}
-    dmin = min(dates) - timedelta(days=14)
-    dmax = max(dates) + timedelta(days=2)
-    try:
-        t = yf.Ticker(ticker)
-        hist = t.history(start=dmin, end=dmax, interval="1d")
-        if hist is None or hist.empty:
-            return {}
-        hist = hist.sort_index()
-        idx_dates = list(hist.index.date)
-        closes = list(hist["Close"].values)
-        out = {}
-        for d in dates:
-            px = None
-            for j in range(len(idx_dates) - 1, -1, -1):
-                if idx_dates[j] <= d:
-                    try:
-                        px = float(closes[j])
-                    except Exception:
-                        px = None
-                    break
-            if px is not None:
-                out[d] = px
-        return out
-    except Exception:
-        return {}
+# ---------------------------------------------------------------------
+# Härledda beräkningar (per rad)
+# ---------------------------------------------------------------------
 
-# ====== Public runners =======================================================
-
-def run_update_price_only(df: pd.DataFrame, user_rates: dict, ticker: str):
+def _recompute_row_derivatives(df: pd.DataFrame, ridx: int):
     """
-    Minimal runner: uppdaterar endast Aktuell kurs (+ namn/valuta om saknas),
-    stämplar 'Senast auto-uppdaterad' och källa. Returnerar (df, message).
+    Beräkna P/S-snitt från Q1..Q4 samt riktkurser idag/1/2/3 för just denna rad.
+    Antar att:
+      - 'Omsättning idag' / 'Omsättning nästa år' är i miljoner (bolagets valuta)
+      - 'Utestående aktier' är i miljoner
     """
-    ridx = _find_row_index(df, ticker)
-    if ridx is None:
-        return df, f"{ticker}: hittades inte i tabellen."
+    ps_q = [df.at[ridx, c] if c in df.columns else 0.0 for c in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]]
+    ps_avg = _mean_pos([_coerce_float(x, 0.0) for x in ps_q])
+    df.at[ridx, "P/S-snitt"] = ps_avg
 
-    base = _yfi_price_currency_name_div(ticker)
-    changed = []
+    shares_m = _coerce_float(df.at[ridx, "Utestående aktier"], 0.0)
+    if shares_m <= 0 or ps_avg <= 0:
+        # kan inte räkna riktkurser utan dessa
+        for c in ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"]:
+            if c in df.columns:
+                df.at[ridx, c] = 0.0
+        return
 
-    # Always stamp even if same value (per your policy)
-    for k in ["Aktuell kurs", "Bolagsnamn", "Valuta", "Årlig utdelning"]:
-        if k in df.columns and base.get(k) is not None:
-            try:
-                before = df.at[ridx, k]
-            except Exception:
-                before = None
-            df.at[ridx, k] = base[k]
-            if str(before) != str(base[k]):
-                changed.append(k)
+    # Omsättning (M)
+    rev_today_m   = _coerce_float(df.at[ridx, "Omsättning idag"], 0.0)
+    rev_next_m    = _coerce_float(df.at[ridx, "Omsättning nästa år"], 0.0)
+    rev_2y_m      = _coerce_float(df.at[ridx, "Omsättning om 2 år"], 0.0)
+    rev_3y_m      = _coerce_float(df.at[ridx, "Omsättning om 3 år"], 0.0)
 
-    _note_auto(df, ridx, source="Pris (Yahoo)")
-    return df, f"{ticker}: uppdaterade { _fmt_changes(changed) }."
+    # Fyll 2y/3y om tomt med enkel CAGR clamp från 'CAGR 5 år (%)'
+    if rev_next_m > 0 and (rev_2y_m <= 0 or rev_3y_m <= 0):
+        cagr = _coerce_float(df.at[ridx, "CAGR 5 år (%)"], 0.0)
+        if cagr > 100.0:
+            cagr = 50.0
+        if cagr < 0.0:
+            cagr = 2.0
+        g = cagr / 100.0
+        if rev_2y_m <= 0:
+            rev_2y_m = round(rev_next_m * (1.0 + g), 2)
+            df.at[ridx, "Omsättning om 2 år"] = rev_2y_m
+        if rev_3y_m <= 0:
+            rev_3y_m = round(rev_next_m * ((1.0 + g) ** 2), 2)
+            df.at[ridx, "Omsättning om 3 år"] = rev_3y_m
 
-def run_update_full(df: pd.DataFrame, user_rates: dict, ticker: str, force_stamp: bool = True):
+    # Riktkurser (enklare PS-modell)
+    def _px(rev_m):  # alla i miljoner → pris i samma valuta
+        if rev_m > 0:
+            return round((rev_m * ps_avg) / shares_m, 2)
+        return 0.0
+
+    if "Riktkurs idag" in df.columns:    df.at[ridx, "Riktkurs idag"]    = _px(rev_today_m)
+    if "Riktkurs om 1 år" in df.columns: df.at[ridx, "Riktkurs om 1 år"] = _px(rev_next_m)
+    if "Riktkurs om 2 år" in df.columns: df.at[ridx, "Riktkurs om 2 år"] = _px(rev_2y_m)
+    if "Riktkurs om 3 år" in df.columns: df.at[ridx, "Riktkurs om 3 år"] = _px(rev_3y_m)
+
+# ---------------------------------------------------------------------
+# Runners
+# ---------------------------------------------------------------------
+
+def run_update_price_only(df: pd.DataFrame, user_rates: Dict[str, float], ticker: str, **kwargs) -> Tuple[pd.DataFrame, List[str], str]:
     """
-    Full runner (Yahoo-baserad, gratis): uppdaterar pris, namn, valuta, utdelning,
-    utestående aktier (implied), P/S (TTM) nu och P/S Q1–Q4 (senaste 4 kvartalens TTM),
-    P/S-snitt. Lämnar 'Omsättning idag/nästa år' orörda (manuell policy).
-    Stämplar TS även om värdet inte ändrats om force_stamp=True.
+    Hämtar pris/namn/valuta/utdelning/marketcap/aktier från yfinance och uppdaterar en rad.
+    Returnerar (df, changed_fields, message).
     """
-    ridx = _find_row_index(df, ticker)
-    if ridx is None:
-        return df, f"{ticker}: hittades inte i tabellen."
+    tkr = (ticker or "").strip().upper()
+    if not tkr:
+        return df, [], "Ingen ticker angiven."
 
-    base = _yfi_price_currency_name_div(ticker)
-    px = float(base.get("Aktuell kurs", 0.0))
-    mcap_now, shares_abs = _yfi_marketcap_and_shares(ticker, price_hint=px)
+    if "Ticker" not in df.columns or tkr not in set(df["Ticker"].astype(str).str.upper()):
+        return df, [], f"{tkr} hittades inte i tabellen."
 
-    # Sätt basfält
-    changed = []
-    for k in ["Aktuell kurs", "Bolagsnamn", "Valuta", "Årlig utdelning"]:
-        if k in df.columns and base.get(k) is not None:
-            before = df.at[ridx, k] if k in df.columns else None
-            df.at[ridx, k] = base[k]
-            if str(before) != str(base[k]):
-                changed.append(k)
+    ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
+    changed: List[str] = []
 
-    # Utestående aktier (miljoner)
-    if shares_abs > 0 and "Utestående aktier" in df.columns:
-        before = df.at[ridx, "Utestående aktier"]
-        df.at[ridx, "Utestående aktier"] = round(shares_abs / 1e6, 6)
-        if force_stamp:
-            _stamp_ts(df, ridx, "Utestående aktier")
-        elif _safe_float(before) != _safe_float(df.at[ridx, "Utestående aktier"]):
-            _stamp_ts(df, ridx, "Utestående aktier")
-        if str(before) != str(df.at[ridx, "Utestående aktier"]):
-            changed.append("Utestående aktier")
+    info = _yfi_info(tkr)
+    # price
+    price = info.get("regularMarketPrice")
+    if price is None:
+        try:
+            h = yf.Ticker(tkr).history(period="1d")
+            if not h.empty and "Close" in h:
+                price = float(h["Close"].iloc[-1])
+        except Exception:
+            price = None
+    if price is not None and price > 0:
+        _safe_set(df, ridx, "Aktuell kurs", float(price), changed)
 
-    # P/S nu + historik
-    q_rows = _quarterly_revenue_rows(ticker)
-    ps_fields_changed = []
-    if q_rows:
-        ttm_list = _ttm_windows(q_rows, need=4)  # list[(end_date, ttm)]
-        # Historiska priser på kvartals-slut
-        q_dates = [d for (d, _) in ttm_list]
-        px_map = _prices_on_or_before(ticker, q_dates)
+    # name
+    name = info.get("shortName") or info.get("longName")
+    if name:
+        _safe_set(df, ridx, "Bolagsnamn", str(name), changed, force_stamp=False)  # ingen TS för namn
 
-        # P/S now (TTM0) med market cap nu
-        if mcap_now > 0 and ttm_list:
-            ttm0 = float(ttm_list[0][1])
-            if ttm0 > 0 and "P/S" in df.columns:
-                before = df.at[ridx, "P/S"]
-                df.at[ridx, "P/S"] = float(mcap_now) / float(ttm0)
-                if force_stamp:
-                    _stamp_ts(df, ridx, "P/S")
-                elif _safe_float(before) != _safe_float(df.at[ridx, "P/S"]):
-                    _stamp_ts(df, ridx, "P/S")
-                if str(before) != str(df.at[ridx, "P/S"]):
-                    ps_fields_changed.append("P/S")
+    # currency
+    ccy = info.get("currency")
+    if ccy:
+        _safe_set(df, ridx, "Valuta", str(ccy).upper(), changed, force_stamp=False)
 
-        # P/S Q1..Q4 beräknat med samma antal aktier (implied) och pris per kvartalsdatum
-        if shares_abs > 0:
-            for idx_q, (d_end, ttm_rev) in enumerate(ttm_list[:4], start=1):
-                p = _safe_float(px_map.get(d_end), 0.0)
-                if p > 0 and ttm_rev > 0:
-                    mcap_hist = float(shares_abs) * float(p)
-                    field = f"P/S Q{idx_q}"
-                    if field in df.columns:
-                        before = df.at[ridx, field]
-                        df.at[ridx, field] = float(mcap_hist) / float(ttm_rev)
-                        if force_stamp:
-                            _stamp_ts(df, ridx, field)
-                        elif _safe_float(before) != _safe_float(df.at[ridx, field]):
-                            _stamp_ts(df, ridx, field)
-                        if str(before) != str(df.at[ridx, field]):
-                            ps_fields_changed.append(field)
+    # dividend
+    div_rate = info.get("dividendRate")
+    if div_rate is not None:
+        try:
+            _safe_set(df, ridx, "Årlig utdelning", float(div_rate), changed, force_stamp=False)
+        except Exception:
+            pass
 
-    # P/S-snitt av positiva Q1..Q4
-    if "P/S-snitt" in df.columns:
-        vals = []
-        for q in [1, 2, 3, 4]:
-            v = _safe_float(df.at[ridx, f"P/S Q{q}"] if f"P/S Q{q}" in df.columns else 0.0, 0.0)
-            if v > 0:
-                vals.append(v)
-        df.at[ridx, "P/S-snitt"] = round(float(np.mean(vals)) if vals else 0.0, 2)
+    # shares (styck) → miljoner
+    shares = info.get("sharesOutstanding")
+    if shares is not None and float(shares) > 0:
+        _safe_set(df, ridx, "Utestående aktier", float(shares)/1e6, changed)  # TS
 
-    # Räkna inte riktkurser här – de brukar räknas centralt efteråt.
-    _note_auto(df, ridx, source="Auto (Yahoo)")
-    changed += ps_fields_changed
-    msg = f"{ticker}: uppdaterade { _fmt_changes(changed) }."
-    if not changed:
-        msg = f"{ticker}: inga fält ändrades (stämplade ändå tid/källa)."
+    _note_auto_update(df, ridx, AUTO_SOURCE_PRICE)
+    # Räkna om P/S-snitt & riktkurser för raden (ifall något beroende fält fanns)
+    _recompute_row_derivatives(df, ridx)
 
-    return df, msg
+    msg = f"{tkr}: uppdaterade {', '.join(changed) if changed else 'inga fält (oförändrat)'}."
+    return df, changed, msg
+
+
+def run_update_full(df: pd.DataFrame, user_rates: Dict[str, float], ticker: str, force_stamp: bool = True, **kwargs) -> Tuple[pd.DataFrame, List[str], str]:
+    """
+    Full uppdatering via yfinance: pris/namn/valuta/utdelning/aktier + P/S TTM & P/S Q1–Q4.
+    Returnerar (df, changed_fields, message).
+    """
+    tkr = (ticker or "").strip().upper()
+    if not tkr:
+        return df, [], "Ingen ticker angiven."
+
+    if "Ticker" not in df.columns or tkr not in set(df["Ticker"].astype(str).str.upper()):
+        return df, [], f"{tkr} hittades inte i tabellen."
+
+    ridx = df.index[df["Ticker"].astype(str).str.upper() == tkr][0]
+    changed: List[str] = []
+
+    # ---- Bas (pris/namn/valuta/utdelning/aktier) ----
+    info = _yfi_info(tkr)
+
+    # price
+    price = info.get("regularMarketPrice")
+    if price is None:
+        try:
+            h = yf.Ticker(tkr).history(period="1d")
+            if not h.empty and "Close" in h:
+                price = float(h["Close"].iloc[-1])
+        except Exception:
+            price = None
+    if price is not None and price > 0:
+        _safe_set(df, ridx, "Aktuell kurs", float(price), changed, force_stamp=force_stamp)
+
+    # name
+    name = info.get("shortName") or info.get("longName")
+    if name:
+        _safe_set(df, ridx, "Bolagsnamn", str(name), changed, force_stamp=False)
+
+    # currency
+    ccy = info.get("currency")
+    if ccy:
+        _safe_set(df, ridx, "Valuta", str(ccy).upper(), changed, force_stamp=False)
+
+    # dividend
+    div_rate = info.get("dividendRate")
+    if div_rate is not None:
+        try:
+            _safe_set(df, ridx, "Årlig utdelning", float(div_rate), changed, force_stamp=False)
+        except Exception:
+            pass
+
+    # shares (styck) → miljoner
+    shares = info.get("sharesOutstanding")
+    if shares is not None and float(shares) > 0:
+        _safe_set(df, ridx, "Utestående aktier", float(shares)/1e6, changed, force_stamp=force_stamp)
+
+    # market cap kan vara intressant att spara i ev. kolumn om den finns
+    if "Market cap (nu)" in df.columns:
+        mc = info.get("marketCap")
+        if mc is not None and float(mc) > 0:
+            _safe_set(df, ridx, "Market cap (nu)", float(mc), changed, force_stamp=False)
+
+    # ---- P/S (TTM) + P/S Q1–Q4 via quarterly_financials ----
+    q_rows = _yfi_quarterly_revenue_rows(tkr)  # [(date, revenue), ...] nyast → äldst
+    ttm_list = _ttm_windows(q_rows, need=4)    # [(end_date, TTM revenue), ...]
+    # P/S (TTM) nu
+    if ttm_list:
+        ttm_end0, ttm0 = ttm_list[0]
+        # market cap / TTM revenue
+        mc_now = info.get("marketCap")
+        try:
+            mc_now = float(mc_now) if mc_now is not None else 0.0
+        except Exception:
+            mc_now = 0.0
+        if mc_now > 0 and ttm0 and ttm0 > 0:
+            ps_now = mc_now / float(ttm0)
+            _safe_set(df, ridx, "P/S", float(ps_now), changed, force_stamp=force_stamp)
+
+        # P/S Q1..Q4 historiskt: använd samma aktieantal (senast) + pris på/strax före respektive TTM-slut
+        # Alt 1: implied shares (om marketCap & price finns)
+        implied_shares = None
+        try:
+            px_now = float(price or 0.0)
+            if (mc_now or 0.0) > 0 and px_now > 0:
+                implied_shares = mc_now / px_now
+        except Exception:
+            implied_shares = None
+
+        if implied_shares is None or implied_shares <= 0:
+            implied_shares = float(shares or 0.0)  # kan vara 0 → skippar historik då
+
+        if implied_shares and implied_shares > 0:
+            for idx, (d_end, ttm_rev) in enumerate(ttm_list[:4], start=1):
+                if ttm_rev and ttm_rev > 0:
+                    px_hist = _yfi_history_close_on_or_before(tkr, d_end)
+                    if px_hist and px_hist > 0:
+                        mcap_hist = implied_shares * float(px_hist)
+                        ps_hist = mcap_hist / float(ttm_rev)
+                        _safe_set(df, ridx, f"P/S Q{idx}", float(ps_hist), changed, force_stamp=force_stamp)
+
+    # Notera auto-källa och räkna härledda
+    _note_auto_update(df, ridx, AUTO_SOURCE_FULL)
+    _recompute_row_derivatives(df, ridx)
+
+    msg = f"{tkr}: uppdaterade {', '.join(changed) if changed else 'inga fält (oförändrat)'}."
+    return df, changed, msg

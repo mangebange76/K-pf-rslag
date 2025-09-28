@@ -2,260 +2,247 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import time
-from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
+from typing import Callable, Dict, List, Tuple, Optional
 import streamlit as st
+import pandas as pd
 
-# För runner-upplösning: dessa definieras i stockapp/sources.py om du har dem.
-try:
-    from .sources import get_runner_by_name  # returnerar en callable eller None
-except Exception:
-    get_runner_by_name = None
+from .utils import add_oldest_ts_col, ensure_ticker_col, recompute_derived
 
-# ---- Hjälpare: äldst-ts, datumtolkning -------------------------------------
 
-_TS_CAND_COLS = [
-    "TS_Utestående aktier","TS_P/S","TS_P/S Q1","TS_P/S Q2","TS_P/S Q3","TS_P/S Q4",
-    "TS_Omsättning idag","TS_Omsättning nästa år",
-]
+RunnerFn = Callable[[pd.DataFrame, str, Dict[str, float]], Tuple[pd.DataFrame, List[str], str]]
+SaveFn = Callable[[pd.DataFrame], None]
 
-def _parse_date(s: str) -> Optional[datetime]:
-    try:
-        s = (s or "").strip()
-        if not s:
-            return None
-        return pd.to_datetime(s, errors="coerce").to_pydatetime()
-    except Exception:
-        return None
 
-def _oldest_any_ts_value(row: pd.Series) -> Optional[datetime]:
-    dates = []
-    for c in _TS_CAND_COLS:
-        if c in row and str(row[c]).strip():
-            d = _parse_date(row[c])
-            if d:
-                dates.append(d)
-    if dates:
-        return min(dates)
-    return None
+# ------------------------------------------------------------
+# Interna hjälpmetoder
+# ------------------------------------------------------------
+def _ensure_batch_state():
+    if "_batch_order" not in st.session_state:
+        st.session_state["_batch_order"] = []       # lista med tickers i köordning
+    if "_batch_cursor" not in st.session_state:
+        st.session_state["_batch_cursor"] = 0       # index i _batch_order
+    if "_batch_log" not in st.session_state:
+        st.session_state["_batch_log"] = {          # körlogg
+            "changed": {},      # ticker -> [kolumn1, kolumn2, ...]
+            "misses": {},       # ticker -> [orsak]
+            "errors": {},       # ticker -> "error text"
+            "runs": 0           # antal körda tickers i denna session
+        }
+    if "_runner" not in st.session_state:
+        st.session_state["_runner"] = None          # kan bindas utifrån
 
-def _normalize_ticker(x: str) -> str:
-    return str(x or "").strip().upper()
-
-# ---- Plocka körordning ------------------------------------------------------
 
 def _pick_order(df: pd.DataFrame, sort_mode: str) -> List[str]:
-    work = df.copy()
-    work["Ticker"] = work["Ticker"].astype(str).str.upper().str.strip()
-    work = work[work["Ticker"] != ""]
+    df = ensure_ticker_col(df)
+    if sort_mode.startswith("Äldst"):
+        work = add_oldest_ts_col(df.copy())
+        work = work.sort_values(by=["_oldest_any_ts_fill", "Bolagsnamn", "Ticker"])
+        return [t for t in work["Ticker"].tolist() if str(t).strip()]
+    # default A–Ö
+    work = df.sort_values(by=[c for c in ["Bolagsnamn","Ticker"] if c in df.columns])
+    return [t for t in work["Ticker"].tolist() if str(t).strip()]
 
-    if sort_mode.startswith("A–Ö"):
-        order = list(work.sort_values(by=["Bolagsnamn","Ticker"], na_position="last")["Ticker"])
-    elif sort_mode.startswith("Äldst"):
-        work["_oldest_any_ts"] = work.apply(_oldest_any_ts_value, axis=1)
-        work["_oldest_any_ts_fill"] = work["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
-        order = list(work.sort_values(by=["_oldest_any_ts_fill","Bolagsnamn","Ticker"])["Ticker"])
-    elif sort_mode.startswith("Slump"):
-        order = list(work.sample(frac=1.0, random_state=int(time.time()))["Ticker"])
-    else:
-        order = list(work["Ticker"])
 
-    # Order-bevarande avdubblering så vi aldrig kör samma ticker två gånger
-    order = list(dict.fromkeys(order))
-    return order
+def _diff_row(before: pd.Series, after: pd.Series) -> List[str]:
+    changed = []
+    for c in after.index:
+        b = str(before.get(c, ""))
+        a = str(after.get(c, ""))
+        if b != a:
+            changed.append(c)
+    return changed
 
-# ---- Runner-upplösning ------------------------------------------------------
 
-def _resolve_runner(runner_choice: str) -> Callable:
-    # 1) Försök använda registrerad runner i sources
-    if get_runner_by_name is not None:
-        fn = get_runner_by_name(runner_choice)
-        if fn is not None:
-            return fn
-
-    # 2) Fallback: noop
-    def _noop_runner(df: pd.DataFrame, ticker: str, **kwargs):
-        return {
-            "ticker": ticker,
-            "attempted": True,
-            "fetched_fields": [],
-            "changed_fields": [],
-            "saved": False,
-            "error": None,
-            "status": "inga data (noop runner)",
-            "duration_s": 0.0,
-        }
-    return _noop_runner
-
-# ---- Batch-UI + körning -----------------------------------------------------
-
-def sidebar_batch_controls(
-    df: pd.DataFrame,
-    user_rates: Optional[Dict[str,float]] = None,
-    save_cb: Optional[Callable[[pd.DataFrame], None]] = None,
-    default_sort: str = "Äldst uppdaterade först (alla fält)",
-    default_runner_choice: str = "Full auto",
-    default_batch_size: int = 10,
-    commit_every: int = 0,
-) -> pd.DataFrame:
+def _default_runner(df: pd.DataFrame, ticker: str, user_rates: Dict[str,float]) -> Tuple[pd.DataFrame, List[str], str]:
     """
-    Sidopanel för batchkörning:
-      • Sortering: Äldst / A–Ö / Slump
-      • Välj runner: "Full auto", "Endast kurs", "Endast P/S + aktier" (kräver GET i sources)
-      • Cooldown: exkludera tickers försöka senaste N timmar
-      • 1/X-progress och status per ticker
-      • Logg i st.session_state["_last_batch_log"]
-      • Uppdaterar 'Senast auto-försök' + 'Senast auto-status' i DF
+    No-op fallback om ingen runner är satt. Returnerar oförändrat df.
     """
-    st.sidebar.subheader("🛠️ Batch-uppdatering")
+    return df, [], "no-runner"
+
+
+def _get_runner(explicit_runner: Optional[RunnerFn]) -> RunnerFn:
+    if explicit_runner is not None:
+        return explicit_runner
+    if st.session_state.get("_runner") is not None:
+        return st.session_state["_runner"]
+    return _default_runner
+
+
+def _position_text() -> str:
+    order = st.session_state["_batch_order"]
+    cur = st.session_state["_batch_cursor"]
+    total = len(order)
+    # 1/X text (cursor är 0-baserad, men visa 1-baserat)
+    pos = min(cur + 1, max(total, 1))
+    return f"{pos}/{max(total,1)}"
+
+
+# ------------------------------------------------------------
+# Publika metoder
+# ------------------------------------------------------------
+def run_batch_update(df: pd.DataFrame,
+                     user_rates: Dict[str,float],
+                     tickers: List[str],
+                     runner: Optional[RunnerFn] = None,
+                     save_cb: Optional[SaveFn] = None) -> Tuple[pd.DataFrame, dict]:
+    """
+    Kör given runner på en lista av tickers. Visar progress (1/X).
+    Returnerar (df, logdict).
+    """
+    _ensure_batch_state()
+    run = _get_runner(runner)
+
+    if not tickers:
+        st.info("Inget att köra.")
+        return df, st.session_state["_batch_log"]
+
+    progress = st.sidebar.progress(0.0, text=f"Kör batch … {0}/{len(tickers)}")
+    status = st.sidebar.empty()
+
+    log = st.session_state["_batch_log"]
+    changed_any = False
+
+    for i, tkr in enumerate(tickers, start=1):
+        tkr = str(tkr).strip().upper()
+        status.write(f"Kör {i}/{len(tickers)}: **{tkr}**  – batchpos { _position_text() }")
+        try:
+            # Snapshot "before"
+            if "Ticker" in df.columns and (df["Ticker"] == tkr).any():
+                ridx = df.index[df["Ticker"] == tkr][0]
+                before = df.loc[ridx].copy()
+            else:
+                before = pd.Series({})
+
+            df, changed_cols, status_str = run(df, tkr, user_rates)
+            changed_cols = changed_cols or []
+
+            # Snapshot "after" + diff om runner ej lämnat lista
+            if "Ticker" in df.columns and (df["Ticker"] == tkr).any():
+                ridx2 = df.index[df["Ticker"] == tkr][0]
+                after = df.loc[ridx2]
+                if not changed_cols and not before.empty:
+                    changed_cols = _diff_row(before, after)
+
+            if changed_cols:
+                log["changed"].setdefault(tkr, [])
+                for c in changed_cols:
+                    if c not in log["changed"][tkr]:
+                        log["changed"][tkr].append(c)
+                changed_any = True
+            else:
+                log["misses"][tkr] = [status_str or "(ingen ändring)"]
+
+            log["runs"] += 1
+        except Exception as e:
+            log["errors"][tkr] = str(e)
+
+        progress.progress(i/len(tickers), text=f"Kör batch … {i}/{len(tickers)}")
+
+    # Recompute derivat + spara en gång
+    df = recompute_derived(df)
+    if save_cb is not None and changed_any:
+        try:
+            save_cb(df)
+            st.sidebar.success("Ändringar sparade.")
+        except Exception as e:
+            st.sidebar.warning(f"Kunde inte spara: {e}")
+    elif not changed_any:
+        st.sidebar.info("Ingen faktisk ändring – ingen sparning.")
+
+    return df, log
+
+
+def sidebar_batch_controls(df: pd.DataFrame,
+                           user_rates: Dict[str,float],
+                           save_cb: Optional[SaveFn] = None,
+                           default_sort: str = "Äldst uppdaterade först (alla fält)",
+                           runner: Optional[RunnerFn] = None) -> pd.DataFrame:
+    """
+    Batchpanelen i sidopanelen. Skapar en kö och låter dig köra stegvis,
+    N-steg eller hela kön. Visar 1/X och en enkel körlogg.
+    """
+    _ensure_batch_state()
+
+    st.sidebar.subheader("🚚 Batch-körning")
 
     sort_mode = st.sidebar.selectbox(
-        "Sortering",
-        ["Äldst uppdaterade först (alla fält)", "A–Ö (bolagsnamn)", "Slumpvis"],
-        index=0 if default_sort.startswith("Äldst") else 1 if default_sort.startswith("A–Ö") else 2,
+        "Sortera",
+        ["Äldst uppdaterade först (alla fält)", "A–Ö (bolagsnamn)"],
+        index=0 if default_sort.startswith("Äldst") else 1,
         key="batch_sort_mode"
     )
+    batch_size = st.sidebar.number_input("Batchstorlek (antal i kön)", min_value=1, max_value=500, value=20, step=1, key="batch_size")
 
-    runner_choice = st.sidebar.selectbox(
-        "Körläge",
-        ["Full auto", "Endast kurs", "Endast P/S + aktier"],
-        index=0 if default_runner_choice.startswith("Full") else 1 if "kurs" in default_runner_choice.lower() else 2,
-        key="batch_runner_choice"
-    )
+    colA, colB = st.sidebar.columns([1,1])
+    with colA:
+        if st.button("🧮 Skapa kö", key="btn_make_queue"):
+            order_all = _pick_order(df, sort_mode)
+            # Ta bort redan körda tickers från loggens "changed/misses/errors" för att inte låsa oss
+            already_done = set()
+            for d in ("changed","misses","errors"):
+                already_done |= set(st.session_state["_batch_log"].get(d, {}).keys())
+            # Filtrera bort redan körda så vi får "nästa" batch
+            remaining = [t for t in order_all if t not in already_done]
+            st.session_state["_batch_order"] = remaining[:int(batch_size)]
+            st.session_state["_batch_cursor"] = 0
+            st.sidebar.success(f"Kö skapad ({len(st.session_state['_batch_order'])} tickers).")
+    with colB:
+        if st.button("🧹 Återställ kö", key="btn_reset_queue"):
+            st.session_state["_batch_order"] = []
+            st.session_state["_batch_cursor"] = 0
+            st.sidebar.info("Kö återställd.")
 
-    batch_size = st.sidebar.number_input(
-        "Antal tickers i batch",
-        min_value=1, max_value=200, value=int(default_batch_size), step=1, key="batch_size_input"
-    )
+    order = st.session_state["_batch_order"]
+    cur = st.session_state["_batch_cursor"]
+    total = len(order)
 
-    cool_hours = st.sidebar.number_input(
-        "Exkludera tickers försökta inom (timmar)",
-        min_value=0, max_value=168, value=24, step=1, key="batch_cooldown_h"
-    )
-    mark_attempt = st.sidebar.checkbox("Markera 'Senast auto-försök' även om inget ändras", value=True, key="batch_mark_attempt")
-    show_preview = st.sidebar.checkbox("Visa förhandslista", value=False, key="batch_preview")
+    if total > 0:
+        st.sidebar.caption(f"🔢 Köläge: { _position_text() }  —  kvar: {max(total - cur, 0)}")
 
-    # Bygg ordning
-    tickers_ordered = _pick_order(df, sort_mode)
+        # Kör-enheter
+        c1, c2, c3 = st.sidebar.columns([1,1,1])
+        with c1:
+            if st.button("▶️ Kör nästa", key="btn_run_next"):
+                to_run = order[cur:cur+1]
+                if to_run:
+                    df2, log = run_batch_update(df, user_rates, to_run, runner=runner, save_cb=save_cb)
+                    df[:] = df2  # uppdatera referensen
+                    st.session_state["_batch_cursor"] = min(cur + 1, total)
+        with c2:
+            if st.button("⏭️ Kör 5", key="btn_run_5"):
+                to_run = order[cur:cur+5]
+                if to_run:
+                    df2, log = run_batch_update(df, user_rates, to_run, runner=runner, save_cb=save_cb)
+                    df[:] = df2
+                    st.session_state["_batch_cursor"] = min(cur + len(to_run), total)
+        with c3:
+            if st.button("⏩ Kör hela kön", key="btn_run_all"):
+                to_run = order[cur:]
+                if to_run:
+                    df2, log = run_batch_update(df, user_rates, to_run, runner=runner, save_cb=save_cb)
+                    df[:] = df2
+                    st.session_state["_batch_cursor"] = total
 
-    # Exkludera nyligen försökta om så önskas
-    if cool_hours > 0 and "Senast auto-försök" in df.columns:
-        cutoff = datetime.now() - timedelta(hours=int(cool_hours))
-
-        def _ok(tkr: str) -> bool:
-            r = df[df["Ticker"].astype(str).str.upper().str.strip() == _normalize_ticker(tkr)]
-            if r.empty:
-                return True
-            s = str(r.iloc[0].get("Senast auto-försök","")).strip()
-            d = _parse_date(s)
-            if not d:
-                return True
-            return d < cutoff
-
-        tickers_ordered = [t for t in tickers_ordered if _ok(t)]
-
-    to_run = tickers_ordered[: int(batch_size)]
-
-    if show_preview:
-        st.sidebar.write("**Körlista (förhandsvisning):**")
-        st.sidebar.code(", ".join(to_run) if to_run else "(tom)")
-
-    # Körning
-    if st.sidebar.button("🔄 Kör batch nu", key="btn_run_batch"):
-        runner = _resolve_runner(runner_choice)
-        results: List[Dict] = []
-        n = len(to_run)
-        if n == 0:
-            st.sidebar.info("Inget att köra (körlista tom).")
-            st.session_state["_last_batch_log"] = []
-            return df
-
-        prog = st.sidebar.progress(0.0, text=f"Startar… 0/{n}")
-        status_line = st.sidebar.empty()
-
-        t_start = time.time()
-        for i, tkr in enumerate(to_run):
-            t0 = time.time()
-            try:
-                res = runner(df, tkr, user_rates=user_rates)
-                if not isinstance(res, dict):
-                    res = {"error": "runner returnerade ogiltigt resultat", "saved": False, "changed_fields": [], "fetched_fields": []}
-            except Exception as e:
-                res = {"error": str(e), "saved": False, "changed_fields": [], "fetched_fields": []}
-
-            fetched = list(res.get("fetched_fields") or [])
-            changed = list(res.get("changed_fields") or [])
-            saved   = bool(res.get("saved", False))
-            err     = res.get("error")
-
-            if err:
-                status = f"fel: {err}"
+        # Lista nästa 10 i kön
+        with st.sidebar.expander("📋 Köinnehåll (nästa 10)", expanded=False):
+            nxt = order[cur:cur+10]
+            if nxt:
+                st.write(", ".join(nxt))
             else:
-                if saved and changed:
-                    status = "sparad"
-                elif fetched and not changed:
-                    status = "oförändrat"
-                else:
-                    status = res.get("status") or ("inga data" if not fetched else "oförändrat")
+                st.caption("— tomt —")
 
-            # Markera försök & status
-            if mark_attempt or saved:
-                mask = (df["Ticker"].astype(str).str.upper().str.strip() == _normalize_ticker(tkr))
-                if mask.any():
-                    try:
-                        df.loc[mask, "Senast auto-försök"] = datetime.now().strftime("%Y-%m-%d")
-                        df.loc[mask, "Senast auto-status"] = status
-                    except Exception:
-                        pass
-
-            dur = time.time() - t0
-            results.append({
-                "Ticker": tkr,
-                "Status": status,
-                "Fält hämtade": ", ".join(fetched) if fetched else "",
-                "Fält ändrade": ", ".join(changed) if changed else "",
-                "Ändringar (#)": len(changed),
-                "Sparad?": "Ja" if saved else "Nej",
-                "Tid (s)": round(dur,2),
-            })
-
-            prog.progress((i+1)/n, text=f"Kör… {i+1}/{n} ({tkr})")
-            status_line.write(f"{i+1}/{n}: {tkr} — {status}")
-
-            if save_cb and commit_every and ((i+1) % int(commit_every) == 0):
-                try:
-                    save_cb(df)
-                except Exception as e:
-                    st.sidebar.warning(f"Kunde inte del-spara efter {i+1} poster: {e}")
-
-        tot_s = round(time.time() - t_start, 2)
-        prog.progress(1.0, text=f"Klar! {n}/{n} — {tot_s}s")
-        st.sidebar.success(f"Batch klar ({n} tickers, {tot_s}s).")
-
-        # Spara rapport
-        st.session_state["_last_batch_log"] = results
-
-        # Summering
-        try:
-            df_log = pd.DataFrame(results)
-            changed_n = int((df_log["Sparad?"] == "Ja").sum())
-        except Exception:
-            changed_n = sum(1 for r in results if r.get("Sparad?") == "Ja")
-        st.sidebar.write(f"**Sparade poster:** {changed_n} / {n}")
-
-        # Slutlig save
-        if save_cb:
-            try:
-                save_cb(df)
-            except Exception as e:
-                st.sidebar.warning(f"Kunde inte spara slutligt: {e}")
-
-    if st.sidebar.button("🧹 Återställ batchlogg (minne)", key="btn_reset_batch_hist"):
-        st.session_state["_last_batch_log"] = []
-        st.sidebar.info("Batchlogg i minnet nollställd.")
+    # Körlogg
+    with st.sidebar.expander("📒 Körlogg", expanded=False):
+        log = st.session_state["_batch_log"]
+        st.caption(f"Antal körningar i sessionen: {int(log.get('runs',0))}")
+        if log.get("changed"):
+            st.markdown("**Ändringar**")
+            st.json(log["changed"])
+        if log.get("misses"):
+            st.markdown("**Missar**")
+            st.json(log["misses"])
+        if log.get("errors"):
+            st.markdown("**Fel**")
+            st.json(log["errors"])
 
     return df

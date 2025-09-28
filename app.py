@@ -322,55 +322,70 @@ def render_diagnostics(df: pd.DataFrame) -> None:
                 st.warning("Missar:\n- " + "\n- ".join(misses))
 
 # -------------------------------------------------------------------------------------
-# Sidopanel: Valutakurser
+# Sidopanel: Valutakurser (med *endast* callbacks som skriver till widget-keys)
 # -------------------------------------------------------------------------------------
 def _init_rate_state():
-    if "rate_usd_input" not in st.session_state:
-        saved = las_sparade_valutakurser()
-        st.session_state.rate_usd_input = float(saved.get("USD", STANDARD_VALUTAKURSER["USD"]))
-        st.session_state.rate_nok_input = float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"]))
-        st.session_state.rate_cad_input = float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"]))
-        st.session_state.rate_eur_input = float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"]))
+    # Sätt default en gång – skriv inte om nycklar om de redan finns
+    saved = las_sparade_valutakurser()
+    st.session_state.setdefault("rate_usd_input", float(saved.get("USD", STANDARD_VALUTAKURSER["USD"])))
+    st.session_state.setdefault("rate_nok_input", float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"])))
+    st.session_state.setdefault("rate_cad_input", float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"])))
+    st.session_state.setdefault("rate_eur_input", float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"])))
+    # plats för feedback från callbacks
+    st.session_state.setdefault("_rates_msg", "")
+
+def _on_fetch_rates():
+    rates, misses, provider = hamta_valutakurser_auto()
+    # Uppdatera *endast* i callback (tillåtna skrivningar)
+    st.session_state.rate_usd_input = float(rates.get("USD", st.session_state.rate_usd_input))
+    st.session_state.rate_nok_input = float(rates.get("NOK", st.session_state.rate_nok_input))
+    st.session_state.rate_cad_input = float(rates.get("CAD", st.session_state.rate_cad_input))
+    st.session_state.rate_eur_input = float(rates.get("EUR", st.session_state.rate_eur_input))
+    msg = f"Valutakurser hämtade (källa: {provider})."
+    if misses:
+        msg += " Missar: " + ", ".join(misses)
+    st.session_state._rates_msg = msg
+
+def _on_load_saved_rates():
+    st.cache_data.clear()
+    saved = las_sparade_valutakurser()
+    st.session_state.rate_usd_input = float(saved.get("USD", STANDARD_VALUTAKURSER["USD"]))
+    st.session_state.rate_nok_input = float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"]))
+    st.session_state.rate_cad_input = float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"]))
+    st.session_state.rate_eur_input = float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"]))
+    st.session_state._rates_msg = "Inlästa sparade kurser."
 
 def _sidebar_rates() -> Dict[str, float]:
     st.sidebar.header("💱 Valutakurser → SEK")
     _init_rate_state()
 
-    # Kör auto-hämtning FÖRE widgets renderas
-    auto_fetch = st.sidebar.button("🌐 Hämta kurser automatiskt")
-    if auto_fetch:
-        auto_rates, misses, provider = hamta_valutakurser_auto()
-        st.session_state.rate_usd_input = float(auto_rates.get("USD", st.session_state.rate_usd_input))
-        st.session_state.rate_nok_input = float(auto_rates.get("NOK", st.session_state.rate_nok_input))
-        st.session_state.rate_cad_input = float(auto_rates.get("CAD", st.session_state.rate_cad_input))
-        st.session_state.rate_eur_input = float(auto_rates.get("EUR", st.session_state.rate_eur_input))
-        st.sidebar.success(f"Valutakurser hämtade (källa: {provider}).")
-        if misses:
-            st.sidebar.warning("Vissa par kunde inte hämtas:\n- " + "\n- ".join(misses))
+    # Knapp-rad (callbacks sköter uppdatering av widget-keys)
+    colb1, colb2 = st.sidebar.columns(2)
+    with colb1:
+        st.button("🌐 Hämta automatiskt", on_click=_on_fetch_rates, key="btn_fetch_rates")
+    with colb2:
+        st.button("↻ Läs sparade", on_click=_on_load_saved_rates, key="btn_load_saved_rates")
 
-    # Widgets (nu är state uppdaterad *innan* render)
+    # Ev. feedback från senaste callback
+    if st.session_state.get("_rates_msg"):
+        st.sidebar.info(st.session_state["_rates_msg"])
+
+    # Widgets – läser/lagrar i st.session_state via keys
     usd = st.sidebar.number_input("USD → SEK", key="rate_usd_input", step=0.01, format="%.4f")
     nok = st.sidebar.number_input("NOK → SEK", key="rate_nok_input", step=0.01, format="%.4f")
     cad = st.sidebar.number_input("CAD → SEK", key="rate_cad_input", step=0.01, format="%.4f")
     eur = st.sidebar.number_input("EUR → SEK", key="rate_eur_input", step=0.01, format="%.4f")
 
+    # Spara-rad
     col_rates1, col_rates2 = st.sidebar.columns(2)
     with col_rates1:
-        if st.button("💾 Spara kurser"):
+        if st.button("💾 Spara kurser", key="btn_save_rates"):
             rates = {"USD": float(usd), "NOK": float(nok), "CAD": float(cad), "EUR": float(eur), "SEK": 1.0}
             spara_valutakurser(rates)
             st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
             st.sidebar.success("Valutakurser sparade.")
-    with col_rates2:
-        if st.button("↻ Läs sparade kurser"):
-            st.cache_data.clear()
-            saved = las_sparade_valutakurser()
-            st.session_state.rate_usd_input = float(saved.get("USD", STANDARD_VALUTAKURSER["USD"]))
-            st.session_state.rate_nok_input = float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"]))
-            st.session_state.rate_cad_input = float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"]))
-            st.session_state.rate_eur_input = float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"]))
-            st.sidebar.info("Inlästa sparade kurser.")
 
+    # Returnera som dict
     return {"USD": float(usd), "NOK": float(nok), "CAD": float(cad), "EUR": float(eur), "SEK": 1.0}
 
 # -------------------------------------------------------------------------------------

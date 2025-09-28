@@ -5,191 +5,330 @@ from __future__ import annotations
 import streamlit as st
 import pandas as pd
 import numpy as np
+from typing import Dict, List
 
-from ..calc import human_mcap, marketcap_risk_label, safe_float
+# -----------------------------
+# Små helpers
+# -----------------------------
 
-CAP_BUCKETS = ["Microcap", "Smallcap", "Midcap", "Largecap", "Megacap"]
+def _human_mc(val: float, suffix_ccy: str = "") -> str:
+    try:
+        x = float(val)
+    except Exception:
+        return "-"
+    units = [("T", 1e12), ("B", 1e9), ("M", 1e6), ("k", 1e3)]
+    for u, m in units:
+        if abs(x) >= m:
+            return f"{x/m:,.2f} {u}{(' ' + suffix_ccy) if suffix_ccy else ''}"
+    return f"{x:,.0f}{(' ' + suffix_ccy) if suffix_ccy else ''}"
 
-def _cap_label_from_row(row: pd.Series) -> str:
-    """Försök bestämma cap-klass. Använd befintlig Market Cap-kolumn, annars räkna px*shares."""
-    mcap = 0.0
-    # försök hämta ev. Market Cap (nu)
-    for k in ["Market Cap (nu)", "MarketCap", "MarketCapNow"]:
-        if k in row and pd.notna(row[k]):
-            mcap = safe_float(row[k], 0.0)
-            break
-    if mcap <= 0:
-        # fallback: implied via kurs * shares (shares i styck; kolumnen är i miljoner)
-        px = safe_float(row.get("Aktuell kurs", 0.0), 0.0)
-        sh_m = safe_float(row.get("Utestående aktier", 0.0), 0.0)  # miljoner
-        if px > 0 and sh_m > 0:
-            mcap = px * sh_m * 1e6
-    return marketcap_risk_label(mcap)
+def _ps_snitt(row: pd.Series) -> float:
+    vals = []
+    for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]:
+        if k in row and pd.notna(row[k]) and float(row[k]) > 0:
+            vals.append(float(row[k]))
+    return round(float(np.mean(vals)), 2) if vals else 0.0
 
-def _compute_mcap_now(row: pd.Series) -> float:
-    # samma som ovan, men numeriskt värde
-    for k in ["Market Cap (nu)", "MarketCap", "MarketCapNow"]:
-        if k in row and pd.notna(row[k]):
-            v = safe_float(row[k], 0.0)
-            if v > 0:
-                return v
-    px = safe_float(row.get("Aktuell kurs", 0.0), 0.0)
-    sh_m = safe_float(row.get("Utestående aktier", 0.0), 0.0)
-    if px > 0 and sh_m > 0:
-        return px * sh_m * 1e6
+def _risk_label(mcap: float) -> str:
+    # enkla bucket-gränser (USD-liknande; vi visar bara label)
+    if mcap >= 200e9: return "Mega"
+    if mcap >= 10e9:  return "Large"
+    if mcap >= 2e9:   return "Mid"
+    if mcap >= 0.3e9: return "Small"
+    return "Micro"
+
+def _div_yield(annual_div: float, price: float) -> float:
+    try:
+        if price > 0:
+            return float(annual_div) / float(price) * 100.0
+    except Exception:
+        pass
     return 0.0
 
-def _composite_score(row: pd.Series, focus: str) -> float:
-    g = safe_float(row.get("GrowthScore", 0.0), 0.0)
-    d = safe_float(row.get("DividendScore", 0.0), 0.0)
-    if focus == "Tillväxt":
-        return 0.85 * g + 0.15 * d
-    elif focus == "Utdelning":
-        return 0.25 * g + 0.75 * d
-    return 0.5 * g + 0.5 * d  # Balanserad
+def _grade(value: float, good_thr: float, ok_thr: float, reverse: bool = False) -> str:
+    """
+    quick grader:
+      reverse=False:  >=good -> Bra, >=ok -> Ok, else Svagt
+      reverse=True:   <=good -> Bra, <=ok -> Ok, else Svagt  (för nyckeltal där lägre är bättre)
+    """
+    try:
+        v = float(value)
+    except Exception:
+        return "Svagt"
+    if not reverse:
+        if v >= good_thr: return "Bra"
+        if v >= ok_thr:   return "Ok"
+        return "Svagt"
+    else:
+        if v <= good_thr: return "Bra"
+        if v <= ok_thr:   return "Ok"
+        return "Svagt"
 
-def _row_potential(row: pd.Series, target_col: str) -> float:
-    px = safe_float(row.get("Aktuell kurs", 0.0), 0.0)
-    tgt = safe_float(row.get(target_col, 0.0), 0.0)
-    if px > 0 and tgt > 0:
-        return (tgt - px) / px * 100.0
-    return 0.0
+def _get(df: pd.DataFrame, row: pd.Series, key: str, default=0.0):
+    try:
+        v = row.get(key, default)
+        # robust float när det förväntas
+        if isinstance(default, (int, float)):
+            return float(v) if pd.notna(v) else float(default)
+        return v if v is not None else default
+    except Exception:
+        return default
 
-def _ps_now(row: pd.Series) -> float:
-    """P/S (TTM) nu om kolumn finns, annars använd P/S som proxy."""
-    cand = safe_float(row.get("P/S", 0.0), 0.0)
-    return round(cand, 2) if cand > 0 else 0.0
+# -----------------------------
+# Scoring
+# -----------------------------
 
-def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
+def _score_row(row: pd.Series, mode: str, riktkurs_col: str) -> Dict[str, float]:
+    """
+    Beräknar delpoäng och totalpoäng:
+      - valuation: uppsida mot valgt riktkurs
+      - quality: marginaler + D/E (lägre är bättre)
+      - risk: bucket-penalty för Micro/Small
+      - mode "Tillväxt": lägger vikt på CAGR 5 år och P/S-snitt (lägre bättre)
+      - mode "Utdelning": viktar utdelningsyield + payout-sustain proxys (FCF > 0, D/E låg)
+    """
+    price = _get(None, row, "Aktuell kurs", 0.0)
+    target = _get(None, row, riktkurs_col, 0.0)
+    mcap = _get(None, row, "Market Cap (nu)", 0.0)
+    ps_now = _get(None, row, "P/S", 0.0)
+    ps_avg = _ps_snitt(row)
+
+    de = _get(None, row, "Debt/Equity", 0.0)
+    gm = _get(None, row, "Bruttomarginal (%)", 0.0)
+    nm = _get(None, row, "Nettomarginal (%)", 0.0)
+    fcf = _get(None, row, "FCF TTM (valuta)", 0.0)
+    cash = _get(None, row, "Kassa (valuta)", 0.0)
+    cagr = _get(None, row, "CAGR 5 år (%)", 0.0)
+    annual_div = _get(None, row, "Årlig utdelning", 0.0)
+    dy = _div_yield(annual_div, price)
+
+    # valuation: uppsida %
+    upside = 0.0
+    if price > 0 and target > 0:
+        upside = (target - price) / price * 100.0
+    # clamp
+    upside_c = max(min(upside, 150.0), -90.0)
+    valuation_score = (upside_c + 90.0) / 240.0  # normalisera ca 0..1
+
+    # quality
+    # D/E (lägre bättre), GM/NM (högre bättre), FCF positivt
+    de_score = 1.0 if de <= 0.5 else (0.7 if de <= 1.0 else (0.4 if de <= 2.0 else 0.2))
+    gm_score = 0.2 + max(0.0, min(gm / 80.0, 0.8))  # 80% ~ topp
+    nm_score = 0.2 + max(0.0, min(nm / 40.0, 0.8))  # 40% ~ topp
+    fcf_score = 0.8 if fcf > 0 else 0.3
+    quality_score = (de_score*0.3 + gm_score*0.35 + nm_score*0.2 + fcf_score*0.15)
+
+    # risk (cap-bucket penalty)
+    risk_pen = 0.0
+    if mcap < 0.3e9:          risk_pen = 0.25   # micro
+    elif mcap < 2e9:          risk_pen = 0.15   # small
+    elif mcap < 10e9:         risk_pen = 0.08   # mid
+    else:                     risk_pen = 0.03   # large/mega
+    risk_score = 1.0 - risk_pen
+
+    # mode-specific
+    if mode == "Tillväxt":
+        # lägre P/S-snitt är bättre, högre CAGR bättre
+        ps_score = 0.8 if ps_avg <= 5 else (0.6 if ps_avg <= 10 else (0.4 if ps_avg <= 20 else 0.2))
+        cagr_score = 0.2 + max(0.0, min(cagr/50.0, 0.8))  # 50% CAGR ~ topp
+        mode_score = ps_score*0.45 + cagr_score*0.55
+    else:  # Utdelning
+        # högre yield bättre men cap även för risk
+        dy_score = 0.2 + max(0.0, min(dy/10.0, 0.8))  # 10% ~ topp
+        # hållbarhet: positiv FCF + låg D/E
+        sustain = (1.0 if fcf > 0 else 0.4) * (1.0 if de <= 1.0 else 0.6)
+        mode_score = dy_score*0.6 + sustain*0.4
+
+    total = valuation_score*0.35 + quality_score*0.35 + risk_score*0.1 + mode_score*0.2
+    return {
+        "Upside (%)": upside,
+        "ValuationScore": valuation_score,
+        "QualityScore": quality_score,
+        "RiskScore": risk_score,
+        "ModeScore": mode_score,
+        "TotalScore": total,
+    }
+
+# -----------------------------
+# Huvudvy
+# -----------------------------
+
+def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> None:
     st.header("💡 Investeringsförslag")
 
-    if df is None or df.empty:
-        st.info("Ingen data att visa ännu.")
+    if df.empty:
+        st.info("Inga bolag i databasen ännu.")
         return
 
-    # Välj fokus & filter
-    colf1, colf2 = st.columns([1,1])
-    with colf1:
-        fokus = st.radio("Fokus", ["Balanserad", "Tillväxt", "Utdelning"], horizontal=True, index=0, key="inv_focus")
-    with colf2:
-        target_col = st.selectbox("Riktkurs att jämföra mot", ["Riktkurs om 1 år","Riktkurs idag","Riktkurs om 2 år","Riktkurs om 3 år"], index=0, key="inv_tgt")
-
-    colf3, colf4 = st.columns([1,1])
-    with colf3:
-        sektorer = sorted([s for s in df.get("Sektor", pd.Series(dtype=str)).dropna().unique() if str(s).strip()])
-        val_sekt = st.multiselect("Filtrera på sektor (valfritt)", sektorer, default=[], key="inv_sectors")
-    with colf4:
-        val_caps = st.multiselect("Cap-klass (valfritt)", CAP_BUCKETS, default=[], key="inv_caps")
-
-    only_with_target = st.checkbox("Visa endast bolag med vald riktkurs > 0", value=True, key="inv_only_tgt")
-
-    # Bygg arbetskopia
-    work = df.copy()
-    # lägg till risklabel/cap
-    work["CapLabel"] = work.apply(_cap_label_from_row, axis=1)
-    # filtrera sektor
-    if val_sekt:
-        work = work[work["Sektor"].astype(str).isin(val_sekt)]
-    # filtrera caps
-    if val_caps:
-        work = work[work["CapLabel"].astype(str).isin(val_caps)]
-    # filtrera riktkurs
-    if only_with_target and target_col in work.columns:
-        work = work[safe_float_series(work[target_col]) > 0]
-
-    if work.empty:
-        st.warning("Inget matchade filtren.")
-        return
-
-    # Beräkna ranking-score per rad
-    work["CompositeScore"] = work.apply(lambda r: _composite_score(r, fokus), axis=1)
-    work["Potential (%)"] = work.apply(lambda r: round(_row_potential(r, target_col), 2), axis=1)
-    work["Direktavkastning (%)"] = work.get("Direktavkastning (%)", pd.Series([0.0]*len(work)))
-
-    # Sorteras: primärt score, sekundärt potential (fallande)
-    work = work.sort_values(by=["CompositeScore","Potential (%)"], ascending=[False, False]).reset_index(drop=True)
-
-    # Navigering (robust)
-    n = len(work)
-    st.session_state.setdefault("forslags_idx", 0)
-    st.session_state.forslags_idx = int(np.clip(st.session_state.forslags_idx, 0, max(0, n-1)))
-
-    nav1, nav2, nav3 = st.columns([1,2,1])
-    with nav1:
-        if st.button("⬅️ Föregående", use_container_width=True):
-            st.session_state.forslags_idx = max(0, st.session_state.forslags_idx - 1)
-    with nav2:
-        st.markdown(f"<div style='text-align:center;'>Förslag {st.session_state.forslags_idx+1} / {n}</div>", unsafe_allow_html=True)
-    with nav3:
-        if st.button("➡️ Nästa", use_container_width=True):
-            st.session_state.forslags_idx = min(n-1, st.session_state.forslags_idx + 1)
-
-    row = work.iloc[st.session_state.forslags_idx]
-
-    # Visa kort info + expander
-    st.subheader(f"{row.get('Bolagsnamn','')} ({row.get('Ticker','')})")
-    k1, k2, k3, k4 = st.columns([1,1,1,1])
-    with k1:
-        st.metric("Kurs", f"{safe_float(row.get('Aktuell kurs',0)):.2f} {row.get('Valuta','')}")
-    with k2:
-        st.metric("Vald riktkurs", f"{safe_float(row.get(target_col,0)):.2f} {row.get('Valuta','')}")
-    with k3:
-        st.metric("Uppsida", f"{safe_float(row.get('Potential (%)',0)):.2f}%")
-    with k4:
-        st.metric("Fokus-score", f"{safe_float(row.get('CompositeScore',0)):.1f}")
-
-    with st.expander("📦 Detaljer", expanded=True):
-        mcap_now = _compute_mcap_now(row)
-        ps_now = _ps_now(row)
-        ps_avg = safe_float(row.get("P/S-snitt", 0.0), 0.0)
-        shares_m = safe_float(row.get("Utestående aktier", 0.0), 0.0)
-        sektor = str(row.get("Sektor","") or "")
-        caplab = _cap_label_from_row(row)
-        vard = str(row.get("Värdering","") or "")
-
-        left, right = st.columns([1,1])
-        with left:
-            st.write(f"- **Market Cap (nu):** {human_mcap(mcap_now)}")
-            st.write(f"- **P/S (nu):** {ps_now:.2f}")
-            st.write(f"- **P/S-snitt (Q1–Q4):** {ps_avg:.2f}")
-            st.write(f"- **Utestående aktier:** {shares_m:.2f} M")
-            if "Årlig utdelning" in row:
-                st.write(f"- **Direktavkastning:** {safe_float(row.get('Direktavkastning (%)',0.0)):.2f}%")
-        with right:
-            st.write(f"- **Sektor:** {sektor or '—'}")
-            st.write(f"- **Cap-klass:** {caplab}")
-            st.write(f"- **GrowthScore:** {safe_float(row.get('GrowthScore',0.0)):.1f}")
-            st.write(f"- **DividendScore:** {safe_float(row.get('DividendScore',0.0)):.1f}")
-            st.write(f"- **Värdering:** {vard or '—'}")
-
-        # Visa ev. historiska mcap-kolumner om de finns
-        mcols = [c for c in row.index if c.lower().startswith("mcap q") or c.lower().startswith("market cap q")]
-        if mcols:
-            st.write("**Historisk Market Cap (senaste Q):**")
-            lines = []
-            for c in sorted(mcols):
-                lines.append(f"- {c}: {human_mcap(safe_float(row.get(c,0.0)))}")
-            st.markdown("\n".join(lines))
-
-    # Tabell med topp 15 för snabb överblick
-    st.markdown("### 📋 Snabböversikt (topp 15 efter filter)")
-    show = work.head(15).copy()
-    show_cols = ["Ticker","Bolagsnamn","Sektor","CapLabel","Aktuell kurs",target_col,"Potential (%)","P/S","P/S-snitt","GrowthScore","DividendScore","Värdering"]
-    show_cols = [c for c in show_cols if c in show.columns]
-    if "Aktuell kurs" in show.columns:
-        show.rename(columns={"Aktuell kurs": "Kurs"}, inplace=True)
-    st.dataframe(
-        show[show_cols],
-        use_container_width=True,
-        hide_index=True
+    # Val av läge och riktkurs
+    mode = st.radio("Köp-läge", ["Tillväxt","Utdelning"], horizontal=True, index=0)
+    riktkurs_val = st.selectbox(
+        "Vilken riktkurs ska användas?",
+        ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"],
+        index=1
     )
+    subset = st.radio("Urval", ["Alla bolag","Endast portfölj"], horizontal=True)
 
+    # Filter: sektor & cap-buckets
+    sectors = sorted([s for s in df.get("Sektor", pd.Series([])).astype(str).unique() if s and s != "nan"])
+    pick_sectors = st.multiselect("Filtrera på sektor", options=sectors, default=[])
+    cap_opts = ["Micro","Small","Mid","Large","Mega"]
+    pick_caps = st.multiselect("Filtrera på börsvärde-bucket", options=cap_opts, default=[])
 
-# ------------------------------
-# Hjälp: safe_float på Series
-# ------------------------------
-def safe_float_series(s: pd.Series) -> pd.Series:
-    try:
-        return pd.to_numeric(s, errors="coerce").fillna(0.0)
-    except Exception:
-        return pd.Series([0.0]*len(s))
+    # Basdata för urval
+    base = df.copy()
+    if subset == "Endast portfölj":
+        base = base[base.get("Antal aktier", 0) > 0].copy()
+
+    # behov: pris + riktkurs + mcap
+    need_cols = ["Aktuell kurs", riktkurs_val, "Market Cap (nu)"]
+    for c in need_cols:
+        if c not in base.columns:
+            base[c] = 0.0
+    base = base[(base["Aktuell kurs"] > 0) & (base[riktkurs_val] > 0)].copy()
+    if base.empty:
+        st.info("Inga bolag matchar uppsatta kriterier (saknar pris/riktkurs).")
+        return
+
+    # sektorfilter
+    if pick_sectors:
+        base = base[base["Sektor"].astype(str).isin(pick_sectors)].copy()
+
+    # cap bucket beräkning + filter
+    if "Market Cap (nu)" not in base.columns:
+        base["Market Cap (nu)"] = 0.0
+    base["_Risklabel"] = base["Market Cap (nu)"].apply(_risk_label)
+    if pick_caps:
+        base = base[base["_Risklabel"].isin(pick_caps)].copy()
+
+    if base.empty:
+        st.info("Inga bolag kvar efter filtrering.")
+        return
+
+    # beräkna P/S-snitt + score
+    base["P/S-snitt"] = base.apply(_ps_snitt, axis=1)
+    scores = []
+    for i, r in base.iterrows():
+        sc = _score_row(r, mode=mode, riktkurs_col=riktkurs_val)
+        for k, v in sc.items():
+            base.at[i, k] = v
+        scores.append(sc["TotalScore"])
+
+    # sortera på högst poäng
+    base = base.sort_values(by="TotalScore", ascending=False).reset_index(drop=True)
+
+    # stabil bläddring
+    key_idx = "inv_idx"
+    st.session_state.setdefault(key_idx, 0)
+    st.session_state[key_idx] = min(st.session_state[key_idx], max(0, len(base)-1))
+
+    st.write(f"Förslag {st.session_state[key_idx]+1}/{len(base)}")
+
+    col_prev, col_next = st.columns([1,1])
+    with col_prev:
+        if st.button("⬅️ Föregående", use_container_width=True):
+            st.session_state[key_idx] = max(0, st.session_state[key_idx]-1)
+    with col_next:
+        if st.button("➡️ Nästa", use_container_width=True):
+            st.session_state[key_idx] = min(len(base)-1, st.session_state[key_idx]+1)
+
+    r = base.iloc[st.session_state[key_idx]]
+
+    # presentation
+    st.subheader(f"{r.get('Bolagsnamn','')} ({r.get('Ticker','')})")
+
+    # huvudrader
+    price = float(r.get("Aktuell kurs", 0.0) or 0.0)
+    target = float(r.get(riktkurs_val, 0.0) or 0.0)
+    mcap_now = float(r.get("Market Cap (nu)", 0.0) or 0.0)
+    valuta = str(r.get("Valuta",""))
+    ps_now = float(r.get("P/S", 0.0) or 0.0)
+    ps_avg = float(r.get("P/S-snitt", 0.0) or 0.0)
+    shares_m = float(r.get("Utestående aktier", 0.0) or 0.0)
+
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("Aktuell kurs", f"{price:.2f} {valuta}")
+        st.metric("Riktkurs (vald)", f"{target:.2f} {valuta}")
+        st.metric("Uppsida", f"{float(r.get('Upside (%)',0.0)):.1f} %")
+    with cols[1]:
+        st.metric("Market Cap (nu)", _human_mc(mcap_now, valuta))
+        st.metric("P/S (nu)", f"{ps_now:.2f}" if ps_now>0 else "-")
+        st.metric("P/S-snitt (Q1–Q4)", f"{ps_avg:.2f}" if ps_avg>0 else "-")
+    with cols[2]:
+        st.metric("Utestående aktier", f"{shares_m:,.2f} M" if shares_m>0 else "-")
+        st.metric("Risklabel", str(r.get("_Risklabel","-")))
+        st.metric("Sektor", str(r.get("Sektor","-")))
+
+    # expanders
+    with st.expander("Nyckeltal & diagnos", expanded=False):
+        de = float(r.get("Debt/Equity", 0.0) or 0.0)
+        gm = float(r.get("Bruttomarginal (%)", 0.0) or 0.0)
+        nm = float(r.get("Nettomarginal (%)", 0.0) or 0.0)
+        fcf = float(r.get("FCF TTM (valuta)", 0.0) or 0.0)
+        cash = float(r.get("Kassa (valuta)", 0.0) or 0.0)
+        runway = float(r.get("Runway (kvartal)", 0.0) or 0.0)
+        cagr = float(r.get("CAGR 5 år (%)", 0.0) or 0.0)
+        dy = _div_yield(float(r.get("Årlig utdelning",0.0) or 0.0), price)
+
+        diag = {
+            "Debt/Equity": _grade(de, 0.5, 1.0, reverse=True),
+            "Bruttomarginal": _grade(gm, 50, 30, reverse=False),
+            "Nettomarginal": _grade(nm, 20, 10, reverse=False),
+            "FCF TTM": "Bra" if fcf > 0 else "Svagt",
+            "Kassa": "Bra" if cash > 0 else "Svagt",
+            "Runway (kvartal)": "Bra" if runway >= 8 else ("Ok" if runway >= 4 else "Svagt"),
+            "CAGR 5 år": _grade(cagr, 25, 10, reverse=False),
+            "Direktavkastning": _grade(dy, 5, 3, reverse=False) if mode=="Utdelning" else ("Info"),
+        }
+
+        df_kpis = pd.DataFrame([
+            ["Debt/Equity", f"{de:.2f}", diag["Debt/Equity"]],
+            ["Bruttomarginal (%)", f"{gm:.1f}", diag["Bruttomarginal"]],
+            ["Nettomarginal (%)", f"{nm:.1f}", diag["Nettomarginal"]],
+            ["FCF TTM", _human_mc(fcf, valuta), diag["FCF TTM"]],
+            ["Kassa", _human_mc(cash, valuta), diag["Kassa"]],
+            ["Runway (kvartal)", f"{runway:.1f}", diag["Runway (kvartal)"]],
+            ["CAGR 5 år (%)", f"{cagr:.1f}", diag["CAGR 5 år"]],
+            ["Direktavkastning (%)", f"{dy:.2f}", diag["Direktavkastning"]],
+        ], columns=["Nyckeltal","Värde","Bedömning"])
+        st.dataframe(df_kpis, hide_index=True, use_container_width=True)
+
+    with st.expander("Historik: P/S & MCAP (om tillgängligt)", expanded=False):
+        cols_ps = ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]
+        data = []
+        for k in cols_ps:
+            v = r.get(k, None)
+            data.append(f"{float(v):.2f}" if v and float(v)>0 else "-")
+        mcaps = []
+        for k in ["MCAP Q1","MCAP Q2","MCAP Q3","MCAP Q4"]:
+            if k in r and pd.notna(r[k]) and float(r[k])>0:
+                mcaps.append(_human_mc(float(r[k]), valuta))
+            else:
+                mcaps.append("-")
+        hist = pd.DataFrame([data, mcaps], index=["P/S","MCAP"], columns=["Q1","Q2","Q3","Q4"])
+        st.dataframe(hist, use_container_width=True)
+
+    # visning av poäng
+    with st.expander("Poängförklaring", expanded=False):
+        st.write(f"**TotalScore:** {r.get('TotalScore',0):.3f}")
+        st.write(f"- ValuationScore: {r.get('ValuationScore',0):.3f}")
+        st.write(f"- QualityScore: {r.get('QualityScore',0):.3f}")
+        st.write(f"- RiskScore: {r.get('RiskScore',0):.3f}")
+        st.write(f"- ModeScore ({mode}): {r.get('ModeScore',0):.3f}")
+
+    # lista / tabell (topp 15) för snabb överblick
+    st.markdown("### Toppval just nu")
+    show_cols = [
+        "Ticker","Bolagsnamn","Sektor","_Risklabel",
+        "Aktuell kurs", riktkurs_val, "Upside (%)",
+        "Market Cap (nu)","P/S","P/S-snitt",
+        "TotalScore"
+    ]
+    for c in show_cols:
+        if c not in base.columns:
+            base[c] = ""
+    grid = base[show_cols].copy()
+    grid["Market Cap (nu)"] = grid["Market Cap (nu)"].apply(lambda x: _human_mc(float(x or 0.0), valuta))
+    grid = grid.head(15)
+    st.dataframe(grid, use_container_width=True, hide_index=True)

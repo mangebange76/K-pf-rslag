@@ -3,41 +3,13 @@
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-from typing import Dict
 
-# --- Lokal Stockholm-tid om pytz finns (annars systemtid) ---
-try:
-    import pytz
-    TZ_STHLM = pytz.timezone("Europe/Stockholm")
-    def now_stamp():
-        return datetime.now(TZ_STHLM).strftime("%Y-%m-%d")
-    def now_dt():
-        return datetime.now(TZ_STHLM)
-except Exception:
-    def now_stamp():
-        return datetime.now().strftime("%Y-%m-%d")
-    def now_dt():
-        return datetime.now()
-
-st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
-
-# ========== Importera modul-funktioner ==========
-# Valutapanel (säker state-hantering)
-from stockapp.rates import sidebar_rates
-
-# I/O mot Google Sheets
-from stockapp.storage import hamta_data, spara_data
-
-# Beräkningar & schemastöd
-from stockapp.utils import (
-    ensure_schema,
-    migrera_gamla_riktkurskolumner,
-    konvertera_typer,
-    uppdatera_berakningar,
-)
-
-# Vyer
+# --- StockApp-moduler ---
+from stockapp.config import STANDARD_VALUTAKURSER
+from stockapp.storage import hamta_data, spara_data, backup_snapshot_sheet
+from stockapp.rates import las_sparade_valutakurser, spara_valutakurser, hamta_valutakurser_auto
+from stockapp.utils import ensure_schema, konvertera_typer, uppdatera_berakningar
+from stockapp.batch import sidebar_batch_controls
 from stockapp.views import (
     kontrollvy,
     analysvy,
@@ -45,132 +17,200 @@ from stockapp.views import (
     visa_investeringsforslag,
     visa_portfolj,
 )
-
-# Batchpanel (köläge, 1/X-uppdateringar, loggar)
-from stockapp.batch import sidebar_batch_controls
-
-# Datakällor/runners (full uppdatering respektive endast pris)
-from stockapp.sources import run_update_full, run_update_price_only
+from stockapp.sources import run_update_full, update_price_only_yf
 
 
-# ======= Liten helper så övrig kod kan fortsätta anropa växelkursen på samma sätt =======
-def hamta_valutakurs(valuta: str, user_rates: Dict[str, float]) -> float:
-    """Enkel helper: returnerar växelkursen för 'valuta' till SEK."""
-    if not valuta:
-        return 1.0
-    try:
-        return float(user_rates.get(str(valuta).upper(), 1.0))
-    except Exception:
-        return 1.0
+st.set_page_config(page_title="📊 Aktieanalys och investeringsförslag", layout="wide")
 
 
-# ======= Callbacks som batchpanelen kan använda =======
-def _save(df: pd.DataFrame):
-    """Skriv hela DataFrame till Google Sheets (utan snapshot här – styrs i batchpanelen)."""
-    spara_data(df)
-
-
-def _recompute(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
-    """Kör om alla härledda kolumner."""
-    return uppdatera_berakningar(df, user_rates)
-
-
-# ============================== MAIN ==============================
-
-def main():
-    st.title("📊 Aktieanalys och investeringsförslag")
-
-    # --- Sidopanel: valutakurser (ny robust modul) ---
-    user_rates = sidebar_rates()  # {"USD":..., "EUR":..., "NOK":..., "CAD":..., "SEK": 1.0}
-
-    # --- Sidopanel: utility-knappar för cache & laddning ---
-    st.sidebar.markdown("---")
-    col_reload, col_clear = st.sidebar.columns(2)
-    with col_reload:
-        if st.button("↻ Läs om data från Google Sheets", key="btn_reload_sheet"):
-            st.cache_data.clear()
-    with col_clear:
-        if st.button("🧹 Töm cache (lokalt)", key="btn_clear_cache"):
-            st.cache_data.clear()
-            st.sidebar.info("Cache rensad.")
-
-    # --- Läs data från Google Sheets ---
-    #    (Modulens hamta_data tar hand om kopplingen; vi säkerställer schema & typer här.)
-    df = hamta_data()
+# -------------------------------------------------------------
+# Små hjälpare
+# -------------------------------------------------------------
+def _recompute(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
+    """
+    Säkerställ schema + typer och kör härledda beräkningar (P/S-snitt, riktkurser m.m.).
+    Använd denna före visningar/analys/sparning.
+    """
     df = ensure_schema(df)
-    df = migrera_gamla_riktkurskolumner(df)
     df = konvertera_typer(df)
+    df = uppdatera_berakningar(df, user_rates)
+    return df
 
-    # Behåll en referens i session_state om batchpanelen vill jobba mot samma DF-objekt
-    st.session_state["_df_ref"] = df
 
-    # --- Sidopanel: batch-körning (köläge, 1/X text, loggar)
+def _save(df: pd.DataFrame, make_snapshot: bool = False):
+    """Spara till Google Sheet, ev. med snapshot före."""
+    try:
+        spara_data(df, do_snapshot=make_snapshot)
+        st.sidebar.success("✅ Ändringar sparade till Google Sheets.")
+    except Exception as e:
+        st.sidebar.error(f"❌ Fel vid sparning: {e}")
+
+
+# -------------------------------------------------------------
+# Sidopanel: valutakurser (utan experimental_rerun)
+# -------------------------------------------------------------
+def _sidebar_rates() -> dict:
+    st.sidebar.header("💱 Valutakurser → SEK")
+
+    # 1) Ladda sparade eller standard (engångs-init i session_state)
+    try:
+        saved = las_sparade_valutakurser()
+    except Exception:
+        saved = {}
+
+    defaults = {
+        "USD": float(saved.get("USD", STANDARD_VALUTAKURSER["USD"])),
+        "NOK": float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"])),
+        "CAD": float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"])),
+        "EUR": float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"])),
+        "SEK": 1.0,
+    }
+
+    # Initiera session state en gång
+    for k_sym, key in [("USD","rate_usd_input"),("NOK","rate_nok_input"),
+                       ("CAD","rate_cad_input"),("EUR","rate_eur_input")]:
+        if key not in st.session_state:
+            st.session_state[key] = float(defaults[k_sym])
+
+    # Knappar FÖRE fälten så vi kan uppdatera session_state tryggt
+    col_btn1, col_btn2 = st.sidebar.columns(2)
+    with col_btn1:
+        if st.button("🌐 Hämta kurser autom."):
+            try:
+                auto_rates, misses, provider = hamta_valutakurser_auto()
+                # Sätt in i session_state INNAN widgets renderas
+                st.session_state.rate_usd_input = float(auto_rates.get("USD", st.session_state.rate_usd_input))
+                st.session_state.rate_nok_input = float(auto_rates.get("NOK", st.session_state.rate_nok_input))
+                st.session_state.rate_cad_input = float(auto_rates.get("CAD", st.session_state.rate_cad_input))
+                st.session_state.rate_eur_input = float(auto_rates.get("EUR", st.session_state.rate_eur_input))
+                st.sidebar.success(f"Kurser uppdaterade (källa: {provider}).")
+                if misses:
+                    st.sidebar.warning("Missar:\n- " + "\n- ".join(misses))
+            except Exception as e:
+                st.sidebar.error(f"Kunde inte hämta kurser automatiskt: {e}")
+    with col_btn2:
+        if st.button("💾 Spara kurser"):
+            try:
+                spara_valutakurser({
+                    "USD": st.session_state.rate_usd_input,
+                    "NOK": st.session_state.rate_nok_input,
+                    "CAD": st.session_state.rate_cad_input,
+                    "EUR": st.session_state.rate_eur_input,
+                    "SEK": 1.0,
+                })
+                st.sidebar.success("Valutakurser sparade.")
+            except Exception as e:
+                st.sidebar.error(f"Fel vid sparning: {e}")
+
+    # Fält (kopplade till session_state-keys)
+    usd = st.sidebar.number_input("USD → SEK", value=float(st.session_state.rate_usd_input), step=0.01, format="%.4f", key="rate_usd_input")
+    nok = st.sidebar.number_input("NOK → SEK", value=float(st.session_state.rate_nok_input), step=0.01, format="%.4f", key="rate_nok_input")
+    cad = st.sidebar.number_input("CAD → SEK", value=float(st.session_state.rate_cad_input), step=0.01, format="%.4f", key="rate_cad_input")
+    eur = st.sidebar.number_input("EUR → SEK", value=float(st.session_state.rate_eur_input), step=0.01, format="%.4f", key="rate_eur_input")
+
+    # Läs sparade (återställ) – uppdaterar session_state värden, nästa körning speglar i fälten
+    if st.sidebar.button("↻ Läs sparade"):
+        try:
+            sr = las_sparade_valutakurser()
+            st.session_state.rate_usd_input = float(sr.get("USD", st.session_state.rate_usd_input))
+            st.session_state.rate_nok_input = float(sr.get("NOK", st.session_state.rate_nok_input))
+            st.session_state.rate_cad_input = float(sr.get("CAD", st.session_state.rate_cad_input))
+            st.session_state.rate_eur_input = float(sr.get("EUR", st.session_state.rate_eur_input))
+            st.sidebar.info("Inlästa sparade kurser.")
+        except Exception as e:
+            st.sidebar.error(f"Kunde inte läsa sparade kurser: {e}")
+
+    return {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
+
+
+# -------------------------------------------------------------
+# Sidopanel: batch & actions
+# -------------------------------------------------------------
+def _sidebar_batch_and_actions(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame | None:
+    """
+    Visar batchpanelen och returnerar ev. uppdaterad df (annars None).
+    """
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🛠️ Uppdateringar")
-    # - runner för FULL uppdatering (allt för en ticker)
-    st.session_state.setdefault("runner_full", run_update_full)
-    # - runner för ENDAST PRIS (snabbknapp)
-    st.session_state.setdefault("runner_price", run_update_price_only)
+    st.sidebar.subheader("🛠️ Batch & åtgärder")
 
-    # Visa batchkontrollerna; funktionen kan returnera samma df eller ett uppdaterat df efter körning.
-    # Den här panelen erbjuder:
-    # - Skapa batchkö (ex. 10–50 st, A–Ö eller äldst-uppdaterade först)
-    # - Kör batch (med progressbar och “i/X” text)
-    # - Loggar: changed/misses och senaste körning
-    df = sidebar_batch_controls(
-        df,
-        user_rates,
+    # Runner-funktioner (signatur: (df, user_rates, ticker) -> (df_out, info_str))
+    def _full_runner(df_in: pd.DataFrame, ur: dict, tkr: str):
+        return run_update_full(df_in, ur, tkr)
+
+    def _price_runner(df_in: pd.DataFrame, ur: dict, tkr: str):
+        return update_price_only_yf(df_in, ur, tkr)
+
+    # Batch-UI & körning
+    updated_df = sidebar_batch_controls(
+        df=df,
+        user_rates=user_rates,
         save_cb=_save,
         recompute_cb=_recompute,
-        runner=st.session_state["runner_full"],
-        price_runner=st.session_state["runner_price"],
+        runner=_full_runner,
+        price_runner=_price_runner,
     )
+    return updated_df
 
-    # --- Router för vy-val ---
+
+# -------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------
+def main():
+    # 1) Sidopanel: valutakurser
+    user_rates = _sidebar_rates()
+
+    # 2) Läs data från Google Sheet
+    try:
+        df_raw = hamta_data()
+    except Exception as e:
+        st.error(f"❌ Kunde inte läsa data från Google Sheets: {e}")
+        df_raw = pd.DataFrame({})
+
+    # 3) Robust: schema + typer och en minsta tom-df om helt tomt
+    if df_raw is None or df_raw.empty:
+        df_raw = pd.DataFrame({})
+    df = ensure_schema(df_raw)
+    df = konvertera_typer(df)
+
+    # 4) Beräkningar (P/S-snitt, riktkurser m.m.) och spara referenser
+    df_calc = _recompute(df.copy(), user_rates)
+    st.session_state["_df_ref"] = df  # “rå” (utan mellanberäkningar) om du föredrar
+    st.session_state["_df_calc"] = df_calc
+
+    # 5) Batch & åtgärder i sidopanelen (kan returnera uppdaterad df)
+    maybe_updated = _sidebar_batch_and_actions(df_calc, user_rates)
+    if maybe_updated is not None:
+        df_calc = _recompute(maybe_updated, user_rates)
+        st.session_state["_df_ref"] = ensure_schema(maybe_updated)
+        st.session_state["_df_calc"] = df_calc
+
+    # 6) Meny och vyer
     st.sidebar.markdown("---")
     meny = st.sidebar.radio(
         "📌 Välj vy",
         ["Kontroll", "Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"],
-        index=0,
-        key="main_view_choice",
-        horizontal=False
+        index=0
     )
 
-    # Säkerställ att vi räknar om härledda kolumner när det behövs
-    df_calc = uppdatera_berakningar(df.copy(), user_rates)
-
     if meny == "Kontroll":
+        # Skicka beräknad df för smidigare visning
         kontrollvy(df_calc)
     elif meny == "Analys":
         analysvy(df_calc, user_rates)
     elif meny == "Lägg till / uppdatera bolag":
-        # Den här vyn hanterar även "Manuell prognoslista" enligt specifikationen.
         df2 = lagg_till_eller_uppdatera(df_calc, user_rates)
-        # Spara om vyn har ändrat något (vyn returnerar ev. uppdaterad df)
-        if df2 is not None and not df2.equals(df):
-            spara_data(df2)
-            df = df2
-            st.success("Ändringar sparade.")
+        if df2 is not None:
+            df_calc = _recompute(df2, user_rates)
+            st.session_state["_df_ref"] = ensure_schema(df2)
+            st.session_state["_df_calc"] = df_calc
+            # Spara direkt vid ändringar (utan snapshot som default)
+            _save(df_calc, make_snapshot=False)
     elif meny == "Investeringsförslag":
+        df_calc = _recompute(df_calc, user_rates)
         visa_investeringsforslag(df_calc, user_rates)
     elif meny == "Portfölj":
+        df_calc = _recompute(df_calc, user_rates)
         visa_portfolj(df_calc, user_rates)
-
-    # --- Visa senaste batch-logg längst ned (om satt av batchpanelen) ---
-    if "last_batch_log" in st.session_state and st.session_state["last_batch_log"]:
-        st.divider()
-        with st.expander("📒 Senaste batch-logg", expanded=False):
-            log = st.session_state["last_batch_log"]
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Ändringar (ticker → fält)**")
-                st.json(log.get("changed", {}))
-            with col2:
-                st.markdown("**Missar (ticker → skäl)**")
-                st.json(log.get("misses", {}))
-            if "queue_info" in log:
-                st.markdown("**Kö-information**")
-                st.json(log["queue_info"])
 
 
 if __name__ == "__main__":

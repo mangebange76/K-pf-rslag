@@ -1,42 +1,35 @@
+# app.py
 # -*- coding: utf-8 -*-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import gspread
-import requests
+from __future__ import annotations
+
 import time
 from datetime import datetime, timedelta
+from typing import Dict, Optional, Tuple
+
+import gspread
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 from google.oauth2.service_account import Credentials
 
-# ----- Vyer + Batch + Runner -----
+# --- Våra moduler
 from stockapp.views import (
-    kontrollvy, analysvy, lagg_till_eller_uppdatera, visa_investeringsforslag, visa_portfolj
+    kontrollvy,
+    analysvy,
+    lagg_till_eller_uppdatera,
+    visa_investeringsforslag,
+    visa_portfolj,
 )
 from stockapp.batch import sidebar_batch_controls
-from stockapp.sources import update_price_only_runner  # <-- standard-runnern (pris-only)
+from stockapp.sources import _safe_float  # nyttjas för robusthet i vissa hjälpare
 
-# Om du har en calc-modul – använd den. Annars fallback.
-try:
-    from stockapp.calc import uppdatera_berakningar
-except Exception:
-    def uppdatera_berakningar(df, user_rates):
-        """Minimal fallback: beräkna P/S-snitt = medel av positiva Q1–Q4."""
-        if df is None or df.empty:
-            return df
-        need = {"P/S Q1","P/S Q2","P/S Q3","P/S Q4"}
-        if need.issubset(df.columns):
-            vals = df[list(need)].replace({None:0}).astype(float)
-            # medel på rader > 0
-            def _row_mean_pos(row):
-                arr = [x for x in row.tolist() if x and x > 0]
-                return round(float(np.mean(arr)),2) if arr else 0.0
-            df["P/S-snitt"] = vals.apply(_row_mean_pos, axis=1)
-        else:
-            if "P/S-snitt" not in df.columns:
-                df["P/S-snitt"] = 0.0
-        return df
+# -------------------------------------------------------------------------------------
+# Grund-inställningar
+# -------------------------------------------------------------------------------------
+st.set_page_config(page_title="Aktieanalys & Investeringsförslag", layout="wide")
 
-# --- Lokal Stockholm-tid om pytz finns (annars systemtid) ---
+# Lokal Stockholm-tid om pytz finns (annars systemtid)
 try:
     import pytz
     TZ_STHLM = pytz.timezone("Europe/Stockholm")
@@ -50,9 +43,9 @@ except Exception:
     def now_dt():
         return datetime.now()
 
-st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
-
-# --- Google Sheets-koppling ---
+# -------------------------------------------------------------------------------------
+# Google Sheets-koppling
+# -------------------------------------------------------------------------------------
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
 RATES_SHEET_NAME = "Valutakurser"
@@ -62,7 +55,6 @@ credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIA
 client = gspread.authorize(credentials)
 
 def _with_backoff(func, *args, **kwargs):
-    """Liten backoff-hjälpare för att mildra 429/kvotfel."""
     delays = [0, 0.5, 1.0, 2.0]
     last_err = None
     for d in delays:
@@ -77,10 +69,10 @@ def _with_backoff(func, *args, **kwargs):
 def get_spreadsheet():
     return client.open_by_url(SHEET_URL)
 
-def skapa_koppling():
+def _sheet_main():
     return get_spreadsheet().worksheet(SHEET_NAME)
 
-def skapa_rates_sheet_if_missing():
+def _rates_sheet():
     ss = get_spreadsheet()
     try:
         return ss.worksheet(RATES_SHEET_NAME)
@@ -90,57 +82,49 @@ def skapa_rates_sheet_if_missing():
         _with_backoff(ws.update, [["Valuta","Kurs"]])
         return ws
 
-def hamta_data():
-    sheet = skapa_koppling()
-    data = _with_backoff(sheet.get_all_records)
-    return pd.DataFrame(data)
+def hamta_data() -> pd.DataFrame:
+    try:
+        ws = _sheet_main()
+        data = _with_backoff(ws.get_all_records)
+        df = pd.DataFrame(data)
+    except Exception:
+        df = pd.DataFrame()
+    return df
 
-def spara_data(df: pd.DataFrame, do_snapshot: bool = False):
-    """Skriv hela DataFrame till huvudbladet. (Snapshot valfritt – normalt False i batch.)"""
-    if do_snapshot:
-        try:
-            backup_snapshot_sheet(df, base_sheet_name=SHEET_NAME)
-        except Exception as e:
-            st.warning(f"Kunde inte skapa snapshot före skrivning: {e}")
-    sheet = skapa_koppling()
-    _with_backoff(sheet.clear)
-    _with_backoff(sheet.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
+def spara_data(df: pd.DataFrame):
+    """Skriv hela DataFrame till huvudbladet."""
+    if df is None or df.empty:
+        # Skydd mot att råka skriva tomt av misstag
+        st.warning("Sparning avbruten: DF tom.")
+        return
+    ws = _sheet_main()
+    _with_backoff(ws.clear)
+    _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
 
-# --- Tids-/utility ---
-def _ts_str():
-    return now_dt().strftime("%Y%m%d-%H%M%S")
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-# --- Standard valutakurser till SEK (fallback/startvärden) ---
-STANDARD_VALUTAKURSER = {
-    "USD": 9.75,
-    "NOK": 0.95,
-    "CAD": 7.05,
-    "EUR": 11.18,
-    "SEK": 1.0,
-}
+# -------------------------------------------------------------------------------------
+# Valutor
+# -------------------------------------------------------------------------------------
+STANDARD_VALUTAKURSER = {"USD": 9.75, "NOK": 0.95, "CAD": 7.05, "EUR": 11.18, "SEK": 1.0}
 
 @st.cache_data(show_spinner=False)
-def las_sparade_valutakurser_cached(nonce: int):
-    ws = skapa_rates_sheet_if_missing()
-    rows = _with_backoff(ws.get_all_records)  # [{'Valuta': 'USD', 'Kurs': '9.46'}, ...]
+def _las_sparade_valutakurser_cached(nonce: int):
+    ws = _rates_sheet()
+    rows = _with_backoff(ws.get_all_records)
     out = {}
     for r in rows:
-        cur = str(r.get("Valuta", "")).upper().strip()
-        val = str(r.get("Kurs", "")).replace(",", ".").strip()
+        c = str(r.get("Valuta","")).upper().strip()
+        v = str(r.get("Kurs","")).replace(",", ".").strip()
         try:
-            out[cur] = float(val)
-        except:
+            out[c] = float(v)
+        except Exception:
             pass
     return out
 
-def las_sparade_valutakurser() -> dict:
-    return las_sparade_valutakurser_cached(st.session_state.get("rates_reload", 0))
+def las_sparade_valutakurser() -> Dict[str, float]:
+    return _las_sparade_valutakurser_cached(st.session_state.get("rates_reload", 0))
 
-def spara_valutakurser(rates: dict):
-    ws = skapa_rates_sheet_if_missing()
+def spara_valutakurser(rates: Dict[str,float]):
+    ws = _rates_sheet()
     body = [["Valuta","Kurs"]]
     for k in ["USD","NOK","CAD","EUR","SEK"]:
         v = rates.get(k, STANDARD_VALUTAKURSER.get(k, 1.0))
@@ -148,285 +132,200 @@ def spara_valutakurser(rates: dict):
     _with_backoff(ws.clear)
     _with_backoff(ws.update, body)
 
-def hamta_valutakurser_auto():
-    """
-    Automatisk hämtning: Frankfurter → exchangerate.host. Fyller luckor med sparade/standard.
-    """
+def hamta_valutakurser_auto() -> Tuple[Dict[str,float], list, str]:
+    """FMP→Frankfurter→exchangerate.host (fallback). Returnerar (rates, misses, provider)."""
     misses = []
     rates = {}
     provider = None
-
-    # 1) Frankfurter (ECB)
+    # 1) FMP om key finns
+    fmp_key = st.secrets.get("FMP_API_KEY", "")
+    base = st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
+    if fmp_key:
+        try:
+            def _pair(pair):
+                url = f"{base}/api/v3/fx/{pair}"
+                r = requests.get(url, params={"apikey": fmp_key}, timeout=15)
+                if r.status_code != 200:
+                    return None, r.status_code
+                j = r.json() or {}
+                return (float(j.get("price")) if j.get("price") is not None else None), 200
+            provider = "FMP"
+            for pair in ("USDSEK","NOKSEK","CADSEK","EURSEK"):
+                v, sc = _pair(pair)
+                if v and v > 0:
+                    rates[pair[:3]] = float(v)
+                else:
+                    misses.append(f"{pair} (HTTP {sc if sc else '??'})")
+        except Exception:
+            pass
+    # 2) Frankfurter
     if len(rates) < 4:
         provider = "Frankfurter"
-        for base_ccy in ("USD","EUR","CAD","NOK"):
+        for ccy in ("USD","EUR","CAD","NOK"):
             try:
-                r2 = requests.get("https://api.frankfurter.app/latest",
-                                  params={"from": base_ccy, "to": "SEK"}, timeout=10)
-                if r2.status_code == 200:
-                    rr = r2.json() or {}
-                    v = (rr.get("rates") or {}).get("SEK")
-                    if v:
-                        rates[base_ccy] = float(v)
-            except Exception:
-                pass
-
-    # 2) exchangerate.host (fallback)
-    if len(rates) < 4:
-        provider = "exchangerate.host"
-        for base_ccy in ("USD","EUR","CAD","NOK"):
-            try:
-                r = requests.get("https://api.exchangerate.host/latest",
-                                 params={"base": base_ccy, "symbols": "SEK"}, timeout=10)
+                r = requests.get("https://api.frankfurter.app/latest", params={"from": ccy, "to": "SEK"}, timeout=10)
                 if r.status_code == 200:
                     v = (r.json() or {}).get("rates", {}).get("SEK")
                     if v:
-                        rates[base_ccy] = float(v)
+                        rates[ccy] = float(v)
             except Exception:
                 pass
-
-    # Fyll luckor med sparade/standard
+    # 3) exchangerate.host
+    if len(rates) < 4:
+        provider = "exchangerate.host"
+        for ccy in ("USD","EUR","CAD","NOK"):
+            try:
+                r = requests.get("https://api.exchangerate.host/latest", params={"base": ccy, "symbols": "SEK"}, timeout=10)
+                if r.status_code == 200:
+                    v = (r.json() or {}).get("rates", {}).get("SEK")
+                    if v:
+                        rates[ccy] = float(v)
+            except Exception:
+                pass
+    # Fyll luckor från sparat/standard
     saved = las_sparade_valutakurser()
-    for base_ccy in ("USD","EUR","CAD","NOK"):
-        if base_ccy not in rates:
-            rates[base_ccy] = float(saved.get(base_ccy, STANDARD_VALUTAKURSER.get(base_ccy, 1.0)))
-
+    for ccy in ("USD","EUR","CAD","NOK"):
+        if ccy not in rates:
+            rates[ccy] = float(saved.get(ccy, STANDARD_VALUTAKURSER.get(ccy, 1.0)))
+    rates["SEK"] = 1.0
     return rates, misses, (provider or "okänd")
 
-# --- Kolumnschema & TS-fält --------------------------------------------------
-TS_FIELDS = {
-    "Utestående aktier": "TS_Utestående aktier",
-    "P/S": "TS_P/S",
-    "P/S Q1": "TS_P/S Q1",
-    "P/S Q2": "TS_P/S Q2",
-    "P/S Q3": "TS_P/S Q3",
-    "P/S Q4": "TS_P/S Q4",
-    "Omsättning idag": "TS_Omsättning idag",
-    "Omsättning nästa år": "TS_Omsättning nästa år",
-}
-
-FINAL_COLS = [
-    # Grund
-    "Ticker", "Bolagsnamn", "Utestående aktier",
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-    "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-    "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier", "Valuta", "Årlig utdelning", "Aktuell kurs",
-    "CAGR 5 år (%)", "P/S-snitt",
-    # Tidsstämplar & källor
-    "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa",
-    # TS
-    TS_FIELDS["Utestående aktier"],
-    TS_FIELDS["P/S"], TS_FIELDS["P/S Q1"], TS_FIELDS["P/S Q2"], TS_FIELDS["P/S Q3"], TS_FIELDS["P/S Q4"],
-    TS_FIELDS["Omsättning idag"], TS_FIELDS["Omsättning nästa år"],
+# -------------------------------------------------------------------------------------
+# Schema-säkring (minimi-kolumner så vyer fungerar)
+# -------------------------------------------------------------------------------------
+MIN_COLS = [
+    "Ticker","Bolagsnamn","Sektor","Valuta","Aktuell kurs",
+    "Utestående aktier","Market Cap (nu)","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
+    "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
+    "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
+    "Bruttomarginal (%)","Nettomarginal (%)","Debt/Equity","Kassa (valuta)","FCF TTM (valuta)","Runway (mån)",
+    "Antal aktier","Årlig utdelning","GAV SEK",
+    "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa",
+    # TS-kolumner
+    "TS_Utestående aktier","TS_P/S","TS_P/S Q1","TS_P/S Q2","TS_P/S Q3","TS_P/S Q4","TS_Omsättning idag","TS_Omsättning nästa år",
 ]
 
-def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
-    for kol in FINAL_COLS:
-        if kol not in df.columns:
-            if any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs","aktier","snitt"]):
-                df[kol] = 0.0
-            elif kol.startswith("TS_"):
-                df[kol] = ""
-            elif kol in ("Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa"):
-                df[kol] = ""
+def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        df = pd.DataFrame({c: [] for c in MIN_COLS})
+    for c in MIN_COLS:
+        if c not in df.columns:
+            # numeriska default för mätvärden
+            if any(x in c.lower() for x in ["p/s","omsättning","riktkurs","aktier","marginal","debt","kassa","fcf","runway","mcap","kurs","andel","utdelning","gav"]):
+                df[c] = 0.0
+            elif c.startswith("TS_") or c in ["Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa","Sektor","Valuta","Bolagsnamn","Ticker"]:
+                df[c] = ""
             else:
-                df[kol] = ""
+                df[c] = ""
+    # Duplicats-fix
     df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
 
-def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
-    mapping = {
-        "Riktkurs 2026": "Riktkurs om 1 år",
-        "Riktkurs 2027": "Riktkurs om 2 år",
-        "Riktkurs 2028": "Riktkurs om 3 år",
-        "Riktkurs om idag": "Riktkurs idag",
-    }
-    for old, new in mapping.items():
-        if old in df.columns:
-            if new not in df.columns:
-                df[new] = 0.0
-            new_vals = pd.to_numeric(df[new], errors="coerce").fillna(0.0)
-            old_vals = pd.to_numeric(df[old], errors="coerce").fillna(0.0)
-            mask = (new_vals == 0.0) & (old_vals > 0.0)
-            df.loc[mask, new] = old_vals[mask]
-            df = df.drop(columns=[old])
-    return df
-
-def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
-    num_cols = [
-        "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-        "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-        "Antal aktier", "Årlig utdelning", "Aktuell kurs", "CAGR 5 år (%)", "P/S-snitt"
-    ]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    for c in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-    for c in df.columns:
-        if str(c).startswith("TS_"):
-            df[c] = df[c].astype(str)
-    return df
-
-# --- Snapshot (valfri) -------------------------------------------------------
-def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME):
-    ss = get_spreadsheet()
-    snap_name = f"Snapshot-{_ts_str()}"
-    try:
-        ss.add_worksheet(title=snap_name, rows=max(1000, len(df)+10), cols=max(50, len(df.columns)+2))
-        ws = ss.worksheet(snap_name)
-        _with_backoff(ws.clear)
-        _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
-        st.success(f"Snapshot skapad: {snap_name}")
-    except Exception as e:
-        st.warning(f"Misslyckades skapa snapshot-flik: {e}")
-
-# ------------------------------
-# SIDOPANEL: Valutakurser (callbacks)
-# ------------------------------
-def _sidebar_rates() -> dict:
-    st.sidebar.header("💱 Valutakurser → SEK")
-
-    # initera state en gång
-    if "rate_usd_input" not in st.session_state: st.session_state.rate_usd_input = STANDARD_VALUTAKURSER["USD"]
-    if "rate_eur_input" not in st.session_state: st.session_state.rate_eur_input = STANDARD_VALUTAKURSER["EUR"]
-    if "rate_cad_input" not in st.session_state: st.session_state.rate_cad_input = STANDARD_VALUTAKURSER["CAD"]
-    if "rate_nok_input" not in st.session_state: st.session_state.rate_nok_input = STANDARD_VALUTAKURSER["NOK"]
-    if "rates_msg" not in st.session_state: st.session_state.rates_msg = ""
-
-    def _set_rates_in_state(rates: dict):
-        st.session_state.rate_usd_input = float(rates.get("USD", st.session_state.rate_usd_input))
-        st.session_state.rate_eur_input = float(rates.get("EUR", st.session_state.rate_eur_input))
-        st.session_state.rate_cad_input = float(rates.get("CAD", st.session_state.rate_cad_input))
-        st.session_state.rate_nok_input = float(rates.get("NOK", st.session_state.rate_nok_input))
-
-    def _auto_rates_cb():
-        auto_rates, misses, provider = hamta_valutakurser_auto()
-        _set_rates_in_state(auto_rates)
-        msg = f"Valutakurser hämtade (källa: {provider})."
-        if misses:
-            msg += " Missar: " + ", ".join(misses)
-        st.session_state.rates_msg = msg
-
-    def _save_rates_cb():
-        rates = {
-            "USD": float(st.session_state.rate_usd_input),
-            "EUR": float(st.session_state.rate_eur_input),
-            "CAD": float(st.session_state.rate_cad_input),
-            "NOK": float(st.session_state.rate_nok_input),
-            "SEK": 1.0,
-        }
-        spara_valutakurser(rates)
-        st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
-        st.session_state.rates_msg = "Valutakurser sparade."
-
-    def _load_saved_cb():
+# -------------------------------------------------------------------------------------
+# Sidopanel: Valutakurser
+# -------------------------------------------------------------------------------------
+def _init_rate_state():
+    # Första körningen → initiera från sparat eller standard
+    if "rate_usd_input" not in st.session_state:
         saved = las_sparade_valutakurser()
-        _set_rates_in_state(saved)
-        st.session_state.rates_msg = "Sparade kurser laddade."
+        st.session_state.rate_usd_input = float(saved.get("USD", STANDARD_VALUTAKURSER["USD"]))
+        st.session_state.rate_nok_input = float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"]))
+        st.session_state.rate_cad_input = float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"]))
+        st.session_state.rate_eur_input = float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"]))
 
-    # widgets
-    st.sidebar.number_input("USD → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_usd_input")
-    st.sidebar.number_input("EUR → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_eur_input")
-    st.sidebar.number_input("CAD → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_cad_input")
-    st.sidebar.number_input("NOK → SEK", min_value=0.0, step=0.0001, format="%.4f", key="rate_nok_input")
+def _sidebar_rates() -> Dict[str, float]:
+    st.sidebar.header("💱 Valutakurser → SEK")
+    _init_rate_state()
+
+    # Hantera “Hämta automatiskt” FÖRE widgets renderas
+    auto_fetch = st.sidebar.button("🌐 Hämta kurser automatiskt")
+    if auto_fetch:
+        auto_rates, misses, provider = hamta_valutakurser_auto()
+        # Skriv endast till *egna* state-nycklar innan widgetarna skapas
+        st.session_state.rate_usd_input = float(auto_rates.get("USD", st.session_state.rate_usd_input))
+        st.session_state.rate_nok_input = float(auto_rates.get("NOK", st.session_state.rate_nok_input))
+        st.session_state.rate_cad_input = float(auto_rates.get("CAD", st.session_state.rate_cad_input))
+        st.session_state.rate_eur_input = float(auto_rates.get("EUR", st.session_state.rate_eur_input))
+        st.sidebar.success(f"Valutakurser hämtade (källa: {provider}).")
+        if misses:
+            st.sidebar.warning("Vissa par kunde inte hämtas:\n- " + "\n- ".join(misses))
+
+    # Widgets – använder session_state-nycklar som kontrollerat sätts ovan
+    usd = st.sidebar.number_input("USD → SEK", key="rate_usd_input", step=0.01, format="%.4f")
+    nok = st.sidebar.number_input("NOK → SEK", key="rate_nok_input", step=0.01, format="%.4f")
+    cad = st.sidebar.number_input("CAD → SEK", key="rate_cad_input", step=0.01, format="%.4f")
+    eur = st.sidebar.number_input("EUR → SEK", key="rate_eur_input", step=0.01, format="%.4f")
 
     col_rates1, col_rates2 = st.sidebar.columns(2)
     with col_rates1:
-        st.button("🌐 Hämta kurser automatiskt", on_click=_auto_rates_cb)
+        if st.button("💾 Spara kurser"):
+            rates = {"USD": float(usd), "NOK": float(nok), "CAD": float(cad), "EUR": float(eur), "SEK": 1.0}
+            spara_valutakurser(rates)
+            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
+            st.sidebar.success("Valutakurser sparade.")
     with col_rates2:
-        st.button("💾 Spara kurser", on_click=_save_rates_cb)
+        if st.button("↻ Läs sparade kurser"):
+            st.cache_data.clear()
+            saved = las_sparade_valutakurser()
+            st.session_state.rate_usd_input = float(saved.get("USD", STANDARD_VALUTAKURSER["USD"]))
+            st.session_state.rate_nok_input = float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"]))
+            st.session_state.rate_cad_input = float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"]))
+            st.session_state.rate_eur_input = float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"]))
+            st.sidebar.info("Inlästa sparade kurser.")
 
-    st.sidebar.markdown("---")
-    st.sidebar.button("↻ Läs om sparade kurser", on_click=_load_saved_cb)
+    return {"USD": float(usd), "NOK": float(nok), "CAD": float(cad), "EUR": float(eur), "SEK": 1.0}
 
-    if st.session_state.rates_msg:
-        st.sidebar.info(st.session_state.rates_msg)
+# -------------------------------------------------------------------------------------
+# Sidopanel: Batch-kontroller
+# -------------------------------------------------------------------------------------
+def _sidebar_batch_and_actions(df: pd.DataFrame):
+    # Batchpanel som även sparar till Sheet efter körning
+    def _save(d: pd.DataFrame):
+        spara_data(d)
 
-    return {
-        "USD": float(st.session_state.rate_usd_input),
-        "EUR": float(st.session_state.rate_eur_input),
-        "CAD": float(st.session_state.rate_cad_input),
-        "NOK": float(st.session_state.rate_nok_input),
-        "SEK": 1.0,
-    }
-
-# --------------------------------------------
-# Sidopanel: Batch (koppling till batch-modul)
-# --------------------------------------------
-def _sidebar_batch_and_actions(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
-    def _save_cb(df_new: pd.DataFrame):
-        spara_data(df_new, do_snapshot=False)
-
-    def _recompute_cb(df_new: pd.DataFrame) -> pd.DataFrame:
-        return uppdatera_berakningar(df_new, user_rates)
-
-    df_out = sidebar_batch_controls(
+    df2 = sidebar_batch_controls(
         df,
-        user_rates,
-        save_cb=_save_cb,
-        recompute_cb=_recompute_cb,
-        runner=st.session_state.get("run_update_for_ticker")  # <-- injicera runnern
+        save_cb=_save,
+        default_sort="Äldst uppdaterade först (alla fält)",
+        default_runner_choice="Full auto",
+        default_batch_size=10,
+        commit_every=0,   # sätt >0 om du vill del-spara var N:te
     )
-    return df_out
+    return df2
 
-# -------------
-# MAIN-LOOPEN
-# -------------
+# -------------------------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------------------------
 def main():
-    st.title("📊 Aktieanalys och investeringsförslag")
+    st.title("📊 Aktieanalys & investeringsförslag")
 
-    # 1) Sidopanel valutakurser
+    # Valutakurser i sidopanel
     user_rates = _sidebar_rates()
 
-    # 2) Läs data från Google Sheets
-    try:
-        df = hamta_data()
-    except Exception as e:
-        st.error(f"Kunde inte läsa data: {e}")
-        df = pd.DataFrame({})
-    if df.empty:
-        df = pd.DataFrame({c: [] for c in FINAL_COLS})
-        df = säkerställ_kolumner(df)
-        spara_data(df)
+    # Läs data
+    df = hamta_data()
+    df = ensure_schema(df)
 
-    # 3) Säkerställ schema, migrera och typer
-    df = säkerställ_kolumner(df)
-    df = migrera_gamla_riktkurskolumner(df)
-    df = konvertera_typer(df)
+    # Batch-panel i sidopanelen
+    df = _sidebar_batch_and_actions(df)
 
-    # >>> Registrera standard-runnern (pris-only) om ingen är satt
-    if "run_update_for_ticker" not in st.session_state:
-        st.session_state["run_update_for_ticker"] = update_price_only_runner
-
-    # 4) Batch-panel i sidopanelen (kan returnera uppdaterat df)
-    df = _sidebar_batch_and_actions(df, user_rates)
-
-    # 5) Meny
-    st.sidebar.markdown("---")
-    meny = st.sidebar.radio(
-        "📌 Välj vy",
-        ["Kontroll","Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"]
-    )
+    # Meny
+    meny = st.sidebar.radio("📌 Välj vy", ["Kontroll","Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"])
 
     if meny == "Kontroll":
         kontrollvy(df)
     elif meny == "Analys":
         analysvy(df, user_rates)
     elif meny == "Lägg till / uppdatera bolag":
-        df2 = lagg_till_eller_uppdatera(df, user_rates)
-        if df2 is not None and isinstance(df2, pd.DataFrame) and not df2.equals(df):
-            spara_data(df2, do_snapshot=False)
+        df2 = lagg_till_eller_uppdatera(df, user_rates, save_cb=lambda d: spara_data(d))
+        # skriv endast om ändringar skett (editor returnerar ny DF om förändrat)
+        if df2 is not None and df2 is not df and not df2.equals(df):
+            spara_data(df2)
             df = df2
     elif meny == "Investeringsförslag":
-        df_calc = uppdatera_berakningar(df, user_rates)
-        visa_investeringsforslag(df_calc, user_rates)
+        visa_investeringsforslag(df, user_rates)
     elif meny == "Portfölj":
-        df_calc = uppdatera_berakningar(df, user_rates)
-        visa_portfolj(df_calc, user_rates)
+        visa_portfolj(df, user_rates)
 
 if __name__ == "__main__":
     main()

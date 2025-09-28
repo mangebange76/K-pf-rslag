@@ -2,431 +2,732 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Dict, Tuple, List, Any
+import os
+import json
+import math
+import time
+import requests
 import pandas as pd
 import numpy as np
-import requests
-import yfinance as yf
-from datetime import date
+from datetime import datetime, timedelta, date
+from functools import lru_cache
+from typing import Dict, Tuple, List, Optional
 
-# -------------------------------------------------
-# Små utils (rena, utan Streamlit-beroenden)
-# -------------------------------------------------
+try:
+    import streamlit as st
+except Exception:
+    st = None
 
-def _safe_float(x, default: float = 0.0) -> float:
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+# ------------------------------------------------------------
+# Konfig & helpers
+# ------------------------------------------------------------
+
+def _now_ts():
     try:
-        if x is None:
-            return default
-        return float(x)
+        import pytz
+        tz = pytz.timezone("Europe/Stockholm")
+        return datetime.now(tz)
     except Exception:
-        return default
+        return datetime.now()
 
-def _human_err(e: Exception) -> str:
-    return f"{type(e).__name__}: {e}"
+def _env_secret(name: str, default: str = "") -> str:
+    # Hämta från st.secrets om möjligt, annars env-var
+    val = ""
+    if st is not None:
+        try:
+            val = st.secrets.get(name, "")
+        except Exception:
+            val = ""
+    if not val:
+        val = os.environ.get(name, "")
+    return val or default
 
-def _fx_rate(base: str, quote: str) -> float:
-    """Frankfurter → exchangerate.host → 1.0 fallback."""
+SEC_USER_AGENT = _env_secret("SEC_USER_AGENT", "StockApp/1.0 (contact: you@example.com)")
+FMP_BASE       = _env_secret("FMP_BASE", "https://financialmodelingprep.com")
+FMP_KEY        = _env_secret("FMP_API_KEY", "")
+
+# ------------------------------------------------------------
+# Valuta
+# ------------------------------------------------------------
+
+@lru_cache(maxsize=256)
+def fx_rate(base: str, quote: str) -> float:
     base = (base or "").upper()
     quote = (quote or "").upper()
     if not base or not quote or base == quote:
         return 1.0
-    # Frankfurter (ECB)
     try:
         r = requests.get("https://api.frankfurter.app/latest",
                          params={"from": base, "to": quote}, timeout=12)
         if r.status_code == 200:
-            v = (r.json() or {}).get("rates", {}).get(quote)
+            j = r.json() or {}
+            v = (j.get("rates") or {}).get(quote)
             if v:
                 return float(v)
     except Exception:
         pass
-    # exchangerate.host
     try:
         r = requests.get("https://api.exchangerate.host/latest",
                          params={"base": base, "symbols": quote}, timeout=12)
         if r.status_code == 200:
-            v = (r.json() or {}).get("rates", {}).get(quote)
+            j = r.json() or {}
+            v = (j.get("rates") or {}).get(quote)
             if v:
                 return float(v)
     except Exception:
         pass
     return 1.0
 
-def _quarter_key(d: date) -> Tuple[int, int]:
-    """Nyckel för 'fiscal quarter' – hanterar dec/jan-gap som Q4."""
-    # Enkel kalender-Q (funkar väl med Yahoo:s datumstämplar)
-    m = d.month
-    if m in (1,):
-        q = 4  # behandla jan som Q4-fönstrets 'late post'
-    elif m <= 3:
-        q = 1
-    elif m <= 6:
-        q = 2
-    elif m <= 9:
-        q = 3
-    else:
-        q = 4
-    # år: om jan->Q4, bind till föregående år
-    y = d.year if m != 1 else d.year - 1
-    return (y, q)
+# ------------------------------------------------------------
+# Yahoo helpers
+# ------------------------------------------------------------
 
-def _dedupe_quarters(rows: List[Tuple[date, float]]) -> List[Tuple[date, float]]:
-    """
-    Tar [(end_date, value)] och behåller *senaste* post per (year, quarter).
-    Fixar vanliga "dec/jan"-duplikat.
-    """
-    seen = {}
-    for d, v in rows:
-        key = _quarter_key(d)
-        # behåll senast datum i samma kvartal
-        if key not in seen or d > seen[key][0]:
-            seen[key] = (d, float(v))
-    out = list(seen.values())
-    out.sort(key=lambda t: t[0], reverse=True)
-    return out
+def _yf_ticker(ticker: str):
+    if yf is None:
+        return None
+    try:
+        return yf.Ticker(ticker)
+    except Exception:
+        return None
 
-def _ttm_windows(values: List[Tuple[date, float]], need: int = 4) -> List[Tuple[date, float]]:
-    """
-    Från kvartalsvärden (nyast→äldst) bygger TTM-summor:
-    [(end_date0, ttm0), (end_date1, ttm1), ...]
-    """
-    out = []
-    if len(values) < 4:
+def _yf_info(tkr) -> dict:
+    try:
+        return tkr.info or {}
+    except Exception:
+        return {}
+
+def _yf_price_currency_name_sector(ticker: str) -> dict:
+    out = {"Aktuell kurs": 0.0, "Valuta": "USD", "Bolagsnamn": "", "Sektor": ""}
+    t = _yf_ticker(ticker)
+    if t is None:
         return out
-    for i in range(0, min(need, len(values) - 3)):
-        end_i = values[i][0]
-        ttm_i = sum(v for (_, v) in values[i:i+4])
-        out.append((end_i, float(ttm_i)))
+    info = _yf_info(t)
+    # Pris
+    price = info.get("regularMarketPrice")
+    if price is None:
+        try:
+            h = t.history(period="1d")
+            if not h.empty and "Close" in h:
+                price = float(h["Close"].iloc[-1])
+        except Exception:
+            price = None
+    if price is not None:
+        out["Aktuell kurs"] = float(price)
+    # Valuta & namn
+    if info.get("currency"):
+        out["Valuta"] = str(info.get("currency")).upper()
+    nm = info.get("shortName") or info.get("longName")
+    if nm:
+        out["Bolagsnamn"] = str(nm)
+    # Sektor
+    if info.get("sector"):
+        out["Sektor"] = str(info.get("sector"))
     return out
+
+def _yf_marketcap_and_shares(ticker: str, fallback_price: float = 0.0) -> Tuple[float, float]:
+    """
+    Returnerar (marketCap, shares) från Yahoo.
+    shares via implied (mcap/price) eller 'sharesOutstanding'.
+    """
+    t = _yf_ticker(ticker)
+    if t is None:
+        return 0.0, 0.0
+    info = _yf_info(t)
+    mcap = info.get("marketCap") or 0.0
+    try:
+        mcap = float(mcap or 0.0)
+    except Exception:
+        mcap = 0.0
+    px = info.get("regularMarketPrice")
+    if px is None or px == 0:
+        px = fallback_price or 0.0
+    sh = 0.0
+    if mcap > 0 and px and px > 0:
+        sh = mcap / px
+    else:
+        so = info.get("sharesOutstanding") or 0.0
+        try:
+            sh = float(so or 0.0)
+        except Exception:
+            sh = 0.0
+    return (mcap, sh)
+
+def _yf_quarterly_revenues(ticker: str) -> List[Tuple[date, float]]:
+    """
+    Försöker läsa kvartalsintäkter från Yahoo.
+    Returnerar [(period_end_date, value), ...] nyast först.
+    """
+    t = _yf_ticker(ticker)
+    if t is None:
+        return []
+    # 1) quarterly_financials
+    try:
+        qf = t.quarterly_financials
+        if isinstance(qf, pd.DataFrame) and not qf.empty:
+            # Letar efter total revenue-liknande rader
+            wanted = {"total revenue","totalrevenue","revenues","revenue","sales",
+                      "total revenue (ttm)","revenues from contracts with customers"}
+            idx_norm = {str(i).strip().lower(): i for i in qf.index}
+            key = None
+            for k in idx_norm:
+                if k in wanted:
+                    key = idx_norm[k]; break
+            if key is None:
+                # fallback: brute contains
+                for i in qf.index:
+                    s = str(i).lower()
+                    if "revenue" in s:
+                        key = i; break
+            if key is not None:
+                ser = qf.loc[key].dropna()
+                out = []
+                for c, v in ser.items():
+                    try:
+                        d = c.date() if hasattr(c, "date") else pd.to_datetime(c).date()
+                        out.append((d, float(v)))
+                    except Exception:
+                        pass
+                out.sort(key=lambda x: x[0], reverse=True)
+                return out
+    except Exception:
+        pass
+    # 2) income_stmt alt (kan vara tomt)
+    try:
+        df_is = getattr(t, "income_stmt", None)
+        if isinstance(df_is, pd.DataFrame) and not df_is.empty and "Total Revenue" in df_is.index:
+            ser = df_is.loc["Total Revenue"].dropna()
+            out = []
+            for c, v in ser.items():
+                try:
+                    d = c.date() if hasattr(c, "date") else pd.to_datetime(c).date()
+                    out.append((d, float(v)))
+                except Exception:
+                    pass
+            out.sort(key=lambda x: x[0], reverse=True)
+            return out
+    except Exception:
+        pass
+    return []
+
+def _yf_margins_de_cash_fcf(ticker: str) -> dict:
+    """
+    Försöker hämta bruttomarginal, nettomarginal, D/E, kassa och FCF TTM via Yahoo.
+    Robust mot tom data.
+    """
+    out = {
+        "Bruttomarginal (%)": 0.0,
+        "Nettomarginal (%)": 0.0,
+        "Debt/Equity": 0.0,
+        "Kassa (valuta)": 0.0,
+        "FCF TTM (valuta)": 0.0,
+    }
+    t = _yf_ticker(ticker)
+    if t is None:
+        return out
+    info = _yf_info(t)
+
+    # Margins från info (andel)
+    try:
+        gm = info.get("grossMargins", None)
+        if gm is not None:
+            out["Bruttomarginal (%)"] = float(gm) * 100.0
+    except Exception:
+        pass
+    try:
+        pm = info.get("profitMargins", None)
+        if pm is not None:
+            out["Nettomarginal (%)"] = float(pm) * 100.0
+    except Exception:
+        pass
+
+    # D/E via balance sheet (quarterly först)
+    def _pick_balance_total(dic: dict, keys: List[str]) -> float:
+        # case-insensitive
+        for k in dic.keys():
+            for target in keys:
+                if str(k).strip().lower() == target.lower():
+                    try:
+                        v = dic.get(k)
+                        return float(v or 0.0)
+                    except Exception:
+                        pass
+        return 0.0
+
+    # Ta senaste kolumn
+    try:
+        qbs = t.quarterly_balance_sheet
+        if isinstance(qbs, pd.DataFrame) and not qbs.empty:
+            col = qbs.columns[0]
+            dic = {str(i): qbs.loc[i, col] for i in qbs.index}
+            total_debt = _pick_balance_total(dic, ["Total Debt","TotalDebt"])
+            equity = _pick_balance_total(dic, ["Total Stockholder Equity","Total Equity Gross Minority Interest","TotalEquityGrossMinorityInterest","StockholdersEquity"])
+            if equity and equity != 0:
+                out["Debt/Equity"] = float(total_debt) / float(equity)
+    except Exception:
+        pass
+    if out["Debt/Equity"] == 0.0:
+        try:
+            bs = t.balance_sheet
+            if isinstance(bs, pd.DataFrame) and not bs.empty:
+                col = bs.columns[0]
+                dic = {str(i): bs.loc[i, col] for i in bs.index}
+                total_debt = _pick_balance_total(dic, ["Total Debt","TotalDebt"])
+                equity = _pick_balance_total(dic, ["Total Stockholder Equity","Total Equity Gross Minority Interest","TotalEquityGrossMinorityInterest","StockholdersEquity"])
+                if equity and equity != 0:
+                    out["Debt/Equity"] = float(total_debt) / float(equity)
+        except Exception:
+            pass
+
+    # Kassa & FCF
+    # Kassa via info om finns, annars via balance_sheet "Cash And Cash Equivalents"
+    try:
+        cash = info.get("totalCash", None)
+        if cash is not None:
+            out["Kassa (valuta)"] = float(cash)
+    except Exception:
+        pass
+    if out["Kassa (valuta)"] == 0.0:
+        try:
+            qbs = t.quarterly_balance_sheet
+            if isinstance(qbs, pd.DataFrame) and not qbs.empty:
+                col = qbs.columns[0]
+                dic = {str(i): qbs.loc[i, col] for i in qbs.index}
+                # Försök hitta "Cash And Cash Equivalents"
+                for key in dic.keys():
+                    if "cash" in key.lower() and "equivalents" in key.lower():
+                        out["Kassa (valuta)"] = float(dic[key] or 0.0)
+                        break
+        except Exception:
+            pass
+
+    # FCF TTM via info eller cashflow
+    try:
+        fcf = info.get("freeCashflow", None)
+        if fcf is not None:
+            out["FCF TTM (valuta)"] = float(fcf)
+    except Exception:
+        pass
+    if out["FCF TTM (valuta)"] == 0.0:
+        # Cashflow DataFrame kan ha "Free Cash Flow"
+        try:
+            qcf = t.quarterly_cashflow
+            if isinstance(qcf, pd.DataFrame) and not qcf.empty:
+                # Summera 4 senaste "Free Cash Flow" eller "FreeCashFlow"
+                row = None
+                for idx in qcf.index:
+                    if str(idx).lower().replace(" ","") in ("freecashflow","free cash flow".replace(" ","")):
+                        row = qcf.loc[idx].dropna()
+                        break
+                if row is not None and not row.empty:
+                    # Ta absolut senaste (detta är inte exakt TTM men approximation om bara 1 kolumn)
+                    # Bättre: summera upp till 4 om >1 kolumn
+                    vals = [float(v) for v in row.values[:4] if pd.notna(v)]
+                    out["FCF TTM (valuta)"] = float(sum(vals)) if vals else float(row.iloc[0])
+        except Exception:
+            pass
+
+    return out
+
+def _yf_sector(ticker: str) -> str:
+    t = _yf_ticker(ticker)
+    if t is None:
+        return ""
+    info = _yf_info(t)
+    return str(info.get("sector") or "") if info else ""
+
+# ------------------------------------------------------------
+# SEC helpers
+# ------------------------------------------------------------
+
+def _sec_get(url: str, params=None):
+    try:
+        r = requests.get(url, params=(params or {}), headers={"User-Agent": SEC_USER_AGENT}, timeout=30)
+        if r.status_code == 200:
+            return r.json(), 200
+        return None, r.status_code
+    except Exception:
+        return None, 0
+
+@lru_cache(maxsize=1)
+def _sec_ticker_map() -> Dict[str, str]:
+    j, sc = _sec_get("https://www.sec.gov/files/company_tickers.json")
+    out = {}
+    if isinstance(j, dict):
+        for _, v in j.items():
+            try:
+                out[str(v["ticker"]).upper()] = str(v["cik_str"]).zfill(10)
+            except Exception:
+                pass
+    return out
+
+def _sec_cik_for(ticker: str) -> Optional[str]:
+    return _sec_ticker_map().get(str(ticker).upper())
+
+def _sec_companyfacts(cik10: str):
+    return _sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json")
+
+def _parse_iso(d: str):
+    try:
+        return datetime.fromisoformat(d.replace("Z", "+00:00")).date()
+    except Exception:
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+def _is_instant_entry(it: dict) -> bool:
+    end = it.get("end"); start = it.get("start")
+    if not end:
+        return False
+    if not start:
+        return True
+    d1 = _parse_iso(str(start)); d2 = _parse_iso(str(end))
+    if d1 and d2:
+        try:
+            return (d2 - d1).days <= 2
+        except Exception:
+            return False
+    return False
+
+def _collect_share_entries(facts: dict) -> list:
+    entries = []
+    facts_all = (facts.get("facts") or {})
+    sources = [
+        ("dei", ["EntityCommonStockSharesOutstanding", "EntityCommonSharesOutstanding"]),
+        ("us-gaap", ["CommonStockSharesOutstanding", "ShareIssued"]),
+        ("ifrs-full", ["NumberOfSharesIssued", "IssuedCapitalNumberOfShares", "OrdinarySharesNumber", "NumberOfOrdinaryShares"]),
+    ]
+    unit_keys = ("shares", "USD_shares", "Shares", "SHARES")
+    for taxo, keys in sources:
+        sect = facts_all.get(taxo, {})
+        for key in keys:
+            fact = sect.get(key)
+            if not fact:
+                continue
+            units = fact.get("units") or {}
+            for uk in unit_keys:
+                arr = units.get(uk)
+                if not isinstance(arr, list):
+                    continue
+                for it in arr:
+                    if not _is_instant_entry(it):
+                        continue
+                    end = _parse_iso(str(it.get("end", "")))
+                    val = it.get("val", None)
+                    if end and val is not None:
+                        try:
+                            v = float(val)
+                            frame = it.get("frame") or ""
+                            form = (it.get("form") or "").upper()
+                            entries.append({"end": end, "val": v, "frame": frame, "form": form, "taxo": taxo, "concept": key})
+                        except Exception:
+                            pass
+    return entries
+
+def _sec_latest_shares_robust(facts: dict) -> float:
+    rows = _collect_share_entries(facts)
+    if not rows:
+        return 0.0
+    newest = max(r["end"] for r in rows)
+    todays = [r for r in rows if r["end"] == newest]
+    total = 0.0
+    for r in todays:
+        try:
+            total += float(r["val"])
+        except Exception:
+            pass
+    return total if total > 0 else 0.0
+
+def _sec_quarterly_revenues_dated_with_unit(facts: dict, max_quarters: int = 24):
+    taxos = [
+        ("us-gaap",  {"forms": ("10-Q", "10-Q/A")}),
+        ("ifrs-full", {"forms": ("6-K", "6-K/A", "10-Q", "10-Q/A")}),
+    ]
+    rev_keys = [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet",
+        "Revenues",
+        "Revenue",
+        "RevenueFromContractsWithCustomers",
+        "RevenueFromContractsWithCustomersExcludingSalesTaxes",
+    ]
+    prefer_units = ("USD","CAD","EUR","GBP")
+
+    for taxo, cfg in taxos:
+        gaap = (facts.get("facts") or {}).get(taxo, {})
+        for name in rev_keys:
+            fact = gaap.get(name)
+            if not fact:
+                continue
+            units = (fact.get("units") or {})
+            for unit_code in prefer_units:
+                arr = units.get(unit_code)
+                if not isinstance(arr, list):
+                    continue
+                tmp = []
+                for it in arr:
+                    form = (it.get("form") or "").upper()
+                    if not any(f in form for f in cfg["forms"]):
+                        continue
+                    end = _parse_iso(str(it.get("end", "")))
+                    start = _parse_iso(str(it.get("start", "")))
+                    val = it.get("val", None)
+                    if not (end and start and val is not None):
+                        continue
+                    try:
+                        dur = (end - start).days
+                    except Exception:
+                        dur = None
+                    if dur is None or dur < 70 or dur > 100:
+                        continue
+                    try:
+                        v = float(val)
+                        tmp.append((end, v))
+                    except Exception:
+                        pass
+                if not tmp:
+                    continue
+                # dedupe by end-date
+                ded = {}
+                for end, v in tmp:
+                    ded[end] = v
+                rows = sorted(ded.items(), key=lambda t: t[0], reverse=True)[:max_quarters]
+                if rows:
+                    return rows, unit_code
+    return [], None
+
+# ------------------------------------------------------------
+# P/S-bygge m.fl.
+# ------------------------------------------------------------
 
 def _yahoo_prices_for_dates(ticker: str, dates: List[date]) -> Dict[date, float]:
-    """Dagliga stängningar – pris på/närmast före respektive datum."""
-    if not dates:
+    if yf is None or not dates:
         return {}
-    dmin = min(dates) - pd.Timedelta(days=14)
-    dmax = max(dates) + pd.Timedelta(days=2)
+    t = _yf_ticker(ticker)
+    if t is None:
+        return {}
+    dmin = min(dates) - timedelta(days=14)
+    dmax = max(dates) + timedelta(days=2)
     try:
-        t = yf.Ticker(ticker)
         hist = t.history(start=dmin, end=dmax, interval="1d")
         if hist is None or hist.empty:
             return {}
         hist = hist.sort_index()
-        out: Dict[date, float] = {}
         idx = list(hist.index.date)
         closes = list(hist["Close"].values)
+        out = {}
         for d in dates:
             px = None
             for j in range(len(idx)-1, -1, -1):
                 if idx[j] <= d:
-                    px = float(closes[j]); break
+                    try:
+                        px = float(closes[j])
+                    except Exception:
+                        px = None
+                    break
             if px is not None:
                 out[d] = px
         return out
     except Exception:
         return {}
 
-def _quarterly_revenues_yf(t: yf.Ticker) -> Tuple[List[Tuple[date, float]], str]:
+def _merge_sec_yahoo_quarters(ticker: str) -> Tuple[List[Tuple[date,float]], Optional[str]]:
     """
-    Hämtar kvartalsintäkter (nyast→äldst) och returnerar [(date, value)], unit.
-    Försöker först quarterly_financials, annars income_stmt.
+    Kombinerar kvartalsintäkter från SEC och Yahoo för att undvika Dec/Jan-gap.
+    Returnerar (rows, unit) där rows är nyast→äldst [(end_date, value_in_unit)].
+    Om SEC saknas → unit=None (Yahoo saknar garanterad unit); vi använder prisvaluta separat.
     """
-    # 1) quarterly_financials
-    try:
-        qf = t.quarterly_financials
-        if isinstance(qf, pd.DataFrame) and not qf.empty:
-            # Leta 'Total Revenue' (olika label-varianter förekommer)
-            idx = [str(x).strip() for x in qf.index]
-            candidates = [
-                "Total Revenue","TotalRevenue","Revenues","Revenue",
-                "Sales","SalesRevenueNet","Revenues from contracts with customers"
-            ]
-            for key in candidates:
-                if key in idx:
-                    row = qf.loc[key].dropna()
-                    tmp = []
-                    for c, v in row.items():
-                        try:
-                            d = c.date() if hasattr(c, "date") else pd.to_datetime(c).date()
-                            tmp.append((d, float(v)))
-                        except Exception:
-                            pass
-                    tmp = _dedupe_quarters(sorted(tmp, key=lambda x: x[0], reverse=True))
-                    if tmp:
-                        # valuta (financialCurrency om möjligt)
-                        info = t.info or {}
-                        unit = str(info.get("financialCurrency") or info.get("currency") or "USD").upper()
-                        return tmp, unit
-    except Exception:
-        pass
+    cik = _sec_cik_for(ticker)
+    rows_sec, unit = [], None
+    if cik:
+        facts, sc = _sec_companyfacts(cik)
+        if sc == 200 and isinstance(facts, dict):
+            rows_sec, unit = _sec_quarterly_revenues_dated_with_unit(facts, max_quarters=24)
 
-    # 2) fallback: income_stmt (kvartal – kan vara tomt beroende på yfinance-version)
-    try:
-        df_is = getattr(t, "income_stmt", None)
-        if isinstance(df_is, pd.DataFrame) and not df_is.empty and "Total Revenue" in df_is.index:
-            ser = df_is.loc["Total Revenue"].dropna()
-            tmp = []
-            for c, v in ser.items():
-                try:
-                    d = c.date() if hasattr(c, "date") else pd.to_datetime(c).date()
-                    tmp.append((d, float(v)))
-                except Exception:
-                    pass
-            tmp = _dedupe_quarters(sorted(tmp, key=lambda x: x[0], reverse=True))
-            if tmp:
-                info = t.info or {}
-                unit = str(info.get("financialCurrency") or info.get("currency") or "USD").upper()
-                return tmp, unit
-    except Exception:
-        pass
+    rows_yf = _yf_quarterly_revenues(ticker)
 
-    return [], None
+    # Merge på end_date (nyast→äldst)
+    ded: Dict[date, float] = {}
+    for d, v in rows_sec:
+        ded[d] = float(v)
+    for d, v in rows_yf:
+        # skriv inte över SEC om redan finns
+        if d not in ded:
+            ded[d] = float(v)
+    rows = sorted(ded.items(), key=lambda t: t[0], reverse=True)
+    return rows, unit
 
-def _implied_shares(info: Dict[str, Any], px: float) -> float:
-    """Försök räkna implied shares (styck) från marketCap/price, annars sharesOutstanding."""
-    mcap = _safe_float(info.get("marketCap"), 0.0)
-    if mcap > 0 and px > 0:
-        return mcap / px
-    so = _safe_float(info.get("sharesOutstanding"), 0.0)
-    return so if so > 0 else 0.0
-
-def _balance_metrics(t: yf.Ticker) -> Dict[str, float]:
-    """Debt/Equity, Cash, etc. från balansräkning."""
-    out: Dict[str, float] = {}
-    try:
-        bsq = t.quarterly_balance_sheet
-        if isinstance(bsq, pd.DataFrame) and not bsq.empty:
-            col = bsq.columns[0]
-            # Total debt (approx: short+long debt)
-            td = 0.0
-            for k in ["Short Long Term Debt","ShortLongTermDebt","Short Term Debt","ShortTermDebt","Long Term Debt","LongTermDebt","Total Debt","TotalDebt"]:
-                if k in bsq.index and pd.notna(bsq.loc[k, col]):
-                    td += _safe_float(bsq.loc[k, col], 0.0)
-            # Equity
-            eq = 0.0
-            for k in ["Total Stockholder Equity","TotalStockholderEquity","Stockholders Equity","Total Equity","TotalEquity"]:
-                if k in bsq.index and pd.notna(bsq.loc[k, col]):
-                    eq = _safe_float(bsq.loc[k, col], 0.0); break
-            out["Debt/Equity"] = td/eq if eq > 0 else 0.0
-
-            # Cash & equivalents
-            cash = 0.0
-            for k in ["Cash And Cash Equivalents","CashAndCashEquivalents","Cash And Cash Equivalents Including Restricted Cash","CashAndShortTermInvestments"]:
-                if k in bsq.index and pd.notna(bsq.loc[k, col]):
-                    cash = _safe_float(bsq.loc[k, col], 0.0); break
-            out["Kassa (valuta)"] = cash
-    except Exception:
-        pass
+def _ttm_windows(values: List[Tuple[date,float]], need: int = 4) -> List[Tuple[date, float]]:
+    """
+    values = [(end_date, kvartalsintäkt)] nyast→äldst
+    Returnerar upp till 'need' rullande TTM-summor (nyast först).
+    """
+    out = []
+    if len(values) < 4:
+        return out
+    # Bygg från NYAST (index 0) => ttm0 = q0+q1+q2+q3, ttm1 = q1+q2+q3+q4, ...
+    for i in range(0, min(need, len(values)-3)):
+        end_i = values[i][0]
+        ttm_i = sum(v for (_, v) in values[i:i+4])
+        out.append((end_i, float(ttm_i)))
     return out
 
-def _margin_metrics(t: yf.Ticker) -> Dict[str, float]:
-    """Brutto- & netto-marginal (senaste årsdata om möjligt)."""
-    out: Dict[str, float] = {}
-    try:
-        is_annual = t.financials  # annual
-        if isinstance(is_annual, pd.DataFrame) and not is_annual.empty:
-            col = is_annual.columns[0]
-            rev = None
-            gp = None
-            ni = None
-            if "Total Revenue" in is_annual.index and pd.notna(is_annual.loc["Total Revenue", col]):
-                rev = _safe_float(is_annual.loc["Total Revenue", col], 0.0)
-            for k in ["Gross Profit","GrossProfit"]:
-                if k in is_annual.index and pd.notna(is_annual.loc[k, col]):
-                    gp = _safe_float(is_annual.loc[k, col], 0.0); break
-            for k in ["Net Income","NetIncome"]:
-                if k in is_annual.index and pd.notna(is_annual.loc[k, col]):
-                    ni = _safe_float(is_annual.loc[k, col], 0.0); break
-            if rev and rev > 0:
-                if gp is not None:
-                    out["Bruttomarginal (%)"] = round(gp/rev*100.0, 2)
-                if ni is not None:
-                    out["Nettomarginal (%)"] = round(ni/rev*100.0, 2)
-    except Exception:
-        pass
+def _ps_quarters_from_rows(ticker: str, rows_merged: List[Tuple[date,float]], rev_unit: Optional[str], price_ccy: str, shares: float) -> Dict[str, float]:
+    """
+    Beräknar P/S (nu) och P/S Q1..Q4 baserat på TTM över de sammanslagna kvartalen.
+    Konverterar revenue till prisvaluta om unit != price_ccy och vi vet unit.
+    """
+    # Konvertera intäkter till prisvaluta om vi kan
+    conv = 1.0
+    if rev_unit and price_ccy and rev_unit.upper() != price_ccy.upper():
+        conv = fx_rate(rev_unit.upper(), price_ccy.upper()) or 1.0
+    rows_px = [(d, v * conv) for (d, v) in rows_merged]
+
+    ttm_list = _ttm_windows(rows_px, need=6)  # hämta gärna 6, så vi kan fylla upp till 4 P/S-historik
+    out = {}
+
+    # Dagens marketcap & pris (behövs separat)
+    prices = _yahoo_prices_for_dates(ticker, [d for (d, _) in rows_px[:6]])
+    # shares ges in (robust) — om 0 skippar vi historik
+    if shares <= 0:
+        return out
+
+    # P/S Q1..Q4: använd upp till 4 TTM-fönster
+    for idx, (d_end, ttm_rev_px) in enumerate(ttm_list[:4], start=1):
+        if ttm_rev_px and ttm_rev_px > 0:
+            px = prices.get(d_end, None)
+            if px and px > 0:
+                mcap_hist = shares * float(px)
+                out[f"P/S Q{idx}"] = float(mcap_hist / ttm_rev_px)
+
+    # P/S nu (senaste TTM)
+    if ttm_list:
+        ttm_now = ttm_list[0][1]
+        # MarketCap nu via Yahoo (igen), eller shares*price_now
+        mcap_now, _ = _yf_marketcap_and_shares(ticker)
+        if (not mcap_now or mcap_now <= 0) and prices:
+            # ta nyaste priset i prices (matchar rows_px[0] end)
+            px0 = prices.get(ttm_list[0][0], None)
+            if px0 and px0 > 0:
+                mcap_now = float(px0) * shares
+        if mcap_now and mcap_now > 0 and ttm_now > 0:
+            out["P/S"] = float(mcap_now / ttm_now)
+
     return out
 
-def _fcf_metrics(t: yf.Ticker) -> Dict[str, float]:
-    """FCF TTM + runway (kvartal) från quarterly_cashflow."""
-    out: Dict[str, float] = {}
+# ------------------------------------------------------------
+# FMP fallback för P/S (TTM)
+# ------------------------------------------------------------
+
+def _fmp_ps_ttm(ticker: str) -> Optional[float]:
+    if not FMP_KEY:
+        return None
     try:
-        qcf = t.quarterly_cashflow
-        if isinstance(qcf, pd.DataFrame) and not qcf.empty:
-            # FCF per kvartal ≈ CFO - CapEx
-            rows = []
-            for c in qcf.columns[:4]:
-                cfo = 0.0; capex = 0.0
-                for k in ["Total Cash From Operating Activities","TotalCashFromOperatingActivities","Operating Cash Flow","OperatingCashFlow"]:
-                    if k in qcf.index and pd.notna(qcf.loc[k, c]):
-                        cfo = _safe_float(qcf.loc[k, c]); break
-                for k in ["Capital Expenditures","CapitalExpenditures"]:
-                    if k in qcf.index and pd.notna(qcf.loc[k, c]):
-                        capex = _safe_float(qcf.loc[k, c]); break
-                rows.append(cfo - capex)
-            rows = [x for x in rows if x is not None]
-            if rows:
-                out["FCF TTM (valuta)"] = float(sum(rows[:4]))
-                # runway (kvartal) om negativt fcf i snitt
-                neg_avg = np.mean([x for x in rows[:4] if x < 0]) if any(x < 0 for x in rows[:4]) else 0.0
-                if neg_avg < 0:
-                    # behövs "Kassa (valuta)"
-                    bal = _balance_metrics(t)
-                    cash = bal.get("Kassa (valuta)", 0.0)
-                    out["Runway (kvartal)"] = float(cash / abs(neg_avg)) if abs(neg_avg) > 0 else 0.0
-                else:
-                    out["Runway (kvartal)"] = 0.0
+        url = f"{FMP_BASE}/api/v3/ratios-ttm/{ticker.upper()}"
+        r = requests.get(url, params={"apikey": FMP_KEY}, timeout=20)
+        if r.status_code == 200:
+            j = r.json() or []
+            if isinstance(j, list) and j:
+                v = j[0].get("priceToSalesTTM") or j[0].get("priceToSalesRatioTTM")
+                if v is not None and float(v) > 0:
+                    return float(v)
     except Exception:
-        pass
-    return out
+        return None
+    return None
 
-# -------------------------------------------------
-# Runners
-# -------------------------------------------------
+# ------------------------------------------------------------
+# Publika API: runners
+# ------------------------------------------------------------
 
-def fetch_price_only(ticker: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def fetch_price_only(ticker: str) -> Tuple[Dict, Dict]:
     """
-    Minimal uppdatering: pris, market cap, implied shares, namn, valuta, sektor.
-    Skriver INTE manuella prognosfält.
+    Snabb uppdatering: pris, valuta, namn, sector, market cap.
+    Returnerar (vals, debug)
     """
-    out: Dict[str, Any] = {}
-    dbg: Dict[str, Any] = {"runner": "price_only"}
+    dbg = {"runner": "price_only", "ticker": ticker}
+    vals = _yf_price_currency_name_sector(ticker)
+    # Market cap & implied shares (sparar endast mcap här)
+    mcap, sh = _yf_marketcap_and_shares(ticker, fallback_price=vals.get("Aktuell kurs", 0.0))
+    if mcap and mcap > 0:
+        vals["Market Cap (nu)"] = float(mcap)
+    # Sektor redan i vals
+    dbg["vals"] = {k: vals.get(k) for k in ["Aktuell kurs","Valuta","Bolagsnamn","Sektor","Market Cap (nu)"]}
+    return vals, dbg
 
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-    except Exception as e:
-        dbg["error"] = _human_err(e)
-        return {}, dbg
+def fetch_all_fields_for_ticker(ticker: str) -> Tuple[Dict, Dict]:
+    """
+    Full auto: försöker fylla “allt” som inte är ren prognos (Omsättning-idag/nästa år).
+    Returnerar (vals, debug) där vals bara innehåller nycklar som bör skrivas.
+    """
+    dbg = {"runner": "full_auto", "ticker": ticker}
+    vals: Dict[str, float | str] = {}
 
-    # Pris & valuta
-    px = _safe_float(info.get("regularMarketPrice") or info.get("currentPrice") or 0.0)
-    if px <= 0:
+    # 1) Bas via Yahoo
+    base = _yf_price_currency_name_sector(ticker)
+    vals.update({k: v for k, v in base.items() if v not in (None, "", 0, 0.0)})
+    price_ccy = (base.get("Valuta") or "USD").upper()
+    price_now = float(base.get("Aktuell kurs", 0.0) or 0.0)
+
+    # 2) Market cap & shares
+    mcap_now, shares_imp = _yf_marketcap_and_shares(ticker, fallback_price=price_now)
+    dbg["yahoo_mcap"] = mcap_now
+    dbg["yahoo_implied_shares"] = shares_imp
+
+    # SEC shares robust fallback om implied saknas
+    shares_used = float(shares_imp or 0.0)
+    cik = _sec_cik_for(ticker)
+    if cik and (shares_used <= 0):
+        facts, sc = _sec_companyfacts(cik)
+        if sc == 200 and isinstance(facts, dict):
+            sh_sec = _sec_latest_shares_robust(facts)
+            if sh_sec and sh_sec > 0:
+                shares_used = float(sh_sec)
+
+    if shares_used > 0:
+        vals["Utestående aktier"] = float(shares_used) / 1e6  # i miljoner
+
+    if mcap_now and mcap_now > 0:
+        vals["Market Cap (nu)"] = float(mcap_now)
+
+    # 3) Marginaler / D/E / Kassa / FCF
+    fin = _yf_margins_de_cash_fcf(ticker)
+    for k, v in fin.items():
+        if v not in (None, "", 0, 0.0):
+            vals[k] = float(v)
+
+    # 4) Kvartalsintäkter (SEC + Yahoo merge) → P/S TTM + P/S Q1..Q4
+    rows_merged, rev_unit = _merge_sec_yahoo_quarters(ticker)
+    dbg["quarters_count"] = len(rows_merged)
+    if rows_merged:
+        ps_vals = _ps_quarters_from_rows(ticker, rows_merged, rev_unit=rev_unit, price_ccy=price_ccy, shares=shares_used)
+        # Om P/S (TTM) saknas men FMP kan leverera → fyll
+        if ("P/S" not in ps_vals) or (not ps_vals.get("P/S") or ps_vals.get("P/S") <= 0):
+            ps_fmp = _fmp_ps_ttm(ticker)
+            if ps_fmp and ps_fmp > 0:
+                ps_vals["P/S"] = float(ps_fmp)
+        for k, v in ps_vals.items():
+            if v and float(v) > 0:
+                vals[k] = float(v)
+
+    # 5) Runway (mån) om FCF<0 och kassa>0
+    cash = float(vals.get("Kassa (valuta)", 0.0) or 0.0)
+    fcf  = float(vals.get("FCF TTM (valuta)", 0.0) or 0.0)
+    runway_m = 0.0
+    if cash > 0 and fcf < 0:
         try:
-            h = t.history(period="1d")
-            if not h.empty and "Close" in h:
-                px = float(h["Close"].iloc[-1])
+            runway_m = 12.0 * cash / abs(fcf)
         except Exception:
-            pass
-    if px > 0:
-        out["Aktuell kurs"] = px
+            runway_m = 0.0
+    if runway_m > 0:
+        vals["Runway (mån)"] = float(round(runway_m, 1))
 
-    ccy = (info.get("currency") or "USD")
-    out["Valuta"] = str(ccy).upper()
-
-    # Namn & sektor
-    name = info.get("shortName") or info.get("longName")
-    if name:
-        out["Bolagsnamn"] = str(name)
-    sector = info.get("sector") or info.get("industry") or ""
-    if sector:
-        out["Sektor"] = str(sector)
-
-    # Market cap & implied shares
-    mcap = _safe_float(info.get("marketCap"), 0.0)
-    if mcap <= 0 and px > 0:
-        so = _safe_float(info.get("sharesOutstanding"), 0.0)
-        if so > 0:
-            mcap = so * px
-    if mcap > 0:
-        out["Market Cap (nu)"] = mcap
-        # Utestående aktier (miljoner)
-        out["Utestående aktier"] = (mcap/px)/1e6 if px > 0 else _safe_float(info.get("sharesOutstanding"),0.0)/1e6
-
-    return out, dbg
-
-def fetch_all_fields_for_ticker(ticker: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Full auto – hämtar allt utom manuella prognosfält:
-      - Bolagsnamn, Valuta, Sektor
-      - Aktuell kurs, Market Cap (nu), Utestående aktier (miljoner)
-      - P/S (nu) + P/S Q1–Q4 (TTM-metodik med dec/jan-fix)
-      - Debt/Equity, Brutto/Netto-marginal, Kassa, FCF TTM, Runway
-    """
-    out: Dict[str, Any] = {}
-    dbg: Dict[str, Any] = {"runner": "full_auto"}
-
-    # Basinfo
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-    except Exception as e:
-        dbg["error"] = _human_err(e)
-        return {}, dbg
-
-    # Namn/valuta/sektor
-    px = _safe_float(info.get("regularMarketPrice") or info.get("currentPrice") or 0.0)
-    if px <= 0:
-        try:
-            h = t.history(period="1d")
-            if not h.empty and "Close" in h:
-                px = float(h["Close"].iloc[-1])
-        except Exception:
-            pass
-    if px > 0:
-        out["Aktuell kurs"] = px
-
-    price_ccy = str(info.get("currency") or "USD").upper()
-    out["Valuta"] = price_ccy
-
-    name = info.get("shortName") or info.get("longName")
-    if name:
-        out["Bolagsnamn"] = str(name)
-    sector = info.get("sector") or info.get("industry") or ""
-    if sector:
-        out["Sektor"] = str(sector)
-
-    # Market cap & shares
-    mcap_now = _safe_float(info.get("marketCap"), 0.0)
-    if mcap_now <= 0 and px > 0:
-        so = _safe_float(info.get("sharesOutstanding"), 0.0)
-        if so > 0:
-            mcap_now = so * px
-    if mcap_now > 0:
-        out["Market Cap (nu)"] = mcap_now
-
-    shares = 0.0
-    if px > 0 and mcap_now > 0:
-        shares = mcap_now / px
-    else:
-        shares = _safe_float(info.get("sharesOutstanding"), 0.0)
-    if shares > 0:
-        out["Utestående aktier"] = shares / 1e6  # miljoner
-
-    # Kvartalsintäkter (Yahoo) → TTM-fönster
-    q_rows, fin_ccy = _quarterly_revenues_yf(t)
-    dbg["quarters"] = [(str(d), v) for (d, v) in q_rows[:6]]
-    # valuta-kvot
-    rate = 1.0
-    if fin_ccy and price_ccy and fin_ccy.upper() != price_ccy.upper():
-        rate = _fx_rate(fin_ccy, price_ccy)
-    # TTM-lista (nyast→)
-    ttm_list = _ttm_windows(q_rows, need=6)
-    ttm_px = [(d, v * rate) for (d, v) in ttm_list]  # samma valuta som 'Valuta'
-
-    # P/S (nu)
-    if mcap_now > 0 and ttm_px:
-        ltm_now = _safe_float(ttm_px[0][1], 0.0)
-        if ltm_now > 0:
-            out["P/S"] = mcap_now / ltm_now
-
-    # P/S Q1–Q4 (historik)
-    if shares > 0 and ttm_px:
-        q_dates = [d for (d, _) in ttm_px]
-        px_map = _yahoo_prices_for_dates(ticker, q_dates)
-        # räkna P/S för upp till 4 TTM-slut
-        ps_hist = []
-        for idx, (d_end, ttm_rev_px) in enumerate(ttm_px[:4], start=1):
-            if ttm_rev_px and ttm_rev_px > 0:
-                p_hist = _safe_float(px_map.get(d_end), 0.0)
-                if p_hist > 0:
-                    mcap_hist = shares * p_hist
-                    ps_val = mcap_hist / ttm_rev_px
-                    out[f"P/S Q{idx}"] = ps_val
-                    ps_hist.append((str(d_end), ps_val))
-        dbg["ps_hist"] = ps_hist
-
-    # Extra nyckeltal
-    out.update(_balance_metrics(t))
-    out.update(_margin_metrics(t))
-    out.update(_fcf_metrics(t))
-
-    return out, dbg
+    # Debug
+    dbg["vals_keys"] = list(vals.keys())
+    dbg["rev_unit"] = rev_unit
+    dbg["price_ccy"] = price_ccy
+    return vals, dbg

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Tuple
 
 import gspread
 import numpy as np
@@ -12,6 +12,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from google.oauth2.service_account import Credentials
+import importlib  # för diagnostik
 
 # --- Våra moduler
 from stockapp.views import (
@@ -22,12 +23,12 @@ from stockapp.views import (
     visa_portfolj,
 )
 from stockapp.batch import sidebar_batch_controls
-from stockapp.sources import _safe_float  # nyttjas för robusthet i vissa hjälpare
+from stockapp.sources import _safe_float  # robust float-cast
 
 # -------------------------------------------------------------------------------------
 # Grund-inställningar
 # -------------------------------------------------------------------------------------
-st.set_page_config(page_title="Aktieanalys & Investeringsförslag", layout="wide")
+st.set_page_config(page_title="Aktieanalys & investeringsförslag", layout="wide")
 
 # Lokal Stockholm-tid om pytz finns (annars systemtid)
 try:
@@ -92,10 +93,9 @@ def hamta_data() -> pd.DataFrame:
     return df
 
 def spara_data(df: pd.DataFrame):
-    """Skriv hela DataFrame till huvudbladet."""
+    """Skriv hela DataFrame till huvudbladet. Skyddar mot att skriva tom DF."""
     if df is None or df.empty:
-        # Skydd mot att råka skriva tomt av misstag
-        st.warning("Sparning avbruten: DF tom.")
+        st.warning("Sparning avbruten: DataFrame är tom.")
         return
     ws = _sheet_main()
     _with_backoff(ws.clear)
@@ -137,6 +137,7 @@ def hamta_valutakurser_auto() -> Tuple[Dict[str,float], list, str]:
     misses = []
     rates = {}
     provider = None
+
     # 1) FMP om key finns
     fmp_key = st.secrets.get("FMP_API_KEY", "")
     base = st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
@@ -158,6 +159,7 @@ def hamta_valutakurser_auto() -> Tuple[Dict[str,float], list, str]:
                     misses.append(f"{pair} (HTTP {sc if sc else '??'})")
         except Exception:
             pass
+
     # 2) Frankfurter
     if len(rates) < 4:
         provider = "Frankfurter"
@@ -170,6 +172,7 @@ def hamta_valutakurser_auto() -> Tuple[Dict[str,float], list, str]:
                         rates[ccy] = float(v)
             except Exception:
                 pass
+
     # 3) exchangerate.host
     if len(rates) < 4:
         provider = "exchangerate.host"
@@ -182,6 +185,7 @@ def hamta_valutakurser_auto() -> Tuple[Dict[str,float], list, str]:
                         rates[ccy] = float(v)
             except Exception:
                 pass
+
     # Fyll luckor från sparat/standard
     saved = las_sparade_valutakurser()
     for ccy in ("USD","EUR","CAD","NOK"):
@@ -202,7 +206,8 @@ MIN_COLS = [
     "Antal aktier","Årlig utdelning","GAV SEK",
     "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa",
     # TS-kolumner
-    "TS_Utestående aktier","TS_P/S","TS_P/S Q1","TS_P/S Q2","TS_P/S Q3","TS_P/S Q4","TS_Omsättning idag","TS_Omsättning nästa år",
+    "TS_Utestående aktier","TS_P/S","TS_P/S Q1","TS_P/S Q2","TS_P/S Q3","TS_P/S Q4",
+    "TS_Omsättning idag","TS_Omsättning nästa år",
 ]
 
 def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -210,22 +215,116 @@ def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
         df = pd.DataFrame({c: [] for c in MIN_COLS})
     for c in MIN_COLS:
         if c not in df.columns:
-            # numeriska default för mätvärden
             if any(x in c.lower() for x in ["p/s","omsättning","riktkurs","aktier","marginal","debt","kassa","fcf","runway","mcap","kurs","andel","utdelning","gav"]):
                 df[c] = 0.0
             elif c.startswith("TS_") or c in ["Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa","Sektor","Valuta","Bolagsnamn","Ticker"]:
                 df[c] = ""
             else:
                 df[c] = ""
-    # Duplicats-fix
     df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
+
+# -------------------------------------------------------------------------------------
+# Diagnostik (sanity checks)
+# -------------------------------------------------------------------------------------
+def _bool_badge(ok: bool) -> str:
+    return "✅" if ok else "❌"
+
+def _try_import(modname: str) -> bool:
+    try:
+        importlib.import_module(modname)
+        return True
+    except Exception:
+        return False
+
+def _check_modules() -> Dict[str, bool]:
+    mods = [
+        "stockapp.sources",
+        "stockapp.editor",
+        "stockapp.batch",
+        "stockapp.views",
+    ]
+    return {m: _try_import(m) for m in mods}
+
+def _check_secrets() -> Dict[str, bool]:
+    required = ["SHEET_URL", "GOOGLE_CREDENTIALS"]
+    optional = ["FMP_API_KEY"]
+    has = {}
+    for k in required:
+        has[k] = (k in st.secrets and bool(st.secrets.get(k)))
+    for k in optional:
+        has[k] = (k in st.secrets and bool(st.secrets.get(k)))
+    return has
+
+def _check_sheets_access() -> Dict[str, str]:
+    out = {"ok": False, "message": "", "worksheets": ""}
+    try:
+        ss = get_spreadsheet()
+        wss = [w.title for w in ss.worksheets()]
+        out["ok"] = True
+        out["worksheets"] = ", ".join(wss)
+        if SHEET_NAME not in wss:
+            out["message"] = f"Saknar huvudbladet '{SHEET_NAME}'."
+        elif RATES_SHEET_NAME not in wss:
+            out["message"] = f"Saknar valutabladet '{RATES_SHEET_NAME}'."
+        else:
+            out["message"] = "OK"
+    except Exception as e:
+        out["ok"] = False
+        out["message"] = f"Kunde inte nå Google Sheet: {e}"
+    return out
+
+def _missing_cols(df: pd.DataFrame) -> list:
+    return [c for c in MIN_COLS if c not in df.columns]
+
+def render_diagnostics(df: pd.DataFrame) -> None:
+    with st.sidebar.expander("🔍 Diagnostik", expanded=False):
+        st.caption("Snabb hälsokontroll av moduler, secrets, Sheets och kolumner.")
+
+        # Moduler
+        mods = _check_modules()
+        st.markdown("**Moduler**")
+        for m, ok in mods.items():
+            st.write(f"{_bool_badge(ok)} {m}")
+        if not all(mods.values()):
+            st.warning("En eller flera moduler saknas. Kontrollera filstrukturen `stockapp/...`.")
+
+        # Secrets
+        secs = _check_secrets()
+        st.markdown("**Secrets**")
+        for k, ok in secs.items():
+            req = " (krävs)" if k in ("SHEET_URL","GOOGLE_CREDENTIALS") else " (valfri)"
+            st.write(f"{_bool_badge(ok)} {k}{req}")
+        if not (secs.get("SHEET_URL") and secs.get("GOOGLE_CREDENTIALS")):
+            st.error("SHEET_URL och GOOGLE_CREDENTIALS måste vara satta i secrets.")
+
+        # Sheets
+        st.markdown("**Google Sheets**")
+        sh = _check_sheets_access()
+        st.write(f"{_bool_badge(sh['ok'])} {sh['message']}")
+        if sh.get("worksheets"):
+            st.write(f"Blad: {sh['worksheets']}")
+
+        # DataFrame
+        st.markdown("**DataFrame**")
+        st.write(f"Form: {df.shape}")
+        miss = _missing_cols(df)
+        if miss:
+            st.warning(f"Saknade kolumner ({len(miss)}): {', '.join(miss[:30])}" + (" …" if len(miss) > 30 else ""))
+        else:
+            st.success("Alla nyckelkolumner finns.")
+
+        # Manuell FX-check
+        if st.button("Kör nätverkscheckar (FX)", key="diag_netbtn"):
+            rates, misses, provider = hamta_valutakurser_auto()
+            st.info(f"FX källa: {provider} | USD={rates.get('USD')} NOK={rates.get('NOK')} CAD={rates.get('CAD')} EUR={rates.get('EUR')}")
+            if misses:
+                st.warning("Missar:\n- " + "\n- ".join(misses))
 
 # -------------------------------------------------------------------------------------
 # Sidopanel: Valutakurser
 # -------------------------------------------------------------------------------------
 def _init_rate_state():
-    # Första körningen → initiera från sparat eller standard
     if "rate_usd_input" not in st.session_state:
         saved = las_sparade_valutakurser()
         st.session_state.rate_usd_input = float(saved.get("USD", STANDARD_VALUTAKURSER["USD"]))
@@ -237,11 +336,10 @@ def _sidebar_rates() -> Dict[str, float]:
     st.sidebar.header("💱 Valutakurser → SEK")
     _init_rate_state()
 
-    # Hantera “Hämta automatiskt” FÖRE widgets renderas
+    # Kör auto-hämtning FÖRE widgets renderas
     auto_fetch = st.sidebar.button("🌐 Hämta kurser automatiskt")
     if auto_fetch:
         auto_rates, misses, provider = hamta_valutakurser_auto()
-        # Skriv endast till *egna* state-nycklar innan widgetarna skapas
         st.session_state.rate_usd_input = float(auto_rates.get("USD", st.session_state.rate_usd_input))
         st.session_state.rate_nok_input = float(auto_rates.get("NOK", st.session_state.rate_nok_input))
         st.session_state.rate_cad_input = float(auto_rates.get("CAD", st.session_state.rate_cad_input))
@@ -250,7 +348,7 @@ def _sidebar_rates() -> Dict[str, float]:
         if misses:
             st.sidebar.warning("Vissa par kunde inte hämtas:\n- " + "\n- ".join(misses))
 
-    # Widgets – använder session_state-nycklar som kontrollerat sätts ovan
+    # Widgets (nu är state uppdaterad *innan* render)
     usd = st.sidebar.number_input("USD → SEK", key="rate_usd_input", step=0.01, format="%.4f")
     nok = st.sidebar.number_input("NOK → SEK", key="rate_nok_input", step=0.01, format="%.4f")
     cad = st.sidebar.number_input("CAD → SEK", key="rate_cad_input", step=0.01, format="%.4f")
@@ -279,17 +377,15 @@ def _sidebar_rates() -> Dict[str, float]:
 # Sidopanel: Batch-kontroller
 # -------------------------------------------------------------------------------------
 def _sidebar_batch_and_actions(df: pd.DataFrame):
-    # Batchpanel som även sparar till Sheet efter körning
     def _save(d: pd.DataFrame):
         spara_data(d)
-
     df2 = sidebar_batch_controls(
         df,
         save_cb=_save,
         default_sort="Äldst uppdaterade först (alla fält)",
         default_runner_choice="Full auto",
         default_batch_size=10,
-        commit_every=0,   # sätt >0 om du vill del-spara var N:te
+        commit_every=0,  # del-spara var N:te om du vill
     )
     return df2
 
@@ -302,9 +398,12 @@ def main():
     # Valutakurser i sidopanel
     user_rates = _sidebar_rates()
 
-    # Läs data
+    # Läs data och schema-säkra
     df = hamta_data()
     df = ensure_schema(df)
+
+    # 🔍 Diagnostik i sidopanelen
+    render_diagnostics(df)
 
     # Batch-panel i sidopanelen
     df = _sidebar_batch_and_actions(df)
@@ -318,7 +417,6 @@ def main():
         analysvy(df, user_rates)
     elif meny == "Lägg till / uppdatera bolag":
         df2 = lagg_till_eller_uppdatera(df, user_rates, save_cb=lambda d: spara_data(d))
-        # skriv endast om ändringar skett (editor returnerar ny DF om förändrat)
         if df2 is not None and df2 is not df and not df2.equals(df):
             spara_data(df2)
             df = df2

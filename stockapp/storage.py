@@ -1,171 +1,149 @@
 # stockapp/storage.py
 # -*- coding: utf-8 -*-
 """
-Högre nivå kring Google Sheets-lagring för appen.
+Google Sheets-lagring:
+- hamta_data()        -> DataFrame med säkerställt schema
+- spara_data(df, ...) -> skriver hela DF till huvudbladet
+- backup_snapshot_sheet(df, ...) -> skapar snapshot-flik
+- get_spreadsheet() / skapa_koppling() -> interna hjälpmetoder
 
-Publika funktioner:
-- hamta_data() -> pd.DataFrame
-- spara_data(df, do_snapshot=False, snapshot_title=None, protect_from_wipe=True, dedupe=True) -> pd.DataFrame
-- snapshot_now(df, title=None) -> str
-- check_duplicate_tickers(df) -> List[str]
-- merge_updates(df, updates) -> pd.DataFrame
-
-All I/O mot Sheets går via stockapp.sheets.
+Krav i st.secrets:
+- SHEET_URL
+- GOOGLE_CREDENTIALS (service account JSON)
 """
 
 from __future__ import annotations
-
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import pandas as pd
 import numpy as np
 import streamlit as st
 
+# Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
+
 from .config import FINAL_COLS, SHEET_NAME
-from .utils import (
-    ensure_final_cols,
-    norm_ticker,
-    ts_str,
-    AppUserError,
-)
-from .sheets import (
-    read_portfolio_df,
-    save_portfolio_df,
-    write_table,
-    read_table,
-    get_spreadsheet,
-    get_ws,
-)
+from .utils import ensure_schema, with_backoff, now_stamp, dedupe_tickers
 
 
 # ---------------------------------------------------------------------
-# Hjälp: dubbletter & normalisering
+# GSpread-klient
 # ---------------------------------------------------------------------
-def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Säkerställ slutkolumner och normalisera Ticker."""
-    work = ensure_final_cols(df.copy())
-    if "Ticker" in work.columns:
-        work["Ticker"] = work["Ticker"].map(norm_ticker)
-    return work
+def _gspread_client():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
+    return gspread.authorize(credentials)
 
+def get_spreadsheet():
+    client = _gspread_client()
+    return client.open_by_url(st.secrets["SHEET_URL"])
 
-def check_duplicate_tickers(df: pd.DataFrame) -> List[str]:
-    """Returnerar en lista av Ticker som förekommer fler än en gång (ignorerar tomma)."""
-    if "Ticker" not in df.columns:
-        return []
-    ser = df["Ticker"].astype(str).str.strip().str.upper()
-    ser = ser[ser != ""]
-    dup = ser[ser.duplicated(keep=False)]
-    return sorted(dup.unique().tolist())
+def skapa_koppling(sheet_name: str = SHEET_NAME):
+    return get_spreadsheet().worksheet(sheet_name)
 
 
 # ---------------------------------------------------------------------
-# Läs & spara
+# Läs / Spara / Snapshot
 # ---------------------------------------------------------------------
 def hamta_data() -> pd.DataFrame:
     """
-    Läser huvudarket (SHEET_NAME) och garanterar FINAL_COLS.
-    Använd denna i appen istället för att prata direkt med gspread.
+    Läser alla rader från huvudbladet och säkerställer schema/typer.
+    Returnerar alltid en DF med FINAL_COLS (saknade fylls).
     """
-    df = read_portfolio_df()
-    return _normalize_df(df)
+    try:
+        sheet = skapa_koppling()
+        rows = with_backoff(sheet.get_all_records)  # List[dict]
+        df = pd.DataFrame(rows)
+    except Exception:
+        # Om bladet saknas eller är tomt – bygg minimal DF
+        df = pd.DataFrame({c: [] for c in FINAL_COLS})
+
+    # Säkerställ schema + typer
+    df = ensure_schema(df)
+
+    # Dedupe tickers i läs-ögonblicket (vi skriver inte tillbaka automatiskt här)
+    df, _dups = dedupe_tickers(df)
+    return df
 
 
-def spara_data(
-    df: pd.DataFrame,
-    do_snapshot: bool = False,
-    snapshot_title: Optional[str] = None,
-    protect_from_wipe: bool = True,
-    dedupe: bool = True,
-) -> pd.DataFrame:
+def _safe_cell_value(v) -> str:
     """
-    Sparar hela portfölj-tabellen.
-
-    Skydd:
-      - protect_from_wipe=True: Om df är tomt men befintligt ark INTE är tomt -> avbryt, kasta AppUserError.
-      - dedupe=True: Dubbletter av Ticker är inte tillåtna -> avbryt, kasta AppUserError.
-
-    Returnerar df (normaliserat) vid lyckad skrivning.
+    Konverterar cellvärde till str för gspread.update.
+    - NaN/NaT -> ""
+    - float -> str(v)
+    - annars str(v)
     """
-    work = _normalize_df(df)
-
-    # Blockera oavsiktlig wipe
-    if protect_from_wipe:
-        if work.empty:
-            old = read_portfolio_df()
-            if not old.empty:
-                raise AppUserError(
-                    "Skrivning avbruten: försökte spara TOM tabell medan befintlig databas innehåller rader."
-                )
-
-    # Dubblettskydd
-    if dedupe:
-        dups = check_duplicate_tickers(work)
-        if dups:
-            raise AppUserError(
-                f"Dubbletter av Ticker ej tillåtna: {', '.join(dups)}. "
-                "Rätta till innan sparning."
-            )
-
-    # Spara (med ev. snapshot)
-    save_portfolio_df(work, do_snapshot=do_snapshot, snapshot_title=snapshot_title)
-    return work
+    if v is None:
+        return ""
+    if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+        return ""
+    s = str(v)
+    if s.lower() in ("nan", "nat", "none"):
+        return ""
+    return s
 
 
-# ---------------------------------------------------------------------
-# Snapshots
-# ---------------------------------------------------------------------
-def snapshot_now(df: pd.DataFrame, title: Optional[str] = None) -> str:
+def spara_data(df: pd.DataFrame, do_snapshot: bool = False) -> None:
     """
-    Skapar en snapshot av df i ett eget ark och returnerar arkets namn.
+    Skriver HELA DataFrame till huvudbladet.
+    Säkerhet:
+      - Avbryter om df är None/tom eller saknar 'Ticker'.
+      - Skapar snapshot-flik först om do_snapshot=True.
     """
-    name = title or f"snapshot_{ts_str()}"
-    work = _normalize_df(df)
-    save_portfolio_df(work, do_snapshot=True, snapshot_title=name)
-    return name
+    if df is None or not isinstance(df, pd.DataFrame):
+        st.error("spara_data: DF saknas – ingen skrivning.")
+        return
+    if "Ticker" not in df.columns:
+        st.error("spara_data: 'Ticker'-kolumn saknas – ingen skrivning.")
+        return
+    if df.empty:
+        st.error("spara_data: DF är tom – ingen skrivning (skydd mot wipe).")
+        return
 
+    # Säkerställ schema och ordning på kolumner
+    df = ensure_schema(df)
+    df = df[[c for c in FINAL_COLS if c in df.columns]].copy()
 
-# ---------------------------------------------------------------------
-# Smidig batch-uppdatering av värden i minnet
-# ---------------------------------------------------------------------
-def merge_updates(df: pd.DataFrame, updates: Dict[str, Dict[str, object]]) -> pd.DataFrame:
-    """
-    Tar en df och en uppsättning uppdateringar per ticker:
-      updates = {
-         "NVDA": {"Kurs (valuta)": 178.4, "Senast uppdaterad": "2025-09-28T12:00:00Z"},
-         "AAPL": {"P/S Q1": 7.2}
-      }
-    Returnerar en NY DataFrame med fälten uppdaterade (sparar inte till Sheets).
-    """
-    work = _normalize_df(df)
-    if "Ticker" not in work.columns or work.empty or not updates:
-        return work
-
-    # Skapa snabb index
-    idx_map = {t: i for i, t in enumerate(work["Ticker"].tolist()) if t}
-
-    for raw_tkr, fields in updates.items():
-        tkr = norm_ticker(raw_tkr)
-        ridx = idx_map.get(tkr, None)
-        if ridx is None:
-            # Ticker finns inte i df => lägg in ny rad
-            new_row = {c: "" for c in work.columns}
-            new_row["Ticker"] = tkr
-            for k, v in (fields or {}).items():
-                if k in work.columns:
-                    new_row[k] = v
-            work.loc[len(work)] = new_row
-            idx_map[tkr] = int(len(work) - 1)
-        else:
-            for k, v in (fields or {}).items():
-                if k in work.columns:
-                    work.iat[ridx, work.columns.get_loc(k)] = v
-
-    # Sista koll dubbletter
-    dups = check_duplicate_tickers(work)
+    # Ta bort dubbletter (behåll första)
+    df, dups = dedupe_tickers(df)
     if dups:
-        raise AppUserError(
-            f"Uppdateringar skapade dubbletter av Ticker: {', '.join(dups)}."
-        )
+        st.warning(f"Dubbletter borttagna vid sparning: {sorted(set(dups))}")
 
-    return work
+    # Snapshot före skrivning om begärt
+    if do_snapshot:
+        try:
+            backup_snapshot_sheet(df, base_sheet_name=SHEET_NAME)
+        except Exception as e:
+            st.warning(f"Kunde inte skapa snapshot före skrivning: {e}")
+
+    # Skriv
+    sheet = skapa_koppling()
+    with_backoff(sheet.clear)
+
+    header = list(df.columns)
+    values = df.astype(object).where(pd.notna(df), None).values.tolist()
+    # Konvertera till str för gspread
+    rows_str = [[_safe_cell_value(x) for x in row] for row in values]
+
+    with_backoff(sheet.update, [header] + rows_str)
+    st.success(f"Sparat {len(df)} rader till '{SHEET_NAME}' ({now_stamp()}).")
+
+
+def backup_snapshot_sheet(df: pd.DataFrame, base_sheet_name: str = SHEET_NAME) -> None:
+    """
+    Skapar snapshot-flik 'Snapshot-YYYYMMDD' och fyller med DF.
+    """
+    ss = get_spreadsheet()
+    snap_name = f"Snapshot-{now_stamp()}"
+    try:
+        ss.add_worksheet(title=snap_name, rows=max(1000, len(df) + 10), cols=max(50, len(df.columns) + 2))
+        ws = ss.worksheet(snap_name)
+        with_backoff(ws.clear)
+        header = list(df.columns)
+        values = df.astype(object).where(pd.notna(df), None).values.tolist()
+        rows_str = [[_safe_cell_value(x) for x in row] for row in values]
+        with_backoff(ws.update, [header] + rows_str)
+        st.success(f"Snapshot skapad: {snap_name}")
+    except Exception as e:
+        st.warning(f"Misslyckades skapa snapshot-flik: {e}")

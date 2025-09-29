@@ -1,21 +1,21 @@
 # stockapp/rates.py
 # -*- coding: utf-8 -*-
 """
-Valutafunktioner:
-- las_sparade_valutakurser()
-- spara_valutakurser(rates)
-- hamta_valutakurser_auto()    (FMP -> Frankfurter -> exchangerate.host)
+Valutafunktioner (kvottsnåla & robusta):
+- las_sparade_valutakurser()     → använder session-cache (TTL) före Sheets-läsning
+- spara_valutakurser(rates)      → skriver + uppdaterar session-cache
+- hamta_valutakurser_auto()      → FMP → Frankfurter → exchangerate.host
 - hamta_valutakurs(valuta, user_rates)
 
-Robust hantering av Google Sheets-bladet för valutakurser:
-- Hittar blad case-insensitivt (trim)
-- Skapar blad om det saknas (med header)
-- Backoff på alla API-anrop
-- Faller tillbaka till STANDARD_VALUTAKURSER och visar varning istället för att krascha
+Skydd:
+- st.cache_resource för gspread-klient & Spreadsheet
+- Circuit breaker vid 429 (blockerar fler läsningar en kort tid)
+- Fallback till STANDARD_VALUTAKURSER utan att krascha
 """
 
 from __future__ import annotations
 from typing import Dict, Tuple, List
+from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
@@ -27,24 +27,38 @@ from google.oauth2.service_account import Credentials
 from .config import STANDARD_VALUTAKURSER, RATES_SHEET_NAME  # t.ex. "Valutakurser"
 from .utils import with_backoff
 
+# ---------- Konstanter ----------
+_CACHE_TTL_MIN = 10          # minuter för session-cache av valutakurser
+_BLOCK_SECONDS_ON_429 = 90   # sekunder att pausa nya läsningar efter en 429
 
-# ---------------------------------------------------------------------
-# Lokal Sheets-koppling (fristående från storage)
-# ---------------------------------------------------------------------
+
+# ---------- Hjälpare ----------
+def _now() -> datetime:
+    try:
+        import pytz
+        return datetime.now(pytz.timezone("Europe/Stockholm"))
+    except Exception:
+        return datetime.now()
+
+def _normalize_title(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+# ---------- Cachat gspread ----------
+@st.cache_resource(show_spinner=False)
 def _gspread_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
     return gspread.authorize(credentials)
 
+@st.cache_resource(show_spinner=False)
 def _get_spreadsheet():
     client = _gspread_client()
     return client.open_by_url(st.secrets["SHEET_URL"])
 
-def _normalize_title(s: str) -> str:
-    return (s or "").strip().lower()
 
 def _find_ws_loose(ss: gspread.Spreadsheet, title: str):
-    """Hitta worksheet genom case-insensitive + trim-match."""
+    """Hitta worksheet via case-insensitive + trim-match."""
     want = _normalize_title(title)
     for ws in with_backoff(ss.worksheets):
         if _normalize_title(ws.title) == want:
@@ -59,36 +73,47 @@ def _ensure_header(ws: gspread.Worksheet):
             with_backoff(ws.clear)
             with_backoff(ws.update, [["Valuta", "Kurs"]])
     except Exception:
-        # Sista utväg: försök skriva header ändå.
         try:
             with_backoff(ws.update, [["Valuta", "Kurs"]])
         except Exception:
             pass
 
+
 def _get_rates_ws():
     """
     Försöker öppna (eller skapa) valutabladet.
-    Returnerar worksheet-objekt eller None vid fel (utan att krascha appen).
+    Respekterar circuit breaker vid 429.
+    Returnerar worksheet-objekt eller None vid fel.
     """
+    # Circuit breaker?
+    block_until = st.session_state.get("_sheets_rates_block_until")
+    if block_until and _now() < block_until:
+        return None
+
     title = RATES_SHEET_NAME or "Valutakurser"
     try:
         ss = _get_spreadsheet()
     except Exception as e:
-        st.warning(f"⚠️ Kunde inte öppna Google Sheet (kontrollera SHEET_URL & behörighet): {e}")
+        st.warning(f"⚠️ Kunde inte öppna Google Sheet (SHEET_URL/behörighet): {e}")
         return None
 
-    # 1) Direkt exakt match
+    # 1) Exakt
     try:
         return with_backoff(ss.worksheet, title)
+    except gspread.exceptions.APIError as e:
+        _maybe_block_on_429(e)
+        # fortsätt försöka nedan
     except Exception:
         pass
 
-    # 2) Lös match (case-insensitiv + trim)
+    # 2) Lös match
     try:
         ws = _find_ws_loose(ss, title)
         if ws:
             _ensure_header(ws)
             return ws
+    except gspread.exceptions.APIError as e:
+        _maybe_block_on_429(e)
     except Exception:
         pass
 
@@ -97,30 +122,67 @@ def _get_rates_ws():
         ws = with_backoff(ss.add_worksheet, title=title, rows=50, cols=5)
         _ensure_header(ws)
         return ws
-    except Exception:
-        # Kan hända om det redan finns ett blad med samma namn (race condition)
+    except gspread.exceptions.APIError as e:
+        # Race: redan skapat? Försök öppna igen.
         try:
             ws = with_backoff(ss.worksheet, title)
             _ensure_header(ws)
             return ws
-        except Exception as e:
-            st.warning(f"⚠️ Kunde inte öppna eller skapa bladet '{title}': {e}")
+        except Exception:
+            _maybe_block_on_429(e)
+            st.warning(f"⚠️ Kunde inte öppna/skapa bladet '{title}': {e}")
             return None
+    except Exception as e:
+        st.warning(f"⚠️ Kunde inte öppna/skapa bladet '{title}': {e}")
+        return None
 
 
-# ---------------------------------------------------------------------
-# Publika API-funktioner
-# ---------------------------------------------------------------------
+def _maybe_block_on_429(err: Exception):
+    """Sätt en kort blockering vid 429 för att undvika att elda på kvottaket."""
+    try:
+        msg = str(err)
+        if "429" in msg or "Quota exceeded" in msg:
+            st.session_state["_sheets_rates_block_until"] = _now() + timedelta(seconds=_BLOCK_SECONDS_ON_429)
+    except Exception:
+        pass
+
+
+# ---------- Session-cache av kurser ----------
+def _get_rates_from_session() -> Dict[str, float] | None:
+    data = st.session_state.get("_rates_cache")
+    ts = st.session_state.get("_rates_cache_ts")
+    if not isinstance(data, dict) or not ts:
+        return None
+    try:
+        if _now() - ts <= timedelta(minutes=_CACHE_TTL_MIN):
+            return data
+    except Exception:
+        return None
+    return None
+
+def _set_rates_in_session(rates: Dict[str, float]):
+    st.session_state["_rates_cache"] = dict(rates)
+    st.session_state["_rates_cache_ts"] = _now()
+
+
+# ---------- Publika API-funktioner ----------
 def las_sparade_valutakurser() -> Dict[str, float]:
     """
-    Läser sparade kurser (Valutakurser-arket). Faller tillbaka på STANDARD_VALUTAKURSER.
-    Returnerar dict som t.ex. {"USD": 10.55, "EUR": 11.20, ...}
+    Läser sparade kurser från session-cache (om färska), annars från Sheets (om möjligt).
+    Faller tillbaka till STANDARD_VALUTAKURSER utan att krascha.
     """
+    # 1) Session-cache
+    cached = _get_rates_from_session()
+    if cached:
+        return dict(cached)
+
+    # 2) Sheets
     ws = _get_rates_ws()
     if ws is None:
-        # Falla tillbaka – visa tydlig info men krascha inte
-        st.warning("Använder standardkurser då valutabladet inte kunde öppnas.")
-        return {k: float(v) for k, v in STANDARD_VALUTAKURSER.items()}
+        st.warning("Använder standardkurser (valutablad ej tillgängligt).")
+        out = {k: float(v) for k, v in STANDARD_VALUTAKURSER.items()}
+        _set_rates_in_session(out)
+        return out
 
     try:
         rows = with_backoff(ws.get_all_records)  # [{'Valuta':'USD','Kurs':'10.23'}, ...]
@@ -132,21 +194,31 @@ def las_sparade_valutakurser() -> Dict[str, float]:
                 out[cur] = float(val)
             except Exception:
                 pass
-        # Fyll luckor med STANDARD
+        # Fyll luckor
         for k, v in STANDARD_VALUTAKURSER.items():
             out.setdefault(k, float(v))
+
+        _set_rates_in_session(out)
+        return out
+    except gspread.exceptions.APIError as e:
+        _maybe_block_on_429(e)
+        st.warning("Använder standardkurser (läsa från valutablad misslyckades p.g.a. kvottak).")
+        out = {k: float(v) for k, v in STANDARD_VALUTAKURSER.items()}
+        _set_rates_in_session(out)
         return out
     except Exception as e:
-        st.warning(f"Kunde inte läsa valutakurser från bladet – använder standard. ({e})")
-        return {k: float(v) for k, v in STANDARD_VALUTAKURSER.items()}
+        st.warning(f"Använder standardkurser (fel vid läsning): {e}")
+        out = {k: float(v) for k, v in STANDARD_VALUTAKURSER.items()}
+        _set_rates_in_session(out)
+        return out
 
 def spara_valutakurser(rates: Dict[str, float]) -> None:
     """
-    Skriver in rad-ordning: USD, NOK, CAD, EUR, SEK
+    Skriver in rad-ordning: USD, NOK, CAD, EUR, SEK och uppdaterar session-cache.
     """
     ws = _get_rates_ws()
     if ws is None:
-        st.warning("Kunde inte spara kurser – valutabladet öppnades/skapades inte.")
+        st.warning("Kunde inte spara kurser – valutablad ej tillgängligt (kvottak/behörighet?).")
         return
 
     body = [["Valuta", "Kurs"]]
@@ -157,7 +229,12 @@ def spara_valutakurser(rates: Dict[str, float]) -> None:
     try:
         with_backoff(ws.clear)
         with_backoff(ws.update, body)
+        _set_rates_in_session({k: float(v if isinstance(v, (int, float)) else STANDARD_VALUTAKURSER.get(k, 1.0))
+                               for k, v in rates.items()})
         st.success("Valutakurser sparade.")
+    except gspread.exceptions.APIError as e:
+        _maybe_block_on_429(e)
+        st.warning(f"Kunde inte spara valutakurser (kvottak?): {e}")
     except Exception as e:
         st.warning(f"Kunde inte spara valutakurser: {e}")
 
@@ -232,10 +309,15 @@ def hamta_valutakurser_auto() -> Tuple[Dict[str, float], List[str], str]:
                 pass
 
     # Fyll luckor med sparade/standard
-    saved = las_sparade_valutakurser()
+    saved = _get_rates_from_session() or las_sparade_valutakurser()
     for base_ccy in ("USD", "EUR", "CAD", "NOK", "SEK"):
         if base_ccy not in rates:
             rates[base_ccy] = float(saved.get(base_ccy, STANDARD_VALUTAKURSER.get(base_ccy, 1.0)))
+
+    # Uppdatera session-cache med det vi just hämtade
+    merged = dict(saved)
+    merged.update(rates)
+    _set_rates_in_session(merged)
 
     return rates, misses, provider
 

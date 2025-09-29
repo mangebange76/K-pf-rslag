@@ -25,7 +25,6 @@ def _is_present(val) -> bool:
         v = float(val)
         if np.isnan(v):
             return False
-        # 0 kan vara giltigt; räkna allt som inte NaN
         return True
     except Exception:
         return str(val).strip() != ""
@@ -44,7 +43,6 @@ def _coverage_fields(mode: str) -> List[str]:
             "Utdelningskvot FCF (%)",
             "Utdelningskvot Vinst (%)",
         ]
-    # Tillväxt
     return [
         "P/S",
         "P/S-snitt",
@@ -77,12 +75,9 @@ def _potential_pct(row: pd.Series, riktkurs_col: str) -> float:
     return (tgt - px) / max(px, 1e-9) * 100.0
 
 def _normalize_potential(pct: float) -> float:
-    """
-    Begränsa och normalisera potential. -50%..+150% ⇒ 0..1.
-    """
     lo, hi = -50.0, 150.0
     x = max(lo, min(hi, pct))
-    return (x - lo) / (hi - lo)  # 0..1
+    return (x - lo) / (hi - lo)
 
 # ---------------------------
 # Huvudvy
@@ -102,54 +97,64 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
         index=1
     )
 
-    # Filter: sektor & risk
     sector_vals = ["Alla"] + sorted([s for s in df.get("Sektor", pd.Series(dtype=str)).astype(str).unique() if s])
     sektor = st.selectbox("Filtrera på sektor", sector_vals, index=0)
 
-    risk_vals = ["Alla", "Micro", "Small", "Mid", "Large", "Mega"]
+    risk_vals = ["Alla", "Micro", "Small", "Mid", "Large", "Mega", "Unknown"]
     risk_choice = st.selectbox("Filtrera på risklabel (Market Cap)", risk_vals, index=0)
 
-    # Basurval – kräver pris & riktkurs > 0
+    # Basurval – kräver pris; riktkurs används om finns, annars fallback
     work = df.copy()
     work["Aktuell kurs"] = pd.to_numeric(work.get("Aktuell kurs", 0), errors="coerce").fillna(0.0)
     work[riktkurs_val] = pd.to_numeric(work.get(riktkurs_val, 0), errors="coerce").fillna(0.0)
-    base = work[(work["Aktuell kurs"] > 0) & (work[riktkurs_val] > 0)].copy()
+    base = work[work["Aktuell kurs"] > 0].copy()
 
     if sektor != "Alla":
         base = base[base.get("Sektor", "").astype(str) == sektor]
 
-    # Robust risklabel även om "Market Cap" saknas
+    # Risklabel robust
     if "Market Cap" in base.columns:
         mcap_series = pd.to_numeric(base["Market Cap"], errors="coerce")
     else:
         mcap_series = pd.Series([np.nan] * len(base), index=base.index, dtype="float64")
     base["_RiskLabel"] = mcap_series.apply(risk_label_from_mcap)
-
     if risk_choice != "Alla":
-        base = base[base["_RiskLabel"] == risk_choice]
+        if risk_choice == "Unknown":
+            base = base[base["_RiskLabel"] == "Unknown"]
+        else:
+            base = base[base["_RiskLabel"] == risk_choice]
 
     if base.empty:
         st.info("Inga bolag matchar filtren just nu.")
         return
 
-    # Score + datatäckning + potential
+    # Potential + täckning + score
     base["Potential (%)"] = base.apply(lambda r: _potential_pct(r, riktkurs_val), axis=1)
     base["_Coverage"], base["_Present"], base["_Total"] = zip(*base.apply(lambda r: _coverage_ratio_row(r, mode), axis=1))
+
+    has_any_target = (base[riktkurs_val] > 0).any()
 
     if mode == "Utdelning":
         base["_BaseScore"] = base.apply(lambda r: dividend_score(r), axis=1)
     else:
+        # Growth-score tar hänsyn till riktkurs om den finns
         base["_BaseScore"] = base.apply(lambda r: growth_score(r, riktkurs_col=riktkurs_val), axis=1)
 
-    # Slutlig poäng med stark vikt på täckning
     base["_FinalScore"] = (
         base["_BaseScore"] * (base["_Coverage"] ** 1.25)
         + 15.0 * base["_Coverage"]
         + 0.2 * base["Potential (%)"].apply(_normalize_potential) * 100.0
     )
 
-    # Sortera: final score, coverage, potential
-    base = base.sort_values(by=["_FinalScore", "_Coverage", "Potential (%)"], ascending=[False, False, False]).reset_index(drop=True)
+    # Om riktkurser saknas rakt av (has_any_target == False), gör FALLBACK:
+    if not has_any_target:
+        # sortera på P/S-snitt om det finns, annars P/S
+        psn = pd.to_numeric(base.get("P/S-snitt", 0), errors="coerce").fillna(0.0)
+        ps0 = pd.to_numeric(base.get("P/S", 0), errors="coerce").fillna(0.0)
+        base["_Sorterare"] = np.where(psn > 0, -psn, np.where(ps0 > 0, -ps0, 0.0))
+        base = base.sort_values(by=["_Sorterare", "_Coverage"], ascending=[True, False]).reset_index(drop=True)
+    else:
+        base = base.sort_values(by=["_FinalScore", "_Coverage", "Potential (%)"], ascending=[False, False, False]).reset_index(drop=True)
 
     # Navigering
     if "forslags_index" not in st.session_state:
@@ -189,7 +194,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
 
     gav_sek = safe_float(rad.get("GAV (SEK)")) if "GAV (SEK)" in df.columns else None
 
-    # Rek etikett
     label, reason, metrics = assign_action_label(
         rad,
         mode=mode,
@@ -228,7 +232,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
 
     st.markdown("\n".join(lines))
 
-    # Expander
     with st.expander("Visa fler detaljer"):
         extra = {}
         for k in [

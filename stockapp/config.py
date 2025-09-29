@@ -1,130 +1,109 @@
 # stockapp/config.py
 # -*- coding: utf-8 -*-
+
 """
-Konfig & kolumn-definitioner för hela appen.
-Den här modulen har inga beroenden (ingen Streamlit-import).
+Central konfiguration & kolumnschema för appen.
+
+Viktigt:
+- SHEET_NAME: huvudbladet i Google Sheet (databasen)
+- RATES_SHEET_NAME: bladet där valutakurser sparas
+- STANDARD_VALUTAKURSER: start-/fallbackkurser
+- TS_FIELDS: vilka fält som har TS_-kolumner
+- FINAL_COLS: fullständig kolumnlista som appen förväntar sig
+  (vi inkluderar även extra nyckeltal så vyer/score kan köras utan KeyError)
 """
 
-# ---------------------------------------------------------------------------
-# Google Sheet / ark-namn
-# ---------------------------------------------------------------------------
-DATA_SHEET_NAME: str = "Data"          # huvudarket med alla bolag
-RATES_SHEET_NAME: str = "Valutakurser"  # separat ark för sparade växelkurser
-SNAPSHOT_PREFIX: str = "snapshot_"      # snapshots döps t.ex. snapshot_2025-09-28
+# --- Google Sheets-flikar ----------------------------------------------------
+SHEET_NAME = "Blad1"
+RATES_SHEET_NAME = "Valutakurser"
 
-# ---------------------------------------------------------------------------
-# Standardvalutakurser (fallback om inga sparade/auto-hämtade finns)
-# Alla kurser uttrycks som 1 BASVALUTA = X SEK
-# ---------------------------------------------------------------------------
+# --- Valutakurser (fallback/startvärden) -------------------------------------
 STANDARD_VALUTAKURSER = {
+    "USD": 9.75,
+    "NOK": 0.95,
+    "CAD": 7.05,
+    "EUR": 11.18,
     "SEK": 1.0,
-    "USD": 10.0,
-    "EUR": 11.0,
-    "NOK": 1.0,
-    "CAD": 7.5,
 }
 
-# ---------------------------------------------------------------------------
-# Visnings-/formateringsregler
-# ---------------------------------------------------------------------------
-MARKETCAP_LABELS = [
-    (1_000_000_000_000_000, "kvadriljoner"),
-    (1_000_000_000_000, "biljoner"),   # 10^12
-    (1_000_000_000, "miljarder"),      # 10^9
-    (1_000_000, "miljoner"),           # 10^6
-]
+# --- Tidsstämpel-spårning ----------------------------------------------------
+TS_FIELDS = {
+    "Utestående aktier": "TS_Utestående aktier",
+    "P/S": "TS_P/S",
+    "P/S Q1": "TS_P/S Q1",
+    "P/S Q2": "TS_P/S Q2",
+    "P/S Q3": "TS_P/S Q3",
+    "P/S Q4": "TS_P/S Q4",
+    "Omsättning idag": "TS_Omsättning idag",
+    "Omsättning nästa år": "TS_Omsättning nästa år",
+}
 
-# Risklabel baserat på market cap (USD-ekvivalent)
-RISK_BUCKETS = [
-    (2_000_000_000_000, "Megacap"),
-    (200_000_000_000, "Largecap"),
-    (10_000_000_000, "Midcap"),
-    (2_000_000_000, "Smallcap"),
-    (0, "Microcap"),
-]
-
-# Default storlek vid batch-körningar
-BATCH_DEFAULT_SIZE = 10
-
-# ---------------------------------------------------------------------------
-# Kolumner i huvudarket (Data)
-# OBS: håll listan stabil – andra moduler förlitar sig på dessa namn.
-# ---------------------------------------------------------------------------
+# --- Fullständig kolumnlista -------------------------------------------------
+# Notera:
+# - "Utestående aktier" lagras i MILJONER (styck/1e6)
+# - Omsättning/FCF/Kassa i MILJONER av bolagets valuta
+# - Market cap kan sparas både i bolagsvaluta och SEK om du vill
 FINAL_COLS = [
-    # Basinfo
-    "Bolagsnamn", "Ticker", "Valuta", "Land", "Lista", "Sektor", "Industri",
+    # Grundidentitet
+    "Ticker", "Bolagsnamn", "Valuta",
 
-    # Pris & aktier
-    "Senast", "Senast (TS)",
-    "Utest. aktier", "Utest. aktier (TS)",
+    # Pris & aktiedata
+    "Aktuell kurs", "Utestående aktier",
 
-    # Market cap nu + TTM
-    "Market Cap (nu)", "Market Cap (TS)",
-    "Omsättning TTM", "Omsättning TTM (TS)",
+    # P/S & historik (TTM/Q)
+    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
 
-    # P/S
-    "P/S (Yahoo)", "P/S (TTM)",
-    "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-    "P/S-snitt (Q1..Q4)",
+    # Omsättning (M, bolagsvaluta)
+    "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
 
-    # Mcap-historik (4 TTM-fönster)
-    "MCap Q1", "MCap Q2", "MCap Q3", "MCap Q4",
-    "MCap-datum Q1", "MCap-datum Q2", "MCap-datum Q3", "MCap-datum Q4",
+    # Riktkurser (bolagsvaluta)
+    "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
 
-    # Lönsamhet & balans
-    "Bruttomarginal (%)", "Nettomarginal (%)", "Debt/Equity",
-    "Kassa (valuta)", "Kassa (TS)",
-    "FCF (TTM)", "FCF (TS)",
-    "CapEx (TTM)", "Opex (TTM)", "Opex (TS)",
-    "Eget kapital", "Eget kapital (TS)",
-    "EPS TTM", "PE (TTM)",
+    # Portfölj
+    "Antal aktier", "Årlig utdelning", "GAV (SEK)",
 
-    # Prognoser (alltid manuella – i bolagets valuta)
-    "Prognos omsättning i år (valuta)", "Prognos omsättning i år (TS)",
-    "Prognos omsättning nästa år (valuta)", "Prognos omsättning nästa år (TS)",
+    # Tillväxt & övrigt
+    "CAGR 5 år (%)",
 
-    # Portföljrelaterat
-    "Antal du äger", "GAV (SEK)", "Andel portfölj (%)",
+    # --- Extra nyckeltal för scoring/analys ---
+    # Marknadsvärde
+    "Market Cap (valuta)", "Market Cap (SEK)",
 
-    # Metafält
-    "Senast uppdaterad (auto)", "Senast uppdaterad (manuell)",
-    "Notis",
+    # Lönsamhet/marginaler (%)
+    "Bruttomarginal (%)", "Nettomarginal (%)",
+
+    # Kassaflöde / skuld / kassa (alla i M, bolagsvaluta)
+    "FCF (M)", "Debt/Equity", "Kassa (M)", "Runway (kvartal)",
+
+    # Multiplar
+    "EV/EBITDA",
+
+    # Dividend
+    "Dividend Yield (%)", "Payout Ratio CF (%)",
+
+    # Klassning
+    "Risklabel", "Sektor", "Industri",
+
+    # Käll- & datumfält
+    "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa",
+
+    # TS-kolumner (en per spårat fält)
+    TS_FIELDS["Utestående aktier"],
+    TS_FIELDS["P/S"], TS_FIELDS["P/S Q1"], TS_FIELDS["P/S Q2"], TS_FIELDS["P/S Q3"], TS_FIELDS["P/S Q4"],
+    TS_FIELDS["Omsättning idag"], TS_FIELDS["Omsättning nästa år"],
 ]
 
-# Alla tidsstämpels-kolumner (identifieras på suffixet "(TS)")
-TS_FIELDS = [c for c in FINAL_COLS if c.endswith("(TS)")]
+# (Valfritt) För appens rubrik/branding
+APP_TITLE = "📊 Aktieanalys och investeringsförslag"
 
-# Kolumner som räknas som "kvartalsrader" i P/S/MCap-tabellen i UI
-PS_HISTORY_FIELDS = ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]
-MCAP_HISTORY_FIELDS = ["MCap Q1", "MCap Q2", "MCap Q3", "MCap Q4"]
-MCAP_DATE_FIELDS = ["MCap-datum Q1", "MCap-datum Q2", "MCap-datum Q3", "MCap-datum Q4"]
-
-# Kolumner vi tillåter att uppdatera i "Kurs endast"-flödet
-COURSE_ONLY_UPDATABLE = ["Senast", "Senast (TS)", "Market Cap (nu)", "Market Cap (TS)"]
-
-# Kolumner som ALDRIG skrivs över automatiskt (manuellt fält)
-MANUAL_ONLY_FIELDS = [
-    "Prognos omsättning i år (valuta)",
-    "Prognos omsättning i år (TS)",
-    "Prognos omsättning nästa år (valuta)",
-    "Prognos omsättning nästa år (TS)",
-    "Antal du äger",
-    "GAV (SEK)",
-    "Notis",
-]
-
-# Kolumner som bör finnas även om hämtning misslyckas (skydd mot KeyError)
-REQUIRED_MIN_COLS = ["Bolagsnamn", "Ticker", "Valuta", "Senast", "Utest. aktier"]
-
-# Defaultvärden om cell saknas
-DEFAULTS = {
-    "Bolagsnamn": "",
-    "Valuta": "USD",
-    "Senast": 0.0,
-    "Utest. aktier": 0.0,
-    "Market Cap (nu)": 0.0,
-    "P/S (TTM)": 0.0,
-    "P/S (Yahoo)": 0.0,
-    "GAV (SEK)": 0.0,
-    "Antal du äger": 0.0,
+# (Valfritt) Risklabel-trösklar (MCAP i bolagsvaluta, ungefärliga nivåer – justera i scoring om du vill)
+RISK_BUCKET_LIMITS = {
+    "Microcap": 300_000_000,    # < 300M
+    "Smallcap": 2_000_000_000,  # < 2B
+    "Midcap": 10_000_000_000,   # < 10B
+    "Largecap": float("inf"),   # >= 10B
 }
+
+# (Valfritt) Standardinställningar för batch
+DEFAULT_BATCH_SIZE = 10
+DEFAULT_BATCH_SORT = "Äldst TS"  # eller "A–Ö"

@@ -9,13 +9,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Streamlit är valfritt – vi faller tillbaka om det inte finns
+# Streamlit är valfritt – fall back om det inte finns
 try:
     import streamlit as st
 except Exception:
     st = None
 
-# Lokal tidszon om tillgänglig
+# ------------------------------------------------------------
+# Lokal tid / datum
+# ------------------------------------------------------------
 try:
     import pytz
     TZ_STHLM = pytz.timezone("Europe/Stockholm")
@@ -29,18 +31,19 @@ except Exception:
     def now_dt() -> datetime:
         return datetime.now()
 
-# För schema & TS-listor
+# ------------------------------------------------------------
+# Hämta schema-konstanter
+# ------------------------------------------------------------
 try:
     from .config import FINAL_COLS, TS_FIELDS
 except Exception:
-    # Fallback om config inte hunnit laddas
+    # Minimal fallback om config inte är laddad (förhindrar importkrasch)
     FINAL_COLS = [
         "Ticker","Bolagsnamn","Valuta","Aktuell kurs","Antal aktier","Årlig utdelning",
         "Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
         "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
         "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
-        "CAGR 5 år (%)","Bruttomarginal (%)","Netto-marginal (%)","Debt/Equity",
-        "Utdelningsyield (%)","Utdelning/FCF coverage","Payout ratio (%)",
+        "CAGR 5 år (%)",
         "Market Cap","Sektor",
         "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa",
     ]
@@ -53,17 +56,12 @@ except Exception:
         "Riktkurs idag": "TS_Riktkurs idag", "Riktkurs om 1 år": "TS_Riktkurs om 1 år",
         "Riktkurs om 2 år": "TS_Riktkurs om 2 år", "Riktkurs om 3 år": "TS_Riktkurs om 3 år",
         "CAGR 5 år (%)": "TS_CAGR 5 år (%)",
-        "Bruttomarginal (%)": "TS_Bruttomarginal (%)", "Netto-marginal (%)": "TS_Netto-marginal (%)",
-        "Debt/Equity": "TS_Debt/Equity",
-        "Utdelningsyield (%)": "TS_Utdelningsyield (%)",
-        "Utdelning/FCF coverage": "TS_Utdelning/FCF coverage",
-        "Payout ratio (%)": "TS_Payout ratio (%)",
         "Market Cap": "TS_Market Cap",
     }
 
-# ------------------------------------------------------------------
-# Allmänna helpers
-# ------------------------------------------------------------------
+# ------------------------------------------------------------
+# Allmänna hjälpare
+# ------------------------------------------------------------
 def with_backoff(func, *args, **kwargs):
     """Kör en funktion med enkel backoff (bra mot 429/kvotfel)."""
     delays = [0, 0.5, 1.0, 2.0]
@@ -112,68 +110,72 @@ def format_large_number(v: float, no_currency: bool = False) -> str:
 def normalize_ticker(t: Any) -> str:
     return str(t or "").upper().strip()
 
-# ------------------------------------------------------------------
+# ------------------------------------------------------------
 # Schema-helpers
-# ------------------------------------------------------------------
+# ------------------------------------------------------------
 def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Säkerställ att alla kolumner finns:
     - FINAL_COLS + alla TS_-kolumner i TS_FIELDS
     - Normaliserar 'Ticker'
-    Returnerar samma df-objekt (modifierat).
+    Returnerar df (modifierat).
     """
     if df is None or not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(columns=FINAL_COLS)
 
-    # Se till att 'Ticker' finns tidigt
     if "Ticker" not in df.columns:
         df["Ticker"] = ""
 
-    # Lägg till saknade final-kolumner
     for c in FINAL_COLS:
         if c not in df.columns:
-            df[c] = ("" if c in ("Ticker","Bolagsnamn","Valuta","Sektor","Senast manuellt uppdaterad",
-                                 "Senast auto-uppdaterad","Senast uppdaterad källa")
+            df[c] = ("" if c in ("Ticker","Bolagsnamn","Valuta","Sektor",
+                                 "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa")
                      else 0.0)
-
-    # Lägg till alla TS_-kolumner
     for ts_col in TS_FIELDS.values():
         if ts_col not in df.columns:
             df[ts_col] = ""
 
     # Normalisera tickers
     df["Ticker"] = df["Ticker"].apply(normalize_ticker)
+    # Ta bort ev. dubbletter (för säkerhets skull – behåll första)
+    df, _ = dedupe_tickers(df, keep="first")
 
     return df
 
 def dedupe_tickers(df: pd.DataFrame, keep: str = "first") -> Tuple[pd.DataFrame, List[str]]:
     """
     Tar bort dubbletter på 'Ticker'. Returnerar (df_ut, borttagna_tickers).
-    - `keep="first"` behåller första förekomsten, `keep="last"` sista.
     """
     if "Ticker" not in df.columns:
         return df, []
-
     df = df.copy()
     df["Ticker"] = df["Ticker"].apply(normalize_ticker)
-
-    before = len(df)
-    # hitta dubbletter
     dups_mask = df.duplicated(subset=["Ticker"], keep=keep)
-    removed_tickers = df.loc[dups_mask, "Ticker"].tolist()
-    # droppa dubblettrader
+    removed = df.loc[dups_mask, "Ticker"].tolist()
     df = df.drop_duplicates(subset=["Ticker"], keep=keep).reset_index(drop=True)
-    after = len(df)
+    if st is not None and removed:
+        st.warning(f"Dubbletter borttagna för tickers: {', '.join(removed)}")
+    return df, removed
 
-    # (valfritt) logga i Streamlit
-    if st is not None and removed_tickers:
-        st.warning(f"Dubbletter borttagna för tickers: {', '.join(removed_tickers)}")
+# ------------------------------------------------------------
+# TS & datum
+# ------------------------------------------------------------
+def stamp_fields_ts(df: pd.DataFrame, row_idx: int, fields: Iterable[str], when: Optional[str] = None) -> None:
+    """
+    Sätter TS_-kolumnerna för givna fältnamn (om de finns i TS_FIELDS).
+    Ex: stamp_fields_ts(df, ridx, ["P/S","Omsättning idag"])
+    """
+    if not isinstance(df, pd.DataFrame):
+        return
+    date_str = when if when else now_stamp()
+    for f in fields or []:
+        ts_col = TS_FIELDS.get(f)
+        if ts_col and ts_col in df.columns:
+            try:
+                df.at[row_idx, ts_col] = date_str
+            except Exception:
+                pass
 
-    return df, removed_tickers
-
-# ------------------------------------------------------------------
-# TS-kontroller
-# ------------------------------------------------------------------
 def oldest_any_ts(row: pd.Series, ts_fields: Iterable[str]) -> Optional[pd.Timestamp]:
     dates = []
     for c in ts_fields:
@@ -199,9 +201,9 @@ def add_oldest_ts_col(df: pd.DataFrame, ts_fields: Optional[Iterable[str]] = Non
     df["_oldest_any_ts_fill"] = df["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
     return df
 
-# ------------------------------------------------------------------
+# ------------------------------------------------------------
 # Auto-uppdateringsskrivare
-# ------------------------------------------------------------------
+# ------------------------------------------------------------
 def apply_auto_updates_to_row(
     df: pd.DataFrame,
     row_idx: int,
@@ -212,8 +214,8 @@ def apply_auto_updates_to_row(
     allow_zero_for: tuple = ("Aktuell kurs","Årlig utdelning"),
 ) -> bool:
     """
-    Skriver in fält från new_vals i df.loc[row_idx] och stämplar TS_ för de fält som kom in.
-    Sätter även 'Senast auto-uppdaterad' & 'Senast uppdaterad källa' om något meningsfullt kom in.
+    Skriver in fält från new_vals i df.loc[row_idx] och stämplar TS_ för fält som kom in.
+    Sätter även 'Senast auto-uppdaterad' & 'Senast uppdaterad källa' om något kom in.
     Returnerar True om någon cell faktiskt ändrades (värdeskillnad).
     """
     def _stamp(field_name: str):

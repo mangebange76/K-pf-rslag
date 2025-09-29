@@ -1,283 +1,302 @@
 # stockapp/utils.py
 # -*- coding: utf-8 -*-
-"""
-Allmänna utilities som används brett i appen.
-
-Den här modulen försöker hålla NOLL beroenden utanför standardbiblioteket +
-pandas/numpy, och den importerar endast konstanter från config.
-
-Innehåll (urval):
-- with_backoff(fn, *args, **kwargs)  -> robusta retries (t.ex. mot Google Sheets/API)
-- parse_ts(s), now_ts(), ts_str(dt)  -> säkra tidsstämplar
-- safe_float(x, default=0.0)
-- human_amount(n), format_marketcap(n, currency="USD", show_raw=False)
-- ensure_final_cols(df)  -> garanterar att FINAL_COLS finns (skapar tomma vid behov)
-- set_timestamp(df, idx, field)      -> sätter fält(TS) med nuvarande ISO-sträng
-- add_oldest_ts_col(df, out_col="_oldest_ts") -> beräknar äldsta TS per rad
-- norm_ticker(t) & check_duplicate_tickers(df)
-- chunked(iterable, size)
-- progress_text(i, total) -> "i/total"
-- label_risk_from_mcap(mcap_usd)
-"""
 
 from __future__ import annotations
-
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
-import math
-import random
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import time
-import re
+from datetime import datetime, timedelta
 
-import numpy as np
 import pandas as pd
+import numpy as np
+import streamlit as st
 
-from .config import (
-    FINAL_COLS,
-    TS_FIELDS,
-    DEFAULTS,
-    MARKETCAP_LABELS,
-    RISK_BUCKETS,
-)
+try:
+    import pytz
+    TZ_STHLM = pytz.timezone("Europe/Stockholm")
+    def now_dt() -> datetime:
+        return datetime.now(TZ_STHLM)
+except Exception:
+    def now_dt() -> datetime:
+        return datetime.now()
+
+def now_stamp() -> str:
+    return now_dt().strftime("%Y-%m-%d")
+
+# Importera ENDAST det vi behöver från config för att undvika cirkulära beroenden
+from .config import TS_FIELDS, FINAL_COLS
 
 
-# ----------------------------------------------------------------------
-# Fel-typ för användarvänliga fel (kan fångas i vyer och visas snyggt)
-# ----------------------------------------------------------------------
-class AppUserError(RuntimeError):
-    pass
-
-
-# ----------------------------------------------------------------------
-# Retry / backoff
-# ----------------------------------------------------------------------
-def with_backoff(
-    fn: Callable[..., Any],
-    *args,
-    tries: int = 5,
-    base_delay: float = 0.6,
-    factor: float = 1.7,
-    jitter: float = 0.4,
-    exceptions: Tuple[type, ...] = (Exception,),
-    **kwargs,
-) -> Any:
+# ---------------------------------------------------------------------
+# Backoff för nät-/Sheets-anrop
+# ---------------------------------------------------------------------
+def with_backoff(func: Callable, *args, **kwargs):
     """
-    Kör fn(*args, **kwargs) med exponentiell backoff.
-    Återkastar sista felet om alla försök misslyckas.
+    Kör func med mild backoff för att tåla 429/transienta fel.
+    Ex: with_backoff(ws.update, data)
     """
-    last_exc: Optional[BaseException] = None
-    delay = base_delay
-    for attempt in range(1, tries + 1):
+    delays = [0.0, 0.5, 1.0, 2.0]
+    last_err = None
+    for d in delays:
+        if d > 0:
+            time.sleep(d)
         try:
-            return fn(*args, **kwargs)
-        except exceptions as exc:  # pragma: no cover
-            last_exc = exc
-            if attempt >= tries:
-                break
-            sleep_for = delay + random.random() * jitter
-            time.sleep(sleep_for)
-            delay *= factor
-    if last_exc:
-        raise last_exc
-    # borde inte nå hit
-    return None
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+    # sista felet
+    raise last_err
 
 
-# ----------------------------------------------------------------------
-# Tidsstämplar
-# ----------------------------------------------------------------------
-_TS_PATTERNS = [
-    "%Y-%m-%dT%H:%M:%S.%fZ",
-    "%Y-%m-%dT%H:%M:%SZ",
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%d",
+# ---------------------------------------------------------------------
+# DataFrame-schema & typer
+# ---------------------------------------------------------------------
+_NUMERIC_COLS = [
+    # Pris/aktier
+    "Aktuell kurs", "Utestående aktier",
+    # P/S
+    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
+    # Omsättning
+    "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+    # Riktkurser
+    "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+    # Portfölj
+    "Antal aktier", "Årlig utdelning", "GAV (SEK)",
+    # Övriga nyckeltal
+    "CAGR 5 år (%)",
+    "Market Cap (valuta)", "Market Cap (SEK)",
+    "Bruttomarginal (%)", "Nettomarginal (%)",
+    "FCF (M)", "Debt/Equity", "Kassa (M)", "Runway (kvartal)",
+    "EV/EBITDA", "Dividend Yield (%)", "Payout Ratio CF (%)",
 ]
 
-def now_ts() -> datetime:
-    return datetime.now(timezone.utc)
+_STR_COLS = [
+    "Ticker", "Bolagsnamn", "Valuta", "Risklabel", "Sektor", "Industri",
+    "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa"
+]
 
-def ts_str(dt: Optional[datetime] = None) -> str:
-    """ISO8601 med 'Z' för UTC."""
-    if dt is None:
-        dt = now_ts()
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Säkerställ att alla FINAL_COLS finns och att typerna är rimliga.
+    - Skapar saknade kolumner.
+    - Undviker dubblettkolumner.
+    """
+    if df is None or not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame({c: [] for c in FINAL_COLS})
 
-def parse_ts(s: Any) -> Optional[datetime]:
-    """Försöker tolka s som tidsstämpel. Returnerar None om omöjligt."""
-    if s is None:
-        return None
-    if isinstance(s, datetime):
-        return s.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
-    text = str(s).strip()
-    if not text:
-        return None
-    for pat in _TS_PATTERNS:
-        try:
-            dt = datetime.strptime(text, pat)
-            # antag UTC om tidszon saknas
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            continue
-    # Pandas kan ibland ha tidsstämplar i annan form
+    # Skapa saknade kolumner
+    for col in FINAL_COLS:
+        if col not in df.columns:
+            if col in _NUMERIC_COLS:
+                df[col] = 0.0
+            elif col in _STR_COLS or col.startswith("TS_"):
+                df[col] = ""
+            else:
+                # default str
+                df[col] = ""
+
+    # Ta bort dubblett-kolumner
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # Konvertera typer
+    for c in _NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in _STR_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+
+    for c in df.columns:
+        if str(c).startswith("TS_"):
+            df[c] = df[c].astype(str)
+
+    return df
+
+
+# ---------------------------------------------------------------------
+# TS-hjälpare (tidsstämplar per fält)
+# ---------------------------------------------------------------------
+def stamp_fields_ts(df: pd.DataFrame, row_idx: int, fields: Union[str, Sequence[str]], when: Optional[str] = None):
+    """
+    Sätter TS_-kolumner för ett eller flera fält.
+    """
+    if isinstance(fields, str):
+        fields = [fields]
+    date_str = when if when else now_stamp()
+    for f in fields:
+        ts_col = TS_FIELDS.get(f)
+        if ts_col and ts_col in df.columns:
+            try:
+                df.at[row_idx, ts_col] = date_str
+            except Exception:
+                pass
+
+def note_auto_update(df: pd.DataFrame, row_idx: int, source: str):
     try:
-        dt2 = pd.to_datetime(text, utc=True, errors="coerce")
-        if pd.isna(dt2):
-            return None
-        return dt2.to_pydatetime().astimezone(timezone.utc)
+        df.at[row_idx, "Senast auto-uppdaterad"] = now_stamp()
+        df.at[row_idx, "Senast uppdaterad källa"] = source
     except Exception:
+        pass
+
+def note_manual_update(df: pd.DataFrame, row_idx: int):
+    try:
+        df.at[row_idx, "Senast manuellt uppdaterad"] = now_stamp()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------
+# Äldsta TS (för kontroll/batch-ordning)
+# ---------------------------------------------------------------------
+def _safe_parse_date(s: Any) -> Optional[pd.Timestamp]:
+    try:
+        d = pd.to_datetime(str(s).strip(), errors="coerce")
+        if pd.notna(d):
+            return d
+    except Exception:
+        pass
+    return None
+
+def oldest_any_ts(row: pd.Series) -> Optional[pd.Timestamp]:
+    dates = []
+    for c in TS_FIELDS.values():
+        if c in row and str(row[c]).strip():
+            d = _safe_parse_date(row[c])
+            if d is not None:
+                dates.append(d)
+    if not dates:
         return None
+    return min(dates)
+
+def add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
+    df["_oldest_any_ts"] = df.apply(oldest_any_ts, axis=1)
+    # Hjälpkolumn för sortering (None blir “långt i framtiden”)
+    df["_oldest_any_ts_fill"] = df["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
+    return df
 
 
-# ----------------------------------------------------------------------
-# Tal/format
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Sätt nya värden + spåra ändringar
+# ---------------------------------------------------------------------
 def safe_float(x: Any, default: float = 0.0) -> float:
-    """Robust float-omvandling (byter kommatecken etc.)."""
-    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-        return default
-    if isinstance(x, (int, float)):
+    try:
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return default
         return float(x)
-    try:
-        txt = str(x).strip().replace(" ", "").replace(",", ".")
-        # plocka ut första numeriska mönstret om skräp
-        m = re.search(r"[-+]?\d+(\.\d+)?", txt)
-        if m:
-            return float(m.group(0))
-        return float(txt)
     except Exception:
         return default
 
+def apply_changes_to_row(
+    df: pd.DataFrame,
+    row_idx: int,
+    new_vals: Dict[str, Any],
+    changes_log: Optional[Dict[str, List[str]]] = None,
+    stamp_ts_if_same: bool = False,
+    fields_to_stamp: Optional[Sequence[str]] = None
+) -> bool:
+    """
+    Skriver in new_vals i raden. Returnerar True om nåt ändrades (eller stämplades).
+    - stamp_ts_if_same: stämpla TS även om värdet är oförändrat (enligt din spec).
+    - fields_to_stamp: stämpla TS för dessa fält även om de inte ändrats.
+    """
+    changed = False
+    touched_fields: List[str] = []
 
-def human_amount(n: Union[int, float]) -> str:
-    """Svensk förkortning (miljoner/miljarder/biljoner)."""
+    for f, v in (new_vals or {}).items():
+        if f not in df.columns:
+            continue
+        old = df.at[row_idx, f]
+        equal = False
+        try:
+            # jämför numeriskt om båda är numeriska
+            if isinstance(old, (int, float, np.floating)) and isinstance(v, (int, float, np.floating)):
+                equal = float(old) == float(v)
+            else:
+                equal = str(old) == str(v)
+        except Exception:
+            equal = False
+
+        if not equal:
+            df.at[row_idx, f] = v
+            changed = True
+            touched_fields.append(f)
+        else:
+            # oförändrat – men vi kanske ska stämpla TS ändå
+            if stamp_ts_if_same:
+                touched_fields.append(f)
+
+    # Stämpla TS för berörda fält som finns i TS_FIELDS
+    if touched_fields:
+        for f in touched_fields:
+            if f in TS_FIELDS:
+                stamp_fields_ts(df, row_idx, f)
+
+    # Extra TS-fält att stämpla
+    if fields_to_stamp:
+        for f in fields_to_stamp:
+            if f in TS_FIELDS:
+                stamp_fields_ts(df, row_idx, f)
+
+    if changes_log is not None and touched_fields:
+        ticker = str(df.at[row_idx, "Ticker"]) if "Ticker" in df.columns else f"row{row_idx}"
+        changes_log.setdefault(ticker, []).extend(touched_fields)
+
+    return changed or (bool(touched_fields) and stamp_ts_if_same)
+
+
+# ---------------------------------------------------------------------
+# Formatterare
+# ---------------------------------------------------------------------
+def compact_number(x: Union[int, float]) -> str:
+    """
+    1 234 -> 1.23K, 12 345 678 -> 12.35M, 1.2e12 -> 1.20T
+    """
     try:
-        val = float(n)
+        x = float(x)
     except Exception:
-        return "0"
-    sign = "-" if val < 0 else ""
-    val = abs(val)
+        return str(x)
 
-    for threshold, label in MARKETCAP_LABELS:
-        if val >= threshold:
-            return f"{sign}{val/threshold:.2f} {label}"
-    # < 1 miljon
-    return f"{sign}{val:,.0f}".replace(",", " ")
+    neg = x < 0
+    x = abs(x)
+    units = [("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)]
+    for suf, val in units:
+        if x >= val:
+            out = f"{x/val:.2f}{suf}"
+            return f"-{out}" if neg else out
+    out = f"{x:.2f}"
+    return f"-{out}" if neg else out
 
-
-def format_marketcap(n: Any, currency: str = "USD", show_raw: bool = False) -> str:
-    """Formaterar market cap med enhet och ev. råtal i parentes."""
-    val = safe_float(n, 0.0)
-    pretty = human_amount(val)
-    if show_raw:
-        return f"{pretty} {currency} ({val:,.0f})".replace(",", " ")
-    return f"{pretty} {currency}"
-
-
-def label_risk_from_mcap(mcap_usd: Any) -> str:
+def human_market_cap(val: Union[int, float], currency: str = "") -> str:
     """
-    Baserat på RISK_BUCKETS i config.
-    Tar USD-belopp.
+    Market cap med suffix + (valuta).
     """
-    val = safe_float(mcap_usd, 0.0)
-    for thr, label in RISK_BUCKETS:
-        if val >= thr:
-            return label
-    return RISK_BUCKETS[-1][1] if RISK_BUCKETS else "Okänd"
+    base = compact_number(val)
+    return f"{base} {currency}".strip()
+
+def percent_str(x: Union[int, float]) -> str:
+    try:
+        return f"{float(x):.2f}%"
+    except Exception:
+        return str(x)
 
 
-# ----------------------------------------------------------------------
-# DataFrame-hjälp
-# ----------------------------------------------------------------------
-def ensure_final_cols(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------------------------------------------------------------
+# Dedupe
+# ---------------------------------------------------------------------
+def dedupe_tickers(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Garanterar att alla FINAL_COLS finns. Saknade skapas med NaN
-    (och default om definierat i DEFAULTS).
+    Tar bort exakta dubbletter (samma 'Ticker') och returnerar (df, duplicates_removed)
+    (behåller första förekomsten).
     """
-    work = df.copy()
-    for c in FINAL_COLS:
-        if c not in work.columns:
-            work[c] = np.nan
-        if c in DEFAULTS:
-            # fyll bara NaN/None – skriv inte över befintliga värden
-            work[c] = work[c].fillna(DEFAULTS[c])
-    return work
-
-
-def set_timestamp(df: pd.DataFrame, idx: int, field: str) -> None:
-    """
-    Sätter fält (TS) i given rad-index till nu.
-    Om fältet inte finns skapas det.
-    """
-    if field not in df.columns:
-        df[field] = np.nan
-    df.at[idx, field] = ts_str()
-
-
-def add_oldest_ts_col(df: pd.DataFrame, out_col: str = "_oldest_ts") -> pd.DataFrame:
-    """
-    Beräknar äldsta TS över alla TS_FIELDS och lägger som datetime i out_col.
-    Saknas TS helt, blir None.
-    """
-    work = df.copy()
-    vals: List[Optional[datetime]] = []
-    for _, row in work.iterrows():
-        dts: List[datetime] = []
-        for f in TS_FIELDS:
-            dt = parse_ts(row.get(f))
-            if dt is not None:
-                dts.append(dt)
-        vals.append(min(dts) if dts else None)
-    work[out_col] = vals
-    return work
-
-
-# ----------------------------------------------------------------------
-# Ticker & dubblett
-# ----------------------------------------------------------------------
-def norm_ticker(t: Any) -> str:
-    """Trim/upper – enkel normalisering."""
-    return str(t or "").strip().upper()
-
-
-def check_duplicate_tickers(df: pd.DataFrame) -> List[str]:
-    """Returnerar lista med tickers som är dubbletter (case-insensitive)."""
     if "Ticker" not in df.columns:
-        return []
-    s = df["Ticker"].map(norm_ticker)
-    dup = s[s.duplicated(keep=False)]
-    return list(sorted(set(dup.tolist())))
-
-
-# ----------------------------------------------------------------------
-# Diverse
-# ----------------------------------------------------------------------
-def chunked(seq: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
-    """Skär upp seq i bitar om 'size'."""
-    if size <= 0:
-        size = 1
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
-def progress_text(i: int, total: int) -> str:
-    """Returnerar 'i/X' (1-baserad indexering)."""
-    i = max(1, int(i))
-    total = max(1, int(total))
-    return f"{i}/{total}"
-
-
-# ----------------------------------------------------------------------
-# Små hjälp för beräkningar
-# ----------------------------------------------------------------------
-def ps_from_mcap_and_revenue(mcap: Any, revenue_ttm: Any) -> float:
-    """
-    P/S = Market Cap / Omsättning (TTM). Skyddar mot noll.
-    """
-    mc = safe_float(mcap, 0.0)
-    rev = safe_float(revenue_ttm, 0.0)
-    if rev <= 0:
-        return 0.0
-    return mc / rev
+        return df, []
+    before = set()
+    dups = []
+    keep_idx = []
+    for idx, t in enumerate(df["Ticker"].astype(str)):
+        if t in before:
+            dups.append(t)
+        else:
+            before.add(t)
+            keep_idx.append(idx)
+    out = df.iloc[keep_idx].reset_index(drop=True)
+    return out, dups

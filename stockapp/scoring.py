@@ -1,409 +1,404 @@
 # stockapp/scoring.py
 # -*- coding: utf-8 -*-
 """
-Poängmodell / ranking för investeringsförslag.
-
-Huvud-API:
-- compute_scoring_inputs(df, user_rates) -> df  (beräknar komponentkolumner)
-- score_growth(df) -> pd.Series (0..100)
-- score_dividend(df) -> pd.Series (0..100)
-- grade_from_score(score) -> str   (Utmärkt/Bra/OK/Svag/Riskabel)
-- reco_from_score_and_valuation(score, valuation_label) -> str  (Köp/Överväg/Avvakta/Trimma/Sälj)
-- rank_for_investing(df, mode="growth", sector=None, cap=None, top=50) -> df (filtrerad + sorterad)
-
-Modellen använder:
-- P/S, P/S-snitt (via ps_rel = P/S / P/S-snitt; lägre är bättre)
-- Estimerad tillväxt: (Omsättning nästa år / Omsättning idag - 1)
-- Valuation gap: (Riktkurs om 1 år / Aktuell kurs - 1)
-- Utdelningsyield: Årlig utdelning / Aktuell kurs
-- Storlek: Market Cap i USD (via finance.market_cap_usd eller befintlig _MC_USD)
-- Risklabel: Micro/Small/Mid/Large/Mega → siffra för penalty
-- Sektorjustering: små viktjusteringar per sektor (om kolumn 'Sektor'/'Sector' finns)
-
-Kräver:
-- Kolumner som appen redan hanterar (Aktuell kurs, Årlig utdelning, P/S, P/S Q1..Q4, Omsättning idag/ nästa år,
-  Riktkurs om 1 år, Valuta, Utestående aktier, ev. _MC_USD/Risk/Valuation).
+Poängsättning, värdering och ranking:
+- compute_fair_valuation_fields(row) -> dict med 'Fair price', 'Fair mcap', 'Upside (%)'
+- valuation_grade_from_upside(up) -> etikett ('Mycket bra', 'Bra', 'Fair/Behåll', 'Trimma', 'Säljvarning')
+- growth_score_for_row(row) -> (score, breakdown)
+- dividend_score_for_row(row) -> (score, breakdown)
+- rank_candidates(df, mode='growth'|'dividend', sector_filter=None, cap_filter=None, top_n=None)
 """
 
 from __future__ import annotations
-from typing import Optional, Dict, Tuple
+from typing import Dict, Tuple, Optional, List
 import numpy as np
 import pandas as pd
 
-from .finance import (
-    ps_snitt_from_row,
-    market_cap_usd,
-    valuation_label,
-)
+# ------------------------------------------------------------
+# Små hjälpare
+# ------------------------------------------------------------
 
-# --------------------------------------------------------------------
-# Normalisering & utils
-# --------------------------------------------------------------------
-
-def _safe_float(x, default=0.0) -> float:
+def _f(x, default: float = 0.0) -> float:
     try:
         return float(x)
     except Exception:
         return default
 
-def _has_col(df: pd.DataFrame, name: str) -> bool:
-    return name in df.columns
+def _clamp01(x: float) -> float:
+    if x is None or np.isnan(x):
+        return 0.0
+    if x < 0:
+        return 0.0
+    if x > 1:
+        return 1.0
+    return float(x)
 
-def _sector_col(df: pd.DataFrame) -> str:
-    # Tillåt både 'Sektor' och 'Sector'
-    if "Sektor" in df.columns: return "Sektor"
-    if "Sector" in df.columns: return "Sector"
-    return ""
-
-def _clip01(x: pd.Series) -> pd.Series:
-    return x.clip(lower=0.0, upper=1.0)
-
-def _robust_minmax(series: pd.Series, higher_better: bool = True) -> pd.Series:
-    """
-    Skalar till [0,1] via 5:e och 95:e percentilen (robust mot outliers).
-    Om alla lika → 0.5.
-    """
-    s = pd.to_numeric(series, errors="coerce").fillna(np.nan)
-    if s.dropna().empty:
-        return pd.Series([0.5] * len(s), index=s.index)
-
-    lo = np.nanpercentile(s, 5)
-    hi = np.nanpercentile(s, 95)
-    if hi <= lo:
-        out = pd.Series([0.5] * len(s), index=s.index)
-    else:
-        out = (s - lo) / (hi - lo)
-        out = out.clip(0, 1)
-
-    if higher_better:
-        return out.fillna(0.5)
-    return (1.0 - out).fillna(0.5)
-
-# --------------------------------------------------------------------
-# Risk-mappning + sektorjusteringar
-# --------------------------------------------------------------------
-
-_RISK_MAP = {
-    "Microcap": 1.00,  # störst risk → störst penalty
-    "Smallcap": 0.75,
-    "Midcap":   0.50,
-    "Largecap": 0.25,
-    "Megacap":  0.10,
-}
-
-# Lätta sektorjusteringar på vikter (multiplikatorer).
-# Nycklarna matchar df[_sector_col] case-insensitivt.
-_SECTOR_WEIGHT_ADJ = {
-    # Tech: tillväxt, valuation gap får lite extra vikt
-    "information technology": {"growth": {"growth": 1.10, "valgap": 1.10, "psrel": 1.00, "yield": 0.90},
-                               "div":    {"yield": 1.00, "safety": 1.00}},
-    "technology":             {"growth": {"growth": 1.10, "valgap": 1.10, "psrel": 1.00, "yield": 0.90},
-                               "div":    {"yield": 1.00, "safety": 1.00}},
-    # Utilities/Telecom/Staples: dividend-vikt upp
-    "utilities":              {"growth": {"yield": 1.05, "psrel": 1.00},
-                               "div":    {"yield": 1.15, "safety": 1.10}},
-    "telecommunication":      {"growth": {"yield": 1.05},
-                               "div":    {"yield": 1.15, "safety": 1.10}},
-    "communication services": {"growth": {"yield": 1.05},
-                               "div":    {"yield": 1.12, "safety": 1.08}},
-    "consumer staples":       {"growth": {"yield": 1.05},
-                               "div":    {"yield": 1.12, "safety": 1.08}},
-    # Industrials: psrel/valgap neutral, tillväxt marginellt upp
-    "industrials":            {"growth": {"growth": 1.05}, "div": {"safety": 1.05}},
-    # Financials: safety (storlek/risk) viktigare i dividend-läge
-    "financials":             {"growth": {"valgap": 1.05}, "div": {"safety": 1.12}},
-    # Energy: dividend ofta viktig, safety upp
-    "energy":                 {"growth": {"yield": 1.05}, "div": {"yield": 1.10, "safety": 1.10}},
-    # Health Care: growth+valgap upp lite
-    "health care":            {"growth": {"growth": 1.08, "valgap": 1.08}, "div": {"safety": 1.05}},
-    # Consumer Discretionary: growth prioriteras
-    "consumer discretionary": {"growth": {"growth": 1.10, "valgap": 1.05}, "div": {"yield": 1.00}},
-    # Materials: neutral
-    "materials":              {"growth": {}, "div": {}},
-    # Real Estate: dividend & safety
-    "real estate":            {"growth": {"yield": 1.05}, "div": {"yield": 1.15, "safety": 1.10}},
-}
-
-def _sector_adjust(weights: Dict[str, float], sector: str, mode: str) -> Dict[str, float]:
-    """
-    Multiplicera base-vikter med sektorjusteringar.
-    keys i weights: 'growth','valgap','psrel','yield','safety'
-    """
-    if not sector:
-        return weights
-    key = sector.strip().lower()
-    for s_name, adj in _SECTOR_WEIGHT_ADJ.items():
-        if s_name in key:
-            m = adj.get("growth" if mode == "growth" else "div", {})
-            out = weights.copy()
-            for k, mult in m.items():
-                if k in out:
-                    out[k] *= float(mult)
-            return out
-    return weights
-
-# --------------------------------------------------------------------
-# Beräkning av komponentkolumner
-# --------------------------------------------------------------------
-
-def compute_scoring_inputs(df: pd.DataFrame, user_rates: Optional[Dict[str, float]]) -> pd.DataFrame:
-    """
-    Lägger till/uppdaterar följande kolumner:
-      - P/S-snitt
-      - est_growth: (Omsättning nästa år / Omsättning idag) - 1
-      - val_gap: (Riktkurs om 1 år / Aktuell kurs) - 1
-      - ps_rel: P/S / P/S-snitt   (clip 0.1..10 och inverteras senare i normalisering)
-      - div_yield: Årlig utdelning / Aktuell kurs
-      - _MC_USD: Market cap i USD (om saknas)
-      - risk_penalty: mappar Risk → tal (0.1..1.0)
-    """
-    w = df.copy()
-
-    # P/S-snitt (om saknas)
-    if not _has_col(w, "P/S-snitt"):
-        w["P/S-snitt"] = w.apply(ps_snitt_from_row, axis=1)
-
-    # estimerad tillväxt
-    rev_now = pd.to_numeric(w.get("Omsättning idag", pd.Series([np.nan] * len(w))), errors="coerce")
-    rev_next = pd.to_numeric(w.get("Omsättning nästa år", pd.Series([np.nan] * len(w))), errors="coerce")
-    w["est_growth"] = np.where((rev_now > 0) & (rev_next > 0), (rev_next / rev_now) - 1.0, np.nan)
-
-    # valuation gap
-    price = pd.to_numeric(w.get("Aktuell kurs", pd.Series([np.nan] * len(w))), errors="coerce")
-    rk1y  = pd.to_numeric(w.get("Riktkurs om 1 år", pd.Series([np.nan] * len(w))), errors="coerce")
-    w["val_gap"] = np.where((price > 0) & (rk1y > 0), (rk1y / price) - 1.0, np.nan)
-
-    # ps_rel
-    ps = pd.to_numeric(w.get("P/S", pd.Series([np.nan] * len(w))), errors="coerce")
-    psavg = pd.to_numeric(w.get("P/S-snitt", pd.Series([np.nan] * len(w))), errors="coerce")
-    w["ps_rel"] = np.where((ps > 0) & (psavg > 0), ps / psavg, np.nan)
-    w["ps_rel"] = w["ps_rel"].clip(lower=0.1, upper=10.0)
-
-    # dividend yield
-    div = pd.to_numeric(w.get("Årlig utdelning", pd.Series([0.0] * len(w))), errors="coerce").fillna(0.0)
-    px  = pd.to_numeric(w.get("Aktuell kurs", pd.Series([np.nan] * len(w))), errors="coerce")
-    w["div_yield"] = np.where(px > 0, div / px, 0.0)
-
-    # _MC_USD (om saknas)
-    if not _has_col(w, "_MC_USD"):
-        w["_MC_USD"] = w.apply(lambda r: market_cap_usd(r, user_rates), axis=1)
-
-    # risk_penalty (låg bättre)
-    risk = w.get("Risk", pd.Series(["-"] * len(w)))
-    w["risk_penalty"] = [ _RISK_MAP.get(str(x), 0.50) for x in risk ]
-
-    return w
-
-# --------------------------------------------------------------------
-# Poängberäkning
-# --------------------------------------------------------------------
-
-# Basvikter (innan sektor-justeringar).
-# Growth-mode prioriterar est_growth, val_gap och ps_rel (inverterat).
-_BASE_WEIGHTS_GROWTH = {
-    "growth": 0.35,   # est_growth
-    "valgap": 0.30,   # val_gap
-    "psrel":  0.20,   # ps_rel (lower better → inverteras via normalisering)
-    "yield":  0.05,   # div_yield
-    "safety": 0.10,   # (1 - risk_penalty_norm)
-}
-
-# Dividend-mode prioriterar utdelningsyield och säkerhet/storlek.
-_BASE_WEIGHTS_DIV = {
-    "growth": 0.10,
-    "valgap": 0.20,
-    "psrel":  0.15,
-    "yield":  0.35,
-    "safety": 0.20,
-}
-
-def _norm_components(df: pd.DataFrame) -> Dict[str, pd.Series]:
-    """
-    Producerar normaliserade komponenter 0..1:
-      - growth_s (higher better)
-      - valgap_s (higher better)
-      - psrel_s (lower better → vi matar ps_rel och sätter higher_better=False)
-      - yield_s (higher better)
-      - safety_s (här normaliserar vi risk_penalty och inverterar → högre är bättre)
-    """
-    comps = {}
-    comps["growth_s"] = _robust_minmax(df["est_growth"], higher_better=True) if "est_growth" in df else pd.Series([0.5]*len(df), index=df.index)
-    comps["valgap_s"] = _robust_minmax(df["val_gap"],    higher_better=True) if "val_gap"    in df else pd.Series([0.5]*len(df), index=df.index)
-    comps["psrel_s"]  = _robust_minmax(df["ps_rel"],     higher_better=False) if "ps_rel"     in df else pd.Series([0.5]*len(df), index=df.index)
-    comps["yield_s"]  = _robust_minmax(df["div_yield"],  higher_better=True) if "div_yield"  in df else pd.Series([0.5]*len(df), index=df.index)
-    # risk → lower better, så vi skickar higher_better=False
-    comps["safety_s"] = _robust_minmax(df["risk_penalty"], higher_better=False) if "risk_penalty" in df else pd.Series([0.5]*len(df), index=df.index)
-    return comps
-
-def _apply_weights(comps: Dict[str, pd.Series], weights: Dict[str, float]) -> pd.Series:
-    # Se till att alla komponenter finns
-    growth = comps.get("growth_s"); valgap = comps.get("valgap_s")
-    psrel  = comps.get("psrel_s");  yld    = comps.get("yield_s")
-    safe   = comps.get("safety_s")
-
-    # Defaults
-    if growth is None: growth = pd.Series([0.5]*len(next(iter(comps.values()))), index=next(iter(comps.values())).index)
-    if valgap is None: valgap = pd.Series([0.5]*len(growth), index=growth.index)
-    if psrel  is None: psrel  = pd.Series([0.5]*len(growth), index=growth.index)
-    if yld    is None: yld    = pd.Series([0.5]*len(growth), index=growth.index)
-    if safe   is None: safe   = pd.Series([0.5]*len(growth), index=growth.index)
-
-    w_growth = float(weights.get("growth", 0.0))
-    w_val    = float(weights.get("valgap", 0.0))
-    w_ps     = float(weights.get("psrel",  0.0))
-    w_y      = float(weights.get("yield",  0.0))
-    w_s      = float(weights.get("safety", 0.0))
-
-    total_w = max(1e-9, w_growth + w_val + w_ps + w_y + w_s)
-    score01 = (w_growth * growth + w_val * valgap + w_ps * psrel + w_y * yld + w_s * safe) / total_w
-    return _clip01(score01) * 100.0  # 0..100
-
-def _weights_for_row(base_weights: Dict[str, float], sector: str, mode: str) -> Dict[str, float]:
-    return _sector_adjust(base_weights, sector, mode)
-
-def score_growth(df: pd.DataFrame) -> pd.Series:
-    comps = _norm_components(df)
-    sec_col = _sector_col(df)
-    if sec_col:
-        weights_each_row = [
-            _weights_for_row(_BASE_WEIGHTS_GROWTH, str(sector), mode="growth")
-            for sector in df[sec_col].fillna("").astype(str).tolist()
-        ]
-        # radvis vikter → gör en vektoriserad approx (gemensam baseline + radvisa korr)
-        # förenkling: ta radvis dot
-        scores = []
-        for i, (idx, _) in enumerate(df.iterrows()):
-            w = weights_each_row[i]
-            score_i = _apply_weights({k: v.iloc[[i]].rename(index={idx: 0}) for k, v in comps.items()}, w).iloc[0]
-            scores.append(score_i)
-        return pd.Series(scores, index=df.index, name="ScoreGrowth")
-    else:
-        # inga sektorer → basvikter
-        return _apply_weights(comps, _BASE_WEIGHTS_GROWTH).rename("ScoreGrowth")
-
-def score_dividend(df: pd.DataFrame) -> pd.Series:
-    comps = _norm_components(df)
-    sec_col = _sector_col(df)
-    if sec_col:
-        weights_each_row = [
-            _weights_for_row(_BASE_WEIGHTS_DIV, str(sector), mode="div")
-            for sector in df[sec_col].fillna("").astype(str).tolist()
-        ]
-        scores = []
-        for i, (idx, _) in enumerate(df.iterrows()):
-            w = weights_each_row[i]
-            score_i = _apply_weights({k: v.iloc[[i]].rename(index={idx: 0}) for k, v in comps.items()}, w).iloc[0]
-            scores.append(score_i)
-        return pd.Series(scores, index=df.index, name="ScoreDividend")
-    else:
-        return _apply_weights(comps, _BASE_WEIGHTS_DIV).rename("ScoreDividend")
-
-# --------------------------------------------------------------------
-# Betyg & rekommendation
-# --------------------------------------------------------------------
-
-def grade_from_score(score: float) -> str:
+def _scale_pos(x: float, lo: float, hi: float) -> float:
+    """Mappar [lo..hi] till [0..1] med klämning. Högre är bättre."""
     try:
-        s = float(score)
+        x = float(x)
     except Exception:
-        return "-"
-    if s >= 80: return "Utmärkt"
-    if s >= 65: return "Bra"
-    if s >= 50: return "OK"
-    if s >= 35: return "Svag"
-    return "Riskabel"
+        return 0.0
+    if hi == lo:
+        return 0.0
+    return _clamp01((x - lo) / (hi - lo))
 
-def reco_from_score_and_valuation(score: float, valuation: str) -> str:
+def _scale_inv(x: float, lo: float, hi: float) -> float:
+    """Lägre är bättre. Mappar [lo..hi] till [1..0]."""
+    return 1.0 - _scale_pos(x, lo, hi)
+
+def _safe_div(a: float, b: float) -> float:
+    a = _f(a); b = _f(b)
+    return a / b if b != 0 else 0.0
+
+def _risk_from_mcap_usd(mcap_usd: float) -> str:
+    mc = _f(mcap_usd)
+    if mc >= 200_000_000_000:  # >= 200B
+        return "Megacap"
+    if mc >= 10_000_000_000:
+        return "Largecap"
+    if mc >= 2_000_000_000:
+        return "Midcap"
+    if mc >= 300_000_000:
+        return "Smallcap"
+    return "Microcap"
+
+# ------------------------------------------------------------
+# Fair value / Upside via P/S-snitt (din modell)
+# ------------------------------------------------------------
+
+def compute_fair_valuation_fields(row: pd.Series) -> Dict[str, float]:
     """
-    Kombinerar modellpoäng med värderingsindikator:
-      - Om valuation ∈ {"Sälj"} → "Sälj"
-      - Om valuation ∈ {"Trimma"} och score < 60 → "Trimma", annars "Avvakta"
-      - Annars baserat på score:
-           >=75 → "Köp"
-           60–75 → "Överväg"
-           45–60 → "Avvakta"
-           <45   → "Avstå"
+    Beräknar 'Fair price' & 'Upside (%)' enligt:
+      fair_mcap = (Omsättning nästa år * P/S-snitt)
+      fair_price = fair_mcap / Utestående aktier
+      upside% = (fair_price / Aktuell kurs - 1) * 100
+    Alla belopp i bolagets prisvaluta (SEK/FX hanteras i visning/portfölj).
     """
-    val = str(valuation or "-")
-    try:
-        s = float(score)
-    except Exception:
-        s = 50.0
+    rev_next_m = _f(row.get("Omsättning nästa år", 0.0))  # miljoner
+    ps_snitt   = _f(row.get("P/S-snitt", 0.0))
+    shares_m   = _f(row.get("Utestående aktier", 0.0))    # milj aktier
+    price_now  = _f(row.get("Aktuell kurs", 0.0))
 
-    if val == "Sälj":
-        return "Sälj"
-    if val == "Trimma":
-        return "Trimma" if s < 60 else "Avvakta"
+    fair_mcap = 0.0
+    fair_price = 0.0
+    upside_pct = 0.0
 
-    if s >= 75: return "Köp"
-    if s >= 60: return "Överväg"
-    if s >= 45: return "Avvakta"
-    return "Avstå"
+    if rev_next_m > 0 and ps_snitt > 0 and shares_m > 0:
+        fair_mcap = rev_next_m * ps_snitt  # "miljoner i prisvaluta"
+        fair_price = fair_mcap / shares_m  # prisvaluta per aktie
+        if price_now > 0:
+            upside_pct = (fair_price / price_now - 1.0) * 100.0
 
-# --------------------------------------------------------------------
-# Ranking-hjälpare
-# --------------------------------------------------------------------
+    return {
+        "Fair mcap (M)": round(fair_mcap, 2),
+        "Fair price": round(fair_price, 4),
+        "Upside (%)": round(u pside_pct, 2)
+    }
 
-def rank_for_investing(
+def valuation_grade_from_upside(up: float) -> str:
+    """
+    Etikett enligt överenskomna trösklar:
+      >= +40%:  Mycket bra (billig)
+      +15..40:  Bra
+      -10..+15: Fair/Behåll
+      -25..-10: Trimma
+      < -25:    Säljvarning
+    """
+    u = _f(up)
+    if u >= 40.0:
+        return "Mycket bra (billig)"
+    if u >= 15.0:
+        return "Bra"
+    if u >= -10.0:
+        return "Fair/Behåll"
+    if u >= -25.0:
+        return "Trimma"
+    return "Säljvarning"
+
+# ------------------------------------------------------------
+# Viktning per sektor (enkla defaultar)
+# ------------------------------------------------------------
+
+def _sector_weights(sector: str, mode: str) -> Dict[str, float]:
+    """
+    Returnerar vikt-nycklar:
+      valuation, growth, margins, leverage, size, stability, yield, safety, quality
+    Summan normaliseras till 1.0.
+    """
+    s = (sector or "").lower()
+    m = (mode or "growth").lower()
+
+    # default
+    w = dict(
+        valuation=0.30,
+        growth=0.25,
+        margins=0.15,
+        leverage=0.10,
+        size=0.05,
+        stability=0.05,
+        yield_=0.05,
+        safety=0.05,
+        quality=0.00,
+    )
+
+    if m == "dividend":
+        w = dict(
+            valuation=0.15,
+            growth=0.10,
+            margins=0.10,
+            leverage=0.05,
+            size=0.10,
+            stability=0.10,
+            yield_=0.35,
+            safety=0.15,
+            quality=0.00,
+        )
+
+    # Lätta sektorjusteringar
+    if "financial" in s or "bank" in s:
+        w["leverage"] += 0.05
+        w["stability"] += 0.05
+        w["valuation"] -= 0.05
+
+    if "real estate" in s:
+        w["yield_"] += 0.05
+        w["safety"] += 0.05
+        w["growth"] -= 0.05
+
+    if "technology" in s:
+        w["growth"] += 0.05
+        w["valuation"] += 0.05
+
+    # normalisera
+    tot = sum(w.values())
+    if tot <= 0:
+        return w
+    return {k: v / tot for k, v in w.items()}
+
+# ------------------------------------------------------------
+# Poängfunktioner
+# ------------------------------------------------------------
+
+def growth_score_for_row(row: pd.Series) -> Tuple[float, Dict[str, float]]:
+    """
+    Poäng för tillväxtcase. Returnerar (score 0..100, breakdown).
+    Vi använder värden om de finns – annars ignoreras de tyst.
+    """
+    sector = str(row.get("Sektor") or row.get("Sector") or "")
+    w = _sector_weights(sector, mode="growth")
+    bd: Dict[str, float] = {}
+
+    # Valuation: lägre P/S bättre, men även "Upside (%)" via fair price
+    ps_now = _f(row.get("P/S", 0.0))
+    ps_avg = _f(row.get("P/S-snitt", 0.0))
+    # Om P/S-snitt saknas – approximera med P/S själv → neutral (0.5)
+    if ps_now > 0 and ps_avg > 0:
+        val_rel = _scale_inv(ps_now / ps_avg, lo=0.3, hi=3.0)  # <1 bättre
+    else:
+        val_rel = 0.5
+
+    up = _f(row.get("Upside (%)", 0.0))
+    up_norm = _scale_pos(up, lo=-50.0, hi=100.0)
+
+    valuation = 0.6 * val_rel + 0.4 * up_norm
+    bd["valuation"] = valuation * 100
+
+    # Growth: CAGR 5 år
+    cagr = _f(row.get("CAGR 5 år (%)", 0.0))
+    growth = _scale_pos(cagr, lo=0.0, hi=50.0)
+    bd["growth"] = growth * 100
+
+    # Margins: Gross/Net margin om finns
+    gm = _f(row.get("Gross Margin (%)", row.get("Bruttomarginal (%)", 0.0)))
+    nm = _f(row.get("Net Margin (%)", row.get("Nettomarginal (%)", 0.0)))
+    margins = 0.5 * _scale_pos(gm, lo=20.0, hi=70.0) + 0.5 * _scale_pos(nm, lo=5.0, hi=30.0)
+    bd["margins"] = margins * 100
+
+    # Leverage: Debt/Equity lägre = bättre
+    de = _f(row.get("Debt/Equity", 0.0))
+    leverage = _scale_inv(de, lo=0.0, hi=2.0)
+    bd["leverage"] = leverage * 100
+
+    # Size (risk): större = bättre stabilitet
+    risk = str(row.get("Risk") or "")
+    risk_idx = dict(Microcap=0.0, Smallcap=0.25, Midcap=0.6, Largecap=0.85, Megacap=1.0).get(risk, None)
+    if risk_idx is None:
+        mc = _f(row.get("_MC_USD", 0.0))
+        risk_idx = dict(Microcap=0.0, Smallcap=0.25, Midcap=0.6, Largecap=0.85, Megacap=1.0)[_risk_from_mcap_usd(mc)]
+    size = risk_idx
+    bd["size"] = size * 100
+
+    # Stability: lägre beta bättre (om finns)
+    beta = _f(row.get("Beta", 1.0))
+    stability = _scale_inv(beta, lo=0.6, hi=2.0)
+    bd["stability"] = stability * 100
+
+    # Quality (om FCF-margin/EBITDA-margin finns)
+    fcf_margin = _f(row.get("FCF Margin (%)", 0.0))
+    ebitda_margin = _f(row.get("EBITDA Margin (%)", 0.0))
+    if fcf_margin != 0.0 or ebitda_margin != 0.0:
+        quality = 0.5 * _scale_pos(fcf_margin, lo=0.0, hi=25.0) + 0.5 * _scale_pos(ebitda_margin, lo=10.0, hi=40.0)
+    else:
+        quality = 0.0
+    bd["quality"] = quality * 100
+
+    # Total score (0..100)
+    score01 = (
+        w["valuation"] * valuation +
+        w["growth"] * growth +
+        w["margins"] * margins +
+        w["leverage"] * leverage +
+        w["size"] * size +
+        w["stability"] * stability +
+        w["quality"] * quality
+    )
+    return round(score01 * 100.0, 2), bd
+
+def dividend_score_for_row(row: pd.Series) -> Tuple[float, Dict[str, float]]:
+    """
+    Poäng för utdelningscase. Returnerar (score 0..100, breakdown).
+    """
+    sector = str(row.get("Sektor") or row.get("Sector") or "")
+    w = _sector_weights(sector, mode="dividend")
+    bd: Dict[str, float] = {}
+
+    # Yield
+    div_rate = _f(row.get("Årlig utdelning", 0.0))
+    price = _f(row.get("Aktuell kurs", 0.0))
+    dy = _safe_div(div_rate, price) * 100.0  # i %
+    dy_norm = _scale_pos(dy, lo=2.0, hi=10.0)
+    bd["yield"] = dy_norm * 100
+
+    # Safety: payout (om finns, EPS/FCF), annars proxys via net margin, leverage
+    payout_eps = _f(row.get("Payout EPS (%)", 0.0))
+    payout_fcf = _f(row.get("Payout FCF (%)", 0.0))
+
+    if payout_eps > 0 or payout_fcf > 0:
+        # lägre payout bättre; över 100% dåligt
+        pe = 1.0 - _scale_pos(payout_eps, lo=40.0, hi=110.0) if payout_eps > 0 else 0.5
+        pf = 1.0 - _scale_pos(payout_fcf, lo=40.0, hi=110.0) if payout_fcf > 0 else 0.5
+        safety = 0.5 * pe + 0.5 * pf
+    else:
+        nm = _f(row.get("Net Margin (%)", 0.0))
+        de = _f(row.get("Debt/Equity", 0.0))
+        safety = 0.6 * _scale_pos(nm, lo=5.0, hi=25.0) + 0.4 * _scale_inv(de, lo=0.0, hi=2.0)
+    bd["safety"] = _clamp01(safety) * 100
+
+    # Valuation via upside från fair price + relativ P/S
+    ps_now = _f(row.get("P/S", 0.0))
+    ps_avg = _f(row.get("P/S-snitt", 0.0))
+    val_rel = _scale_inv(ps_now / ps_avg, lo=0.5, hi=3.0) if (ps_now > 0 and ps_avg > 0) else 0.5
+    up = _f(row.get("Upside (%)", 0.0))
+    up_norm = _scale_pos(up, lo=-30.0, hi=80.0)
+    valuation = 0.5 * val_rel + 0.5 * up_norm
+    bd["valuation"] = valuation * 100
+
+    # Stability & Size
+    beta = _f(row.get("Beta", 1.0))
+    stability = _scale_inv(beta, lo=0.6, hi=2.0)
+    bd["stability"] = stability * 100
+
+    risk = str(row.get("Risk") or "")
+    risk_idx = dict(Microcap=0.0, Smallcap=0.25, Midcap=0.6, Largecap=0.85, Megacap=1.0).get(risk, None)
+    if risk_idx is None:
+        mc = _f(row.get("_MC_USD", 0.0))
+        risk_idx = dict(Microcap=0.0, Smallcap=0.25, Midcap=0.6, Largecap=0.85, Megacap=1.0)[_risk_from_mcap_usd(mc)]
+    size = risk_idx
+    bd["size"] = size * 100
+
+    # Margins & Growth
+    gm = _f(row.get("Gross Margin (%)", 0.0))
+    nm = _f(row.get("Net Margin (%)", 0.0))
+    margins = 0.5 * _scale_pos(gm, lo=20.0, hi=70.0) + 0.5 * _scale_pos(nm, lo=5.0, hi=25.0)
+    bd["margins"] = margins * 100
+
+    cagr = _f(row.get("CAGR 5 år (%)", 0.0))
+    growth = _scale_pos(cagr, lo=0.0, hi=15.0)
+    bd["growth"] = growth * 100
+
+    # Total score
+    score01 = (
+        w["yield_"] * dy_norm +
+        w["safety"] * safety +
+        w["valuation"] * valuation +
+        w["stability"] * stability +
+        w["size"] * size +
+        w["margins"] * margins +
+        w["growth"] * growth
+    )
+    return round(score01 * 100.0, 2), bd
+
+# ------------------------------------------------------------
+# Ranking-API för vyer
+# ------------------------------------------------------------
+
+def _ensure_fair_fields(df: pd.DataFrame) -> pd.DataFrame:
+    if not {"Fair price", "Upside (%)"}.issubset(df.columns):
+        extra = df.apply(lambda r: compute_fair_valuation_fields(r), axis=1, result_type="expand")
+        for c in extra.columns:
+            df[c] = extra[c]
+    return df
+
+def _apply_mode_score(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    scores = []
+    breakdowns: List[Dict[str, float]] = []
+    for _, r in df.iterrows():
+        if mode == "dividend":
+            sc, br = dividend_score_for_row(r)
+        else:
+            sc, br = growth_score_for_row(r)
+        scores.append(sc)
+        breakdowns.append(br)
+    df = df.copy()
+    df["Score"] = scores
+    df["_score_breakdown"] = breakdowns
+    return df
+
+def rank_candidates(
     df: pd.DataFrame,
     mode: str = "growth",
-    sector: Optional[str] = None,
-    cap: Optional[str] = None,
-    top: int = 50,
+    sector_filter: Optional[str] = None,
+    cap_filter: Optional[List[str]] = None,
+    top_n: Optional[int] = None
 ) -> pd.DataFrame:
     """
-    Filtrerar och rangordnar efter vald modell.
-    - mode: "growth" eller "dividend"
-    - sector: om satt, matchar (case-insensitive substring) mot Sektor/Sector
-    - cap: en av {"Microcap","Smallcap","Midcap","Largecap","Megacap"} för att filtrera
-    - top: antal rader i resultatet
-    Returnerar kopia med kolumner: Score, Grade, Valuation, Reco + inputs.
+    Returnerar nytt DataFrame med Score, Upside, Grade, sorterad på Score desc.
+    - mode: 'growth' eller 'dividend'
+    - sector_filter: om satt, behåll endast den sektorn (case-insensitive contains)
+    - cap_filter: lista av risklabels att behålla (t.ex. ['Largecap','Midcap'])
+    - top_n: om satt, truncerar listan
     """
     work = df.copy()
 
-    # Säkra scoring-inputs
-    work = compute_scoring_inputs(work, user_rates=None)
+    # Säkerställ fair-fields & grade
+    work = _ensure_fair_fields(work)
+    work["Grade"] = work["Upside (%)"].apply(valuation_grade_from_upside)
 
-    # Filtrera på sektor
-    sec_col = _sector_col(work)
-    if sector and sec_col:
-        key = sector.strip().lower()
-        mask = work[sec_col].fillna("").str.lower().str.contains(key, na=False)
-        work = work.loc[mask].copy()
+    # Filtrering
+    if sector_filter:
+        s = sector_filter.lower()
+        work = work[work["Sektor"].astype(str).str.lower().str.contains(s, na=False) |
+                    work["Sector"].astype(str).str.lower().str.contains(s, na=False)]
 
-    # Filtrera på cap
-    if cap and "Risk" in work.columns:
-        work = work.loc[work["Risk"].astype(str).str.lower() == str(cap).lower()].copy()
+    if cap_filter:
+        capset = {c.lower() for c in cap_filter}
+        risk_col = work.get("Risk")
+        if risk_col is None:
+            # härleder från _MC_USD
+            work["Risk"] = work["_MC_USD"].apply(_risk_from_mcap_usd)
+        work = work[work["Risk"].astype(str).str.lower().isin(capset)]
 
     # Score
-    if mode.lower().startswith("div"):
-        scr = score_dividend(work)
-        work["Score"] = scr
-    else:
-        scr = score_growth(work)
-        work["Score"] = scr
+    work = _apply_mode_score(work, mode=mode)
 
-    # Grade/Valuation/Reco
-    work["Grade"] = work["Score"].apply(grade_from_score)
-    # Faller tillbaka till att räkna valuation_label om kolumn saknas
-    if "Valuation" not in work.columns:
-        work["Valuation"] = work.apply(lambda r: valuation_label(r, "Riktkurs om 1 år"), axis=1)
-    work["Reco"] = [reco_from_score_and_valuation(s, v) for s, v in zip(work["Score"], work["Valuation"])]
+    # Sortera & topp
+    work = work.sort_values(by=["Score", "Upside (%)"], ascending=[False, False])
+    if top_n is not None and top_n > 0:
+        work = work.head(top_n)
 
-    # Sortera
-    work = work.sort_values(by=["Score", "Valuation"], ascending=[False, True])
-
-    # Returnera topp
-    cols_pref = [
-        "Ticker", "Bolagsnamn", "Sektor" if "Sektor" in work.columns else ("Sector" if "Sector" in work.columns else None),
-        "Aktuell kurs", "Valuta", "Årlig utdelning", "div_yield",
-        "P/S", "P/S-snitt", "ps_rel",
-        "Omsättning idag", "Omsättning nästa år", "est_growth",
-        "Riktkurs om 1 år", "val_gap",
-        "_MC_USD", "Risk",
-        "Score", "Grade", "Valuation", "Reco"
-    ]
-    cols_pref = [c for c in cols_pref if c and c in work.columns]
-    rest = [c for c in work.columns if c not in cols_pref]
-    out = work[cols_pref + rest].head(int(top)).copy()
-    return out
+    # Runda snyggt
+    for c in ["Score", "Upside (%)", "Fair price"]:
+        if c in work.columns:
+            work[c] = work[c].apply(lambda x: round(_f(x), 2))
+    return work.reset_index(drop=True)

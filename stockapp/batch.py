@@ -1,379 +1,267 @@
 # stockapp/batch.py
 # -*- coding: utf-8 -*-
 """
-Batch-körningar (sidopanel) + hjälpmetoder för att uppdatera enskilda rader.
+Batch-kontroller i sidopanelen + hjälpfunktioner.
 
 Publik:
-- sidebar_batch_controls(df, user_rates, save_cb=None, recompute_cb=None, runner_price=None, runner_full=None)
-  Visar batch-panel i sidopanelen:
-    * Skapa kö (A–Ö eller Äldst först), välj antal
-    * Välj uppdateringstyp: Endast kurs eller Full uppdatering
-    * Kör nästa / Kör alla i kö / Återställ kö
-  Returnerar uppdaterad df (samma referens-objekt som skickades in)
-
-Interna hjälpare:
-- _pick_order(df, mode) -> List[str]
-- _oldest_any_ts(row)   -> Optional[pd.Timestamp]
-- _add_oldest_ts_col(df)
-- _stamp_ts_for_field(df, idx, field, when=None)
-- _note_auto_update(df, idx, source)
-- _apply_updates_to_row(df, idx, new_vals, source, log_changed, always_stamp=False)
-
-Runner default:
-- Om runner_price/runner_full ej anges används stockapp.sources.run_update_price_only / run_update_full
+- sidebar_batch_controls(df, user_rates, save_cb=None, recompute_cb=None, runner=None) -> pd.DataFrame
+- run_batch_update(df, user_rates, tickers, runner, make_snapshot=False, save_cb=None, recompute_cb=None)
 """
 
 from __future__ import annotations
-from typing import Dict, List, Tuple, Optional
+from typing import List, Dict, Tuple, Callable, Optional
+from datetime import datetime, timedelta, date
 
-import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import streamlit as st
 
-from .config import TS_FIELDS, FINAL_COLS
-from .utils import now_stamp
-from . import sources as _sources
-from .storage import spara_data
+from .config import TS_FIELDS
+from .sources import run_update_full, run_update_price_only
 
-# ---------------------------------------------------------------------------
-# Hjälpare: TS & ordning
-# ---------------------------------------------------------------------------
 
-def _oldest_any_ts(row: pd.Series) -> Optional[pd.Timestamp]:
-    dates = []
-    for c in TS_FIELDS.values():
-        if c in row and str(row[c]).strip():
-            try:
-                d = pd.to_datetime(str(row[c]).strip(), errors="coerce")
-                if pd.notna(d):
-                    dates.append(d)
-            except Exception:
-                pass
-    return min(dates) if dates else None
+# ------------------------------------------------------------
+# Interna hjälpare
+# ------------------------------------------------------------
 
-def _add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["_oldest_any_ts"] = out.apply(_oldest_any_ts, axis=1)
-    out["_oldest_any_ts_fill"] = out["_oldest_any_ts"].fillna(pd.Timestamp("2099-12-31"))
-    return out
+def _safe_to_datetime(s: str) -> Optional[datetime]:
+    try:
+        if not s:
+            return None
+        d = pd.to_datetime(str(s), errors="coerce")
+        if pd.isna(d):
+            return None
+        return d.to_pydatetime()
+    except Exception:
+        return None
+
+def _oldest_ts_for_row(row: pd.Series) -> Optional[datetime]:
+    """Äldsta tidsstämpeln bland TS_-kolumner som finns i DF."""
+    dates: List[datetime] = []
+    for tracked_field, ts_col in TS_FIELDS.items():
+        if ts_col in row and str(row[ts_col]).strip():
+            d = _safe_to_datetime(str(row[ts_col]).strip())
+            if d is not None:
+                dates.append(d)
+    if not dates:
+        return None
+    return min(dates)
 
 def _pick_order(df: pd.DataFrame, mode: str) -> List[str]:
     """
-    Returnerar en lista med tickers i vald ordning.
-    mode: "A–Ö (bolagsnamn)" eller "Äldst uppdaterade först"
+    Returnerar lista av tickers i vald ordning.
+    mode: "Äldst TS först" | "A–Ö (Ticker)"
     """
     work = df.copy()
+    if "Ticker" not in work.columns:
+        return []
+
     if mode.startswith("Äldst"):
-        work = _add_oldest_ts_col(work)
-        work = work.sort_values(by=["_oldest_any_ts_fill", "Bolagsnamn"], ascending=[True, True])
+        work["_oldest_any_ts"] = work.apply(_oldest_ts_for_row, axis=1)
+        # sortera: None → längst bak, därefter stigande datum (äldst först)
+        work["_oldest_sort"] = work["_oldest_any_ts"].apply(lambda d: d if d is not None else datetime(2999, 1, 1))
+        work = work.sort_values(by=["_oldest_sort", "Ticker"], ascending=[True, True])
+        order = [str(t).upper() for t in work["Ticker"].tolist()]
+        return order
     else:
-        work = work.sort_values(by=["Bolagsnamn", "Ticker"], ascending=[True, True])
-    # Endast unika tickers och icke-tomma
-    tickers = [str(t).upper().strip() for t in work["Ticker"].tolist() if str(t).strip()]
+        order = [str(t).upper() for t in work["Ticker"].tolist()]
+        order = sorted(order)
+        return order
+
+def _unique_preserve(items: List[str]) -> List[str]:
+    """Unika (case-insensitive), bibehåll ordning."""
     seen = set()
-    uniq = []
-    for t in tickers:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    return uniq
-
-# ---------------------------------------------------------------------------
-# Hjälpare: stämpling & skrivning
-# ---------------------------------------------------------------------------
-
-def _stamp_ts_for_field(df: pd.DataFrame, row_idx: int, field: str, when: Optional[str] = None):
-    ts_col = TS_FIELDS.get(field)
-    if not ts_col:
-        return
-    date_str = when if when else now_stamp()
-    try:
-        df.at[row_idx, ts_col] = date_str
-    except Exception:
-        pass
-
-def _note_auto_update(df: pd.DataFrame, row_idx: int, source: str):
-    try:
-        df.at[row_idx, "Senast auto-uppdaterad"] = now_stamp()
-        df.at[row_idx, "Senast uppdaterad källa"] = source
-    except Exception:
-        pass
-
-def _apply_updates_to_row(
-    df: pd.DataFrame,
-    row_idx: int,
-    new_vals: Dict[str, object],
-    source: str,
-    log_changed: Dict[str, List[str]],
-    always_stamp: bool = False,
-) -> bool:
-    """
-    Skriver endast meningsfulla fält från new_vals till df.
-    - Numeriskt: >0 för P/S, P/S Qx, Utestående aktier, Aktuell kurs; 0 får skrivas för t.ex. utdelning om den uttryckligen finns med
-    - Sträng: icke-tom
-    - Stämplar TS_ för fält i TS_FIELDS när de skrivs (eller always_stamp=True om nyckeln finns i new_vals).
-    - Sätter auto-uppdaterad och källa om något ändrades OCH/ELLER always_stamp=True och nyckeln finns (så datum hålls färskt).
-
-    Returnerar True om någonting skrevs eller stämplades.
-    """
-    ticker = str(df.at[row_idx, "Ticker"]).upper().strip()
-    changed_fields: List[str] = []
-    stamped_only: List[str] = []
-
-    for f, v in (new_vals or {}).items():
-        if f not in df.columns:
+    out = []
+    for x in items:
+        k = str(x).upper()
+        if k in seen:
             continue
-        old = df.at[row_idx, f] if f in df.columns else None
+        seen.add(k)
+        out.append(k)
+    return out
 
-        write_ok = False
-        if isinstance(v, (int, float, np.floating)):
-            # Fält som inte ska vara negativa/meningslösa
-            if f in ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Utestående aktier","Aktuell kurs"]:
-                write_ok = (float(v) > 0)
-            else:
-                # ok att skriva noll i vissa fall (utdelning t.ex.)
-                write_ok = (float(v) >= 0)
-        elif isinstance(v, str):
-            write_ok = (v.strip() != "")
 
-        if write_ok:
-            # Uppdatera om skillnad
-            if (old is None) or (str(old) != str(v)):
-                df.at[row_idx, f] = v
-                changed_fields.append(f)
-                # Stämpla ev. TS_ för spårat fält
-                if f in TS_FIELDS:
-                    _stamp_ts_for_field(df, row_idx, f)
-            else:
-                # Identiskt — om always_stamp, stämpla TS_ ändå
-                if always_stamp and f in TS_FIELDS:
-                    _stamp_ts_for_field(df, row_idx, f)
-                    stamped_only.append(f)
-        else:
-            # Inget skriv — men stämpla TS_ om always_stamp och f finns i new_vals
-            if always_stamp and f in TS_FIELDS:
-                _stamp_ts_for_field(df, row_idx, f)
-                stamped_only.append(f)
+# ------------------------------------------------------------
+# Körning
+# ------------------------------------------------------------
 
-    any_effect = bool(changed_fields or stamped_only)
-    if any_effect:
-        _note_auto_update(df, row_idx, source)
-        if changed_fields:
-            log_changed.setdefault(ticker, []).extend(changed_fields)
-        # Om endast stämplar, logga TS_* också så att det syns i körlogg
-        if stamped_only and not changed_fields:
-            log_changed.setdefault(ticker, []).extend([f"(TS) {x}" for x in stamped_only])
+RunnerFn = Callable[[pd.DataFrame, str, Dict[str, float]], Tuple[pd.DataFrame, List[str], str]]
 
-    return any_effect
+def run_batch_update(
+    df: pd.DataFrame,
+    user_rates: Dict[str, float],
+    tickers: List[str],
+    runner: RunnerFn,
+    make_snapshot: bool = False,
+    save_cb: Optional[Callable[[pd.DataFrame, bool], None]] = None,
+    recompute_cb: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, List[str]], Dict[str, str]]:
+    """
+    Kör runner för en lista tickers. Returnerar (df2, changed_map, msg_map).
+    changed_map: {ticker: [fält,...]}
+    msg_map: {ticker: "status-text"}
+    """
+    total = len(tickers)
+    changed_map: Dict[str, List[str]] = {}
+    msg_map: Dict[str, str] = {}
 
-# ---------------------------------------------------------------------------
-# Huvud-UI för batch i sidopanelen
-# ---------------------------------------------------------------------------
+    prog = st.sidebar.progress(0.0)
+    prog_txt = st.sidebar.empty()
+
+    df2 = df.copy()
+    for i, tkr in enumerate(tickers, start=1):
+        try:
+            df2, changed, msg = runner(df2, tkr, user_rates)
+            if changed:
+                changed_map[tkr] = changed
+            msg_map[tkr] = msg or ""
+        except Exception as e:
+            msg_map[tkr] = f"Fel: {e}"
+
+        frac = i / max(1, total)
+        prog.progress(frac)
+        prog_txt.write(f"**Körning:** {i}/{total}  —  {tkr}")
+
+    # Efter batch: recompute + spara
+    if recompute_cb is not None:
+        try:
+            df2 = recompute_cb(df2)
+        except Exception as e:
+            st.sidebar.warning(f"Beräkningar misslyckades: {e}")
+
+    if save_cb is not None:
+        try:
+            save_cb(df2, make_snapshot)
+        except Exception as e:
+            st.sidebar.error(f"Misslyckades spara till Google Sheets: {e}")
+
+    st.sidebar.success("Batchkörning klar.")
+    return df2, changed_map, msg_map
+
+
+# ------------------------------------------------------------
+# Sidopanel: kontroller
+# ------------------------------------------------------------
 
 def sidebar_batch_controls(
     df: pd.DataFrame,
     user_rates: Dict[str, float],
-    save_cb=None,
-    recompute_cb=None,
-    runner_price=None,
-    runner_full=None,
+    save_cb: Optional[Callable[[pd.DataFrame, bool], None]] = None,
+    recompute_cb: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
+    runner: Optional[RunnerFn] = None,
 ) -> pd.DataFrame:
     """
-    Visar en sidopanelsektion för batch-körningar.
-    - Skapa batch-kö utifrån ordning & max antal
-    - Välj runner-typ: "Endast kurs" eller "Full uppdatering"
-    - Kör nästa eller Kör alla
-    - Progressbar + "i/X"-text
-    - Logg över ändringar/missar
-
-    Parametrar:
-      save_cb(df) -> None             : om angiven, används vid spara; annars storage.spara_data
-      recompute_cb(df) -> pd.DataFrame: om angiven, körs efter uppdatering (t.ex. uppdatera_berakningar)
-      runner_price(tkr) -> (vals, source, err)
-      runner_full(tkr, df=None, user_rates=None) -> (vals, source, err)
+    Bygger hela batchpanelen i sidopanelen.
+    Använder st.session_state["batch_queue"], ["batch_pointer"], ["batch_last_results"].
+    Returnerar ev. uppdaterad df.
     """
-    if runner_price is None:
-        runner_price = _sources.run_update_price_only
-    if runner_full is None:
-        runner_full = _sources.run_update_full
+    st.sidebar.subheader("🛠️ Batch-körning")
 
-    st.sidebar.subheader("🛠️ Batch-uppdatering")
+    # Runner-val
+    runner_map: Dict[str, RunnerFn] = {
+        "Full (Yahoo)": run_update_full,
+        "Pris endast": run_update_price_only,
+    }
+    default_runner_name = "Full (Yahoo)" if runner is None else None
+    runner_name = st.sidebar.selectbox(
+        "Runner",
+        options=list(runner_map.keys()) if runner is None else ["(extern runner)"],
+        index=0,
+        help="Välj vilken uppdateringsstrategi som ska användas per ticker."
+    )
+    use_runner = runner if runner is not None else runner_map[runner_name]
 
-    # Inställningar
-    sort_mode = st.sidebar.selectbox("Sortera", ["Äldst uppdaterade först", "A–Ö (bolagsnamn)"], index=0)
-    max_items = st.sidebar.number_input("Antal i kö", min_value=1, max_value=1000, value=20, step=1)
-    run_type = st.sidebar.radio("Vad ska uppdateras?", ["Endast kurs", "Full uppdatering"], horizontal=True)
-    always_stamp = st.sidebar.checkbox("Stämpla datum även om värdet ej ändras", value=True)
+    # Sortering
+    sort_mode = st.sidebar.radio(
+        "Ordning för batch",
+        ["Äldst TS först", "A–Ö (Ticker)"],
+        horizontal=False,
+    )
 
-    # Skapa kö
-    if st.sidebar.button("📋 Skapa batch-kö"):
+    # Storlek att lägga i kö
+    default_batch_size = st.sidebar.number_input(
+        "Batch-storlek (hur många tickers ska läggas i kön vid 'Skapa batch')",
+        min_value=1, max_value=500, value=20, step=1
+    )
+
+    # Skapa batch-kö
+    if st.sidebar.button("📦 Skapa batch från tabellen"):
         order = _pick_order(df, sort_mode)
-        # Skär till max_items
-        queue = order[: int(max_items)]
-        # Om det redan finns en kö, ersätt med ny
-        st.session_state["batch_queue"] = queue
-        st.session_state["batch_done"] = []
-        st.session_state["batch_sort"] = sort_mode
-        st.session_state["batch_type"] = run_type
-        st.sidebar.success(f"Kö skapad ({len(queue)} st).")
+        order = _unique_preserve(order)
+        st.session_state["batch_queue"] = order[:default_batch_size] if default_batch_size > 0 else order
+        st.session_state["batch_pointer"] = 0
+        st.session_state["batch_last_results"] = {}
+        st.sidebar.success(f"Skapade batch-kö med {len(st.session_state['batch_queue'])} tickers.")
 
+    # Visa status för kön
     queue: List[str] = st.session_state.get("batch_queue", [])
-    done: List[str] = st.session_state.get("batch_done", [])
-    batch_type = st.session_state.get("batch_type", run_type)
-    # Om användaren ändrat radio efter skapad kö, respektera manuellt val nu:
-    current_type = run_type
+    ptr: int = int(st.session_state.get("batch_pointer", 0))
+    remaining = max(0, len(queue) - ptr)
 
     if queue:
-        st.sidebar.info(f"Aktuell kö: {len(queue)} tickers • Klara: {len(done)}")
-        # Val: Kör nästa
-        if st.sidebar.button("▶️ Kör nästa i kö"):
-            tkr = None
-            # Plocka första som inte är klar
-            for cand in queue:
-                if cand not in done:
-                    tkr = cand
-                    break
-            if tkr:
-                # Kör vald runner
-                try:
-                    if current_type == "Endast kurs":
-                        vals, source, err = runner_price(tkr)
-                    else:
-                        vals, source, err = runner_full(tkr, df=df, user_rates=user_rates)
-                except Exception as e:
-                    vals, source, err = {}, "runner_error", str(e)
-
-                # Loggar i session för senare visning
-                log = st.session_state.get("last_auto_log", {"changed": {}, "misses": {}, "errors": {}})
-                if "changed" not in log: log["changed"] = {}
-                if "misses" not in log: log["misses"] = {}
-                if "errors" not in log: log["errors"] = {}
-
-                # Skriv rad om den finns
-                ridxs = df.index[df["Ticker"].astype(str).str.upper().str.strip() == str(tkr).upper().strip()].tolist()
-                if not ridxs:
-                    log["errors"][tkr] = ["Ticker saknas i tabellen."]
-                else:
-                    idx = ridxs[0]
-                    wrote = _apply_updates_to_row(df, idx, vals, source, log_changed=log["changed"], always_stamp=always_stamp)
-                    if not wrote:
-                        # registrera "miss"
-                        log["misses"][tkr] = list(vals.keys()) if vals else ["(inga fält)"]
-
-                    # Spara direkt?
-                    if save_cb:
-                        try:
-                            save_cb(df)
-                        except Exception as e:
-                            log["errors"].setdefault(tkr, []).append(f"Spara-fel: {e}")
-                    else:
-                        try:
-                            spara_data(df, do_snapshot=False)
-                        except Exception as e:
-                            log["errors"].setdefault(tkr, []).append(f"Spara-fel: {e}")
-
-                    # Recompute?
-                    if recompute_cb:
-                        try:
-                            df2 = recompute_cb(df)
-                            if df2 is not None:
-                                df[:] = df2  # in-place uppdatering
-                        except Exception as e:
-                            log["errors"].setdefault(tkr, []).append(f"Recompute-fel: {e}")
-
-                # Markera klar
-                if tkr not in done:
-                    done.append(tkr)
-                st.session_state["batch_done"] = done
-                st.session_state["last_auto_log"] = log
-                st.sidebar.success(f"Klar: {tkr}")
-
-        # Kör alla
-        if st.sidebar.button("⏩ Kör alla i kö"):
-            total = len(queue)
-            done_set = set(done)
-            todo = [t for t in queue if t not in done_set]
-            progress = st.sidebar.progress(0.0)
-            status = st.sidebar.empty()
-            log = st.session_state.get("last_auto_log", {"changed": {}, "misses": {}, "errors": {}})
-            if "changed" not in log: log["changed"] = {}
-            if "misses" not in log: log["misses"] = {}
-            if "errors" not in log: log["errors"] = {}
-
-            for i, tkr in enumerate(todo):
-                status.write(f"Uppdaterar {i+1}/{len(todo)}: {tkr}")
-                try:
-                    if current_type == "Endast kurs":
-                        vals, source, err = runner_price(tkr)
-                    else:
-                        vals, source, err = runner_full(tkr, df=df, user_rates=user_rates)
-                except Exception as e:
-                    vals, source, err = {}, "runner_error", str(e)
-
-                ridxs = df.index[df["Ticker"].astype(str).str.upper().str.strip() == str(tkr).upper().strip()].tolist()
-                if not ridxs:
-                    log["errors"][tkr] = ["Ticker saknas i tabellen."]
-                else:
-                    idx = ridxs[0]
-                    wrote = _apply_updates_to_row(df, idx, vals, source, log_changed=log["changed"], always_stamp=always_stamp)
-                    if not wrote:
-                        log["misses"][tkr] = list(vals.keys()) if vals else ["(inga fält)"]
-                    # Spara efter varje
-                    if save_cb:
-                        try:
-                            save_cb(df)
-                        except Exception as e:
-                            log["errors"].setdefault(tkr, []).append(f"Spara-fel: {e}")
-                    else:
-                        try:
-                            spara_data(df, do_snapshot=False)
-                        except Exception as e:
-                            log["errors"].setdefault(tkr, []).append(f"Spara-fel: {e}")
-
-                    # Recompute?
-                    if recompute_cb:
-                        try:
-                            df2 = recompute_cb(df)
-                            if df2 is not None:
-                                df[:] = df2
-                        except Exception as e:
-                            log["errors"].setdefault(tkr, []).append(f"Recompute-fel: {e}")
-
-                done.append(tkr)
-                progress.progress((len(done) / max(total, 1.0)))
-                status.write(f"Uppdaterar {len(done)}/{total}: {tkr}")
-
-            st.session_state["batch_done"] = done
-            st.session_state["last_auto_log"] = log
-            st.sidebar.success("Batch körning klar.")
-
-        # Återställ kö
-        if st.sidebar.button("🧹 Återställ kö"):
-            st.session_state.pop("batch_queue", None)
-            st.session_state.pop("batch_done", None)
-            st.sidebar.info("Kö återställd.")
-
-        # Liten förhandsvisning av kö
-        with st.sidebar.expander("Visa kö"):
-            st.write(queue)
-
-        # Visa logg
-        with st.sidebar.expander("Senaste körlogg"):
-            log = st.session_state.get("last_auto_log")
-            if not log:
-                st.write("Ingen körlogg ännu.")
-            else:
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**Ändringar**")
-                    st.json(log.get("changed", {}))
-                with col2:
-                    st.markdown("**Missar**")
-                    st.json(log.get("misses", {}))
-                st.markdown("**Fel**")
-                st.json(log.get("errors", {}))
+        st.sidebar.info(f"Kö: {len(queue)} tickers  —  Nästa index: {ptr}  —  Kvar: {remaining}")
+        st.sidebar.code(", ".join(queue[max(0, ptr - 3):min(len(queue), ptr + 7)]) or "-", language="text")
     else:
-        st.sidebar.info("Ingen aktiv kö. Skapa en via **📋 Skapa batch-kö**.")
+        st.sidebar.write("Ingen batch-kö ännu.")
 
-    return df
+    # Kör “nästa N”
+    step = st.sidebar.number_input("Kör nästa N", min_value=1, max_value=max(1, remaining or 1), value=min(10, remaining or 1), step=1)
+    run_next = st.sidebar.button("▶️ Kör nästa N")
+
+    # Kör “hela kön”
+    run_all = st.sidebar.button("⏩ Kör hela kön")
+
+    # Rensa
+    if st.sidebar.button("🗑️ Rensa batch-kö"):
+        st.session_state["batch_queue"] = []
+        st.session_state["batch_pointer"] = 0
+        st.session_state["batch_last_results"] = {}
+        st.sidebar.success("Batch-kö rensad.")
+
+    df2 = df
+
+    # Körning
+    if run_next and queue and ptr < len(queue):
+        to_run = queue[ptr : ptr + int(step)]
+        df2, changed_map, msg_map = run_batch_update(
+            df2, user_rates, to_run, use_runner,
+            make_snapshot=False,
+            save_cb=save_cb,
+            recompute_cb=recompute_cb
+        )
+        # uppdatera pointer och logg
+        st.session_state["batch_pointer"] = ptr + len(to_run)
+        last = st.session_state.get("batch_last_results", {})
+        last.update({k: {"changed": changed_map.get(k, []), "msg": msg_map.get(k, "")} for k in to_run})
+        st.session_state["batch_last_results"] = last
+
+    if run_all and queue and ptr < len(queue):
+        to_run = queue[ptr:]
+        df2, changed_map, msg_map = run_batch_update(
+            df2, user_rates, to_run, use_runner,
+            make_snapshot=False,
+            save_cb=save_cb,
+            recompute_cb=recompute_cb
+        )
+        st.session_state["batch_pointer"] = len(queue)
+        last = st.session_state.get("batch_last_results", {})
+        last.update({k: {"changed": changed_map.get(k, []), "msg": msg_map.get(k, "")} for k in to_run})
+        st.session_state["batch_last_results"] = last
+
+    # Senaste körlogg
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**📒 Senaste körlogg**")
+    last = st.session_state.get("batch_last_results", {})
+    if not last:
+        st.sidebar.write("–")
+    else:
+        # Visa senaste ~20
+        items = list(last.items())[-20:]
+        for tkr, info in items:
+            ch = info.get("changed", [])
+            msg = info.get("msg", "")
+            st.sidebar.write(f"**{tkr}** — {msg}")
+            if ch:
+                st.sidebar.caption("Ändrade fält: " + ", ".join(ch))
+
+    return df2

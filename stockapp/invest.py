@@ -1,16 +1,15 @@
-# stockapp/investment.py
+# stockapp/invest.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import math
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from .utils import safe_float, format_large_number
 from .rates import hamta_valutakurs
+from .utils import safe_float, format_large_number
 from .scoring import (
     growth_score,
     dividend_score,
@@ -18,22 +17,85 @@ from .scoring import (
     risk_label_from_mcap,
 )
 
+# ---------------------------
+# Hjälpare: datatäckning
+# ---------------------------
+def _is_present(val) -> bool:
+    try:
+        v = float(val)
+        if np.isnan(v):
+            return False
+        # för kvoter och procentsatser kan noll vara giltigt; räkna allt som "present" så länge det inte är NaN
+        return True
+    except Exception:
+        return str(val).strip() != ""
+
+def _coverage_fields(mode: str) -> List[str]:
+    if mode == "Utdelning":
+        return [
+            # utdelningsfokus
+            "Årlig utdelning",
+            "Aktuell kurs",
+            "Market Cap",
+            "Free Cash Flow (M)",
+            "Kassa (M)",
+            "Debt/Equity",
+            "Bruttomarginal (%)",
+            "Netto-marginal (%)",
+            "Utdelningskvot FCF (%)",   # om du har denna
+            "Utdelningskvot Vinst (%)"  # om du har denna
+        ]
+    # Tillväxt
+    return [
+        "P/S",
+        "P/S-snitt",
+        "CAGR 5 år (%)",
+        "Market Cap",
+        "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        "MCAP Q1 (M)", "MCAP Q2 (M)", "MCAP Q3 (M)", "MCAP Q4 (M)",
+        "Bruttomarginal (%)",
+        "Netto-marginal (%)",
+        "Debt/Equity",
+        "Free Cash Flow (M)",
+        "Kassa (M)",
+    ]
+
+def _coverage_ratio_row(row: pd.Series, mode: str) -> Tuple[float, int, int]:
+    fields = _coverage_fields(mode)
+    present = 0
+    for k in fields:
+        if k in row.index and _is_present(row.get(k)):
+            present += 1
+    total = len(fields)
+    ratio = (present / total) if total > 0 else 0.0
+    return ratio, present, total
+
+def _potential_pct(row: pd.Series, riktkurs_col: str) -> float:
+    px = safe_float(row.get("Aktuell kurs"))
+    tgt = safe_float(row.get(riktkurs_col))
+    if px <= 0 or tgt <= 0:
+        return 0.0
+    return (tgt - px) / max(px, 1e-9) * 100.0
+
+def _normalize_potential(pct: float) -> float:
+    """
+    Begränsa och normalisera potential. -50%..+150% ⇒ 0..1 (linjärt).
+    Stora extrema värden får inte dominera.
+    """
+    lo, hi = -50.0, 150.0
+    x = max(lo, min(hi, pct))
+    return (x - lo) / (hi - lo)  # 0..1
+
+# ---------------------------
+# Huvudvy
+# ---------------------------
 def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> None:
-    """
-    Investeringsförslag (Tillväxt/Utdelning) med:
-      - sektor- & riskfilter
-      - score (0..100)
-      - uppsida mot vald riktkurs
-      - handlingsetikett: Köp / Håll / Trimma / Sälj inkl. motivering
-      - robust mot saknade kolumner
-    """
     st.header("💡 Investeringsförslag")
 
     if df is None or df.empty:
         st.info("Inga bolag i databasen ännu.")
         return
 
-    # Val: fokus & riktkursfält
     mode = st.radio("Fokus", ["Tillväxt", "Utdelning"], horizontal=True, index=0)
 
     riktkurs_val = st.selectbox(
@@ -42,10 +104,8 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
         index=1
     )
 
-    # Filter: sektor & risketikett
-    sector_vals = ["Alla"] + sorted(
-        [s for s in df.get("Sektor", pd.Series(dtype=str)).astype(str).unique() if s]
-    )
+    # Filter: sektor & risk
+    sector_vals = ["Alla"] + sorted([s for s in df.get("Sektor", pd.Series(dtype=str)).astype(str).unique() if s])
     sektor = st.selectbox("Filtrera på sektor", sector_vals, index=0)
 
     risk_vals = ["Alla", "Micro", "Small", "Mid", "Large", "Mega"]
@@ -55,37 +115,41 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
     work = df.copy()
     work["Aktuell kurs"] = pd.to_numeric(work.get("Aktuell kurs", 0), errors="coerce").fillna(0.0)
     work[riktkurs_val] = pd.to_numeric(work.get(riktkurs_val, 0), errors="coerce").fillna(0.0)
-
     base = work[(work["Aktuell kurs"] > 0) & (work[riktkurs_val] > 0)].copy()
 
     if sektor != "Alla":
         base = base[base.get("Sektor", "").astype(str) == sektor]
 
+    # Risklabel filtrering
+    base["_RiskLabel"] = base.get("Market Cap", 0).apply(risk_label_from_mcap)
     if risk_choice != "Alla":
-        base["_RiskLabel"] = base.get("Market Cap", 0).apply(risk_label_from_mcap)
         base = base[base["_RiskLabel"] == risk_choice]
 
     if base.empty:
         st.info("Inga bolag matchar filtren just nu.")
         return
 
-    # Potential & score
-    def _potential(row):
-        px = safe_float(row.get("Aktuell kurs"))
-        tgt = safe_float(row.get(riktkurs_val))
-        if px <= 0 or tgt <= 0:
-            return 0.0
-        return (tgt - px) / px * 100.0
-
-    base["Potential (%)"] = base.apply(_potential, axis=1)
+    # Score + datatäckning + potential
+    base["Potential (%)"] = base.apply(lambda r: _potential_pct(r, riktkurs_val), axis=1)
+    base["_Coverage"], base["_Present"], base["_Total"] = zip(*base.apply(lambda r: _coverage_ratio_row(r, mode), axis=1))
 
     if mode == "Utdelning":
-        base["_Score"] = base.apply(lambda r: dividend_score(r), axis=1)
+        base["_BaseScore"] = base.apply(lambda r: dividend_score(r), axis=1)
     else:
-        base["_Score"] = base.apply(lambda r: growth_score(r, riktkurs_col=riktkurs_val), axis=1)
+        base["_BaseScore"] = base.apply(lambda r: growth_score(r, riktkurs_col=riktkurs_val), axis=1)
 
-    # Sortera: högst score först, sedan potential
-    base = base.sort_values(by=["_Score", "Potential (%)"], ascending=[False, False]).reset_index(drop=True)
+    # Slutlig poäng med stark vikt på täckning
+    #   - coverage exponent 1.25 straffar låg täckning mer
+    #   - + 15 * coverage ger alltid lite upp för fler datapunkter
+    #   - + 0.2 * potential_norm (lätt studs från riktkurs)
+    base["_FinalScore"] = (
+        base["_BaseScore"] * (base["_Coverage"] ** 1.25)
+        + 15.0 * base["_Coverage"]
+        + 0.2 * base["Potential (%)"].apply(_normalize_potential) * 100.0
+    )
+
+    # Sortera: final score, coverage, potential
+    base = base.sort_values(by=["_FinalScore", "_Coverage", "Potential (%)"], ascending=[False, False, False]).reset_index(drop=True)
 
     # Navigering
     if "forslags_index" not in st.session_state:
@@ -104,9 +168,8 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
 
     rad = base.iloc[st.session_state.forslags_index]
 
-    # Portföljandel (om möjligt) + GAV i SEK
+    # Portföljandel & GAV SEK
     vx = hamta_valutakurs(rad.get("Valuta", "SEK"), user_rates)
-
     if "Antal aktier" in df.columns:
         pos_value_sek = safe_float(rad.get("Antal aktier")) * safe_float(rad.get("Aktuell kurs")) * vx
         port = df[pd.to_numeric(df.get("Antal aktier", 0), errors="coerce").fillna(0.0) > 0].copy()
@@ -126,7 +189,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
 
     gav_sek = safe_float(rad.get("GAV (SEK)")) if "GAV (SEK)" in df.columns else None
 
-    # Handlingsetikett + motivering
+    # Rek etikett
     label, reason, metrics = assign_action_label(
         rad,
         mode=mode,
@@ -136,14 +199,18 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
         fx_to_sek=vx,
     )
 
-    # Presentation
+    # Header
     st.subheader(f"{rad.get('Bolagsnamn','')} ({rad.get('Ticker','')})")
 
+    # Nyckeltal i kortform
     ps_now = safe_float(rad.get("P/S"))
     ps_avg = safe_float(rad.get("P/S-snitt"))
     mcap = safe_float(rad.get("Market Cap"))
     uts_m = safe_float(rad.get("Utestående aktier"))
-    yld = metrics.get("yield_pct", 0.0)
+
+    label_emoji = {"Köp": "🟢", "Håll": "🟡", "Trimma": "🟠", "Sälj": "🔴"}.get(label, "🔷")
+    st.markdown(f"### {label_emoji} Rekommendation: **{label}**")
+    st.markdown("**Motivering:** " + (reason or "—"))
 
     lines = [
         f"- **Aktuell kurs:** {safe_float(rad.get('Aktuell kurs')):.2f} {rad.get('Valuta','')}",
@@ -152,15 +219,16 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
         f"- **P/S (nu):** {ps_now:.2f}  | **P/S-snitt:** {ps_avg:.2f}",
         f"- **Utestående aktier (M):** {uts_m:.2f}",
         f"- **Market Cap:** {format_large_number(mcap)}",
+        f"- **Datatäckning:** {rad.get('_Coverage', 0.0)*100:.0f}%  ({int(rad.get('_Present',0))}/{int(rad.get('_Total',0))} nyckeltal)",
+        f"- **Score:** {rad.get('_FinalScore', 0.0):.1f}",
     ]
     if mode == "Utdelning":
+        yld = metrics.get("yield_pct", 0.0)
         lines.append(f"- **Direktavkastning:** {yld:.2f} %")
 
-    label_emoji = {"Köp": "🟢", "Håll": "🟡", "Trimma": "🟠", "Sälj": "🔴"}.get(label, "🔷")
-    st.markdown(f"### {label_emoji} Rekommendation: **{label}**")
-    st.markdown("**Motivering:** " + (reason or "—"))
     st.markdown("\n".join(lines))
 
+    # Expander
     with st.expander("Visa fler detaljer"):
         extra = {}
         for k in [
@@ -179,12 +247,17 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
     st.markdown("**Toppkandidater (översikt):**")
     top = base.head(10).copy()
     out_cols = [
-        "Ticker", "Bolagsnamn", "_Score", "Potential (%)", "Aktuell kurs",
-        riktkurs_val, "P/S", "P/S-snitt", "Market Cap"
+        "Ticker", "Bolagsnamn", "_FinalScore", "_Coverage", "Potential (%)",
+        "Aktuell kurs", riktkurs_val, "P/S", "P/S-snitt", "Market Cap"
     ]
     show = [c for c in out_cols if c in top.columns]
+    if "_Coverage" in show:
+        top["_Coverage (%)"] = (top["_Coverage"] * 100.0).round(0)
+        show = [c for c in show if c != "_Coverage"] + ["_Coverage (%)"]
+    if "_FinalScore" in show:
+        top.rename(columns={"_FinalScore": "Score"}, inplace=True)
     st.dataframe(
-        top[show].rename(columns={"_Score": "Score"}).reset_index(drop=True),
+        top[show].reset_index(drop=True),
         use_container_width=True,
         hide_index=True,
     )

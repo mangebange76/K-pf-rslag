@@ -2,20 +2,15 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import time
-from datetime import datetime
-from typing import List, Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 
-# ---- Våra moduler -----------------------------------------------------------
-from stockapp.config import (
-    APP_TITLE,
-    STANDARD_VALUTAKURSER,
-    TS_FIELDS,
-)
-from stockapp.utils import ensure_schema, now_stamp
+# -------------------------------------------------------
+# Importera modulära delar
+# -------------------------------------------------------
 from stockapp.storage import hamta_data, spara_data
 from stockapp.rates import (
     las_sparade_valutakurser,
@@ -23,367 +18,307 @@ from stockapp.rates import (
     hamta_valutakurser_auto,
     hamta_valutakurs,
 )
-from stockapp.update import (
-    update_price_for_all,
-    update_price_for_ticker,
-    update_full_for_ticker,
+from stockapp.utils import (
+    ensure_schema,
 )
-from stockapp.views import (
-    kontrollvy,
-    analysvy,
-    lagg_till_eller_uppdatera,
-    visa_portfolj,
-)
+
+# Invest-vyn (rankning/poäng + expander med nyckeltal)
 from stockapp.invest import visa_investeringsforslag
 
+# Dessa vyer är valfria – visas bara om moduler finns
+try:
+    from stockapp.views import (
+        kontrollvy,
+        analysvy,
+        lagg_till_eller_uppdatera,
+        visa_portfolj,
+    )
+    _HAVE_VIEWS = True
+except Exception:
+    _HAVE_VIEWS = False
 
-# -----------------------------------------------------------------------------
-# Streamlit grund
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+# Valfria uppdaterings- & batch-funktioner
+_HAVE_UPDATE = False
+try:
+    from stockapp.update import run_update_price_only, run_update_full
+    _HAVE_UPDATE = True
+except Exception:
+    _HAVE_UPDATE = False
 
+_HAVE_BATCH = False
+try:
+    from stockapp.batch import sidebar_batch_controls
+    _HAVE_BATCH = True
+except Exception:
+    _HAVE_BATCH = False
 
-# -----------------------------------------------------------------------------
-# Små hjälpare lokalt (endast i app)
-# -----------------------------------------------------------------------------
-def _init_session_defaults():
-    ss = st.session_state
-    ss.setdefault("_last_log", {})            # senaste körlogg (ändringar/missar)
-    ss.setdefault("_batch_cursor", 0)         # pekare för nästa batch-slice
-    ss.setdefault("_batch_order_cache", [])   # cachenad ordning (tickers) för batch
-    ss.setdefault("_batch_sort_mode", "Äldst först")
-    ss.setdefault("_rates_display", None)     # vad vi visar i inputs
-    ss.setdefault("_rates_saved_nonce", 0)    # bumpas när vi sparar kurser
-    ss.setdefault("_df_ref", None)            # den DF vi jobbar med i sessionen
+# -------------------------------------------------------
+# Streamlit bas
+# -------------------------------------------------------
+st.set_page_config(page_title="Aktieanalys & Investeringsförslag", layout="wide")
 
+# Kompatibilitet: om någon modul använder experimental_rerun men din Streamlit har st.rerun
+if not hasattr(st, "experimental_rerun") and hasattr(st, "rerun"):
+    setattr(st, "experimental_rerun", st.rerun)
 
-def _oldest_any_ts(row: pd.Series) -> pd.Timestamp | None:
-    dates = []
-    for c in row.index:
-        if str(c).startswith("TS_"):
-            val = str(row.get(c, "")).strip()
-            if val:
-                try:
-                    d = pd.to_datetime(val, errors="coerce")
-                    if pd.notna(d):
-                        dates.append(d)
-                except Exception:
-                    pass
-    if not dates:
-        return None
-    return min(dates)
-
-
-def _sorted_tickers(df: pd.DataFrame, mode: str) -> List[str]:
-    """
-    Bygger en ordning på tickers för batch-körning.
-    - 'Äldst först' sorterar på äldsta TS_* (min-date). Tomma → längst upp.
-    - 'A–Ö' sorterar alfabetiskt på Bolagsnamn, sedan Ticker.
-    """
-    work = df.copy()
-    work["_oldest"] = work.apply(_oldest_any_ts, axis=1)
-    if mode == "Äldst först":
-        # tom/NaT först:
-        work["_oldest_fill"] = work["_oldest"].fillna(pd.Timestamp("1900-01-01"))
-        work = work.sort_values(by=["_oldest_fill", "Bolagsnamn", "Ticker"], ascending=[True, True, True])
-    else:
-        work = work.sort_values(by=["Bolagsnamn", "Ticker"], ascending=[True, True])
-    return list(work["Ticker"].astype(str))
-
-
-def _progress_bar(i: int, n: int, label: str = "Körning"):
-    pct = (i / max(1, n))
-    st.sidebar.progress(pct, text=f"{label}: {i}/{n}")
-
-
-# -----------------------------------------------------------------------------
-# Sidopanel: Valutor & uppdateringsknappar
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------
+# Sidopanel – Valutakurser (robust utan förbjudna writes)
+# -------------------------------------------------------
 def _sidebar_rates() -> Dict[str, float]:
     st.sidebar.header("💱 Valutakurser → SEK")
 
-    # 1) Initiera "display"-värden bara en gång
-    if st.session_state["_rates_display"] is None:
-        try:
-            saved = las_sparade_valutakurser()
-        except Exception:
-            saved = STANDARD_VALUTAKURSER.copy()
-        # Spara som floats
-        st.session_state["_rates_display"] = {
-            "USD": float(saved.get("USD", STANDARD_VALUTAKURSER["USD"])),
-            "NOK": float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"])),
-            "CAD": float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"])),
-            "EUR": float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"])),
-            "SEK": 1.0,
-        }
+    # 1) Läs sparade kurser
+    saved = las_sparade_valutakurser()  # dict {"USD":..., "EUR":..., "CAD":..., "NOK":..., "SEK":1.0}
 
-    # 2) Rita inputs mot display-state (vi läser av värdena direkt ur widget-resultaten,
-    #    vi rör aldrig widget-keys i session_state → undviker StreamlitAPIException)
-    disp = st.session_state["_rates_display"]
-    colA, colB = st.sidebar.columns(2)
-    with colA:
-        usd_val = st.number_input("USD → SEK", value=float(disp["USD"]), step=0.01, format="%.4f")
-        cad_val = st.number_input("CAD → SEK", value=float(disp["CAD"]), step=0.01, format="%.4f")
-        sek_val = st.number_input("SEK → SEK", value=1.0, step=0.01, format="%.2f", disabled=True)
-    with colB:
-        eur_val = st.number_input("EUR → SEK", value=float(disp["EUR"]), step=0.01, format="%.4f")
-        nok_val = st.number_input("NOK → SEK", value=float(disp["NOK"]), step=0.01, format="%.4f")
+    # 2) Init defaults EN gång (innan widgets renderas)
+    defaults = {
+        "form_rate_usd": float(saved.get("USD", 10.0)),
+        "form_rate_eur": float(saved.get("EUR", 11.0)),
+        "form_rate_cad": float(saved.get("CAD", 7.0)),
+        "form_rate_nok": float(saved.get("NOK", 1.0)),
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # 3) Knapp: Auto-hämtning
-    if st.sidebar.button("🌐 Hämta kurser automatiskt"):
+    # 3) Auto-hämtning – skriv till session_state INNAN form byggs
+    auto_col1, auto_col2 = st.sidebar.columns([1, 1])
+    with auto_col1:
+        do_auto = st.button("🌐 Hämta automatiskt")
+    with auto_col2:
+        do_reload = st.button("↻ Läs sparade")
+
+    if do_auto:
         auto_rates, misses, provider = hamta_valutakurser_auto()
-        # Uppdatera display-värdena (inte widget keys)
-        st.session_state["_rates_display"].update({
-            "USD": float(auto_rates.get("USD", usd_val)),
-            "NOK": float(auto_rates.get("NOK", nok_val)),
-            "CAD": float(auto_rates.get("CAD", cad_val)),
-            "EUR": float(auto_rates.get("EUR", eur_val)),
-        })
-        st.sidebar.success(f"Valutakurser uppdaterade (källa: {provider}).")
+        st.sidebar.success(f"Hämtade från {provider}.")
         if misses:
             st.sidebar.warning("Kunde inte hämta för:\n- " + "\n- ".join(misses))
+        st.session_state["form_rate_usd"] = float(auto_rates.get("USD", st.session_state["form_rate_usd"]))
+        st.session_state["form_rate_eur"] = float(auto_rates.get("EUR", st.session_state["form_rate_eur"]))
+        st.session_state["form_rate_cad"] = float(auto_rates.get("CAD", st.session_state["form_rate_cad"]))
+        st.session_state["form_rate_nok"] = float(auto_rates.get("NOK", st.session_state["form_rate_nok"]))
 
-        # Skriv över lokala variabler så retur blir synkad med display
-        usd_val = st.session_state["_rates_display"]["USD"]
-        nok_val = st.session_state["_rates_display"]["NOK"]
-        cad_val = st.session_state["_rates_display"]["CAD"]
-        eur_val = st.session_state["_rates_display"]["EUR"]
+    if do_reload:
+        sv = las_sparade_valutakurser()
+        st.session_state["form_rate_usd"] = float(sv.get("USD", st.session_state["form_rate_usd"]))
+        st.session_state["form_rate_eur"] = float(sv.get("EUR", st.session_state["form_rate_eur"]))
+        st.session_state["form_rate_cad"] = float(sv.get("CAD", st.session_state["form_rate_cad"]))
+        st.session_state["form_rate_nok"] = float(sv.get("NOK", st.session_state["form_rate_nok"]))
+        st.sidebar.info("Sparade kurser inlästa.")
 
-    # 4) Spara/Läs
-    colS1, colS2 = st.sidebar.columns(2)
-    with colS1:
-        if st.button("💾 Spara kurser"):
-            rates_to_save = {
-                "USD": float(usd_val),
-                "NOK": float(nok_val),
-                "CAD": float(cad_val),
-                "EUR": float(eur_val),
-                "SEK": 1.0,
-            }
-            try:
-                spara_valutakurser(rates_to_save)
-                st.session_state["_rates_display"].update(rates_to_save)
-                st.sidebar.success("Sparat.")
-            except Exception as e:
-                st.sidebar.error(f"Kunde inte spara kurser: {e}")
+    # 4) Form (vi ändrar inte keys efter render)
+    with st.sidebar.form("rates_form", clear_on_submit=False):
+        usd = st.number_input("USD → SEK", key="form_rate_usd", step=0.01, format="%.4f")
+        eur = st.number_input("EUR → SEK", key="form_rate_eur", step=0.01, format="%.4f")
+        cad = st.number_input("CAD → SEK", key="form_rate_cad", step=0.01, format="%.4f")
+        nok = st.number_input("NOK → SEK", key="form_rate_nok", step=0.01, format="%.4f")
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            save_click = st.form_submit_button("💾 Spara")
+        with col_s2:
+            cancel_click = st.form_submit_button("Ångra ändringar")
 
-    with colS2:
-        if st.button("↻ Läs sparade kurser"):
-            try:
-                saved = las_sparade_valutakurser()
-                st.session_state["_rates_display"].update({
-                    "USD": float(saved.get("USD", STANDARD_VALUTAKURSER["USD"])),
-                    "NOK": float(saved.get("NOK", STANDARD_VALUTAKURSER["NOK"])),
-                    "CAD": float(saved.get("CAD", STANDARD_VALUTAKURSER["CAD"])),
-                    "EUR": float(saved.get("EUR", STANDARD_VALUTAKURSER["EUR"])),
-                    "SEK": 1.0,
-                })
-                st.sidebar.success("Inlästa.")
-            except Exception as e:
-                st.sidebar.error(f"Kunde inte läsa sparade kurser: {e}")
+    if save_click:
+        try:
+            to_save = {"USD": float(usd), "EUR": float(eur), "CAD": float(cad), "NOK": float(nok), "SEK": 1.0}
+            spara_valutakurser(to_save)
+            st.sidebar.success("Valutakurser sparade.")
+        except Exception as e:
+            st.sidebar.error(f"Kunde inte spara kurser: {e}")
 
-    # 5) Retur som user_rates
+    if cancel_click:
+        sv = las_sparade_valutakurser()
+        st.session_state["form_rate_usd"] = float(sv.get("USD", st.session_state["form_rate_usd"]))
+        st.session_state["form_rate_eur"] = float(sv.get("EUR", st.session_state["form_rate_eur"]))
+        st.session_state["form_rate_cad"] = float(sv.get("CAD", st.session_state["form_rate_cad"]))
+        st.session_state["form_rate_nok"] = float(sv.get("NOK", st.session_state["form_rate_nok"]))
+        st.sidebar.info("Återställde till sparade kurser.")
+
     return {
-        "USD": float(usd_val),
-        "NOK": float(nok_val),
-        "CAD": float(cad_val),
-        "EUR": float(eur_val),
+        "USD": float(st.session_state["form_rate_usd"]),
+        "EUR": float(st.session_state["form_rate_eur"]),
+        "CAD": float(st.session_state["form_rate_cad"]),
+        "NOK": float(st.session_state["form_rate_nok"]),
         "SEK": 1.0,
     }
 
-
-def _sidebar_updates(df: pd.DataFrame) -> pd.DataFrame:
+# -------------------------------------------------------
+# Sidopanel – ⚙️ Uppdatera data (ticker, kurs, full auto & ev. batch)
+# -------------------------------------------------------
+def _sidebar_updates(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
     st.sidebar.markdown("---")
-    st.sidebar.subheader("⚡ Snabb-uppdatering")
+    st.sidebar.header("⚙️ Uppdatera data")
 
-    # Alla kurser
-    if st.sidebar.button("📈 Uppdatera kurser (alla)"):
-        try:
-            # Progress
-            tickers = list(df["Ticker"].astype(str))
-            n = len(tickers)
-            log_changed = {}
-            log_miss = {}
+    if df is None or df.empty or "Ticker" not in df.columns:
+        st.sidebar.info("Ingen data inläst ännu.")
+        return df
 
-            prog = st.sidebar.empty()
-            bar = st.sidebar.progress(0.0, text="Startar...")
+    tickers = sorted([str(t).upper() for t in df["Ticker"].dropna().astype(str).unique() if str(t).strip()])
+    if "upd_selected_ticker" not in st.session_state:
+        st.session_state["upd_selected_ticker"] = tickers[0] if tickers else ""
 
-            df2 = df.copy()
-            for i, tkr in enumerate(tickers, start=1):
-                try:
-                    df2, changed, _ = update_price_for_ticker(df2, tkr)
-                    if changed:
-                        log_changed[tkr] = changed
-                    else:
-                        log_miss[tkr] = ["(ingen förändring)"]
-                except Exception as e:
-                    log_miss[tkr] = [f"error: {e}"]
-                # progress
-                bar.progress(i / n, text=f"Uppdaterar kurser: {i}/{n}")
+    tkr = st.sidebar.selectbox("Välj ticker", tickers, index=max(0, tickers.index(st.session_state["upd_selected_ticker"])) if tickers else 0, key="upd_selected_ticker")
 
-            spara_data(df2, do_snapshot=False)
-            st.session_state["_df_ref"] = df2
-            st.session_state["_last_log"] = {"changed": log_changed, "misses": log_miss}
-            st.sidebar.success("Klart – kurser uppdaterade.")
-            return df2
-        except Exception as e:
-            st.sidebar.error(f"Fel vid uppdatering: {e}")
+    col_u1, col_u2 = st.sidebar.columns(2)
+    do_price = col_u1.button("📉 Uppdatera kurs (snabb)")
+    do_full  = col_u2.button("🔄 Full auto (endast denna)")
 
-    # Enskild ticker
-    tkr = st.sidebar.text_input("Ticker (Yahoo-format) för enskild uppdatering", value="")
-    colU1, colU2 = st.sidebar.columns(2)
-    if tkr:
-        with colU1:
-            if st.button("🔹 Endast kurs (ticker)"):
-                try:
-                    df2, changed, _ = update_price_for_ticker(df.copy(), tkr.strip().upper())
-                    spara_data(df2, do_snapshot=False)
-                    st.session_state["_df_ref"] = df2
-                    st.session_state["_last_log"] = {"changed": {tkr: changed} if changed else {}, "misses": {}}
-                    st.sidebar.success(f"Klar ({tkr}).")
-                    return df2
-                except Exception as e:
-                    st.sidebar.error(f"{tkr}: {e}")
+    df_out = df
 
-        with colU2:
-            if st.button("🔶 Full uppdatering (ticker)"):
-                try:
-                    df2, changed, _ = update_full_for_ticker(df.copy(), tkr.strip().upper())
-                    spara_data(df2, do_snapshot=False)
-                    st.session_state["_df_ref"] = df2
-                    st.session_state["_last_log"] = {"changed": {tkr: changed} if changed else {}, "misses": {}}
-                    st.sidebar.success(f"Klar ({tkr}).")
-                    return df2
-                except Exception as e:
-                    st.sidebar.error(f"{tkr}: {e}")
-
-    return df
-
-
-def _sidebar_batch(df: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🧺 Batch-körning")
-
-    sort_mode = st.sidebar.radio("Ordning", ["Äldst först", "A–Ö"], index=0, horizontal=True)
-    size = st.sidebar.number_input("Batch-storlek", min_value=1, max_value=max(1, len(df)), value=min(10, max(1, len(df))), step=1)
-
-    # Bygg/uppdatera ordning vid behov
-    if (sort_mode != st.session_state["_batch_sort_mode"]) or not st.session_state["_batch_order_cache"]:
-        st.session_state["_batch_sort_mode"] = sort_mode
-        st.session_state["_batch_order_cache"] = _sorted_tickers(df, sort_mode)
-        st.session_state["_batch_cursor"] = 0
-
-    # Visa info
-    total = len(st.session_state["_batch_order_cache"])
-    cur = st.session_state["_batch_cursor"]
-    st.sidebar.write(f"Vald ordning innehåller **{total}** tickers. Nästa startindex: **{cur}**")
-
-    colB1, colB2, colB3 = st.sidebar.columns(3)
-    with colB1:
-        if st.button("↺ Återställ kö"):
-            st.session_state["_batch_cursor"] = 0
-            st.sidebar.info("Batch-kö återställd.")
-    with colB2:
-        pass
-    with colB3:
-        pass
-
-    # Kör batch
-    if st.sidebar.button(f"▶ Kör batch ({int(size)})"):
-        order = st.session_state["_batch_order_cache"]
-        start = st.session_state["_batch_cursor"]
-        end = min(start + int(size), total)
-        subset = order[start:end]
-        if not subset:
-            st.sidebar.warning("Inget mer att köra i denna ordning. Återställ kö om du vill börja om.")
-            return df
-
-        df2 = df.copy()
-        log_changed = {}
-        log_miss = {}
-
-        n = len(subset)
-        bar = st.sidebar.progress(0.0, text=f"Kör batch: 0/{n}")
-        for i, tkr in enumerate(subset, start=1):
+    if do_price:
+        if not _HAVE_UPDATE:
+            st.sidebar.warning("Modulen 'stockapp.update' saknas – kan inte uppdatera kurs.")
+        else:
             try:
-                df2, changed, _ = update_full_for_ticker(df2, tkr)
-                if changed:
-                    log_changed[tkr] = changed
+                # Vi tillåter både (df, user_rates, ticker) och (df, ticker) och (ticker, df)
+                changed = False
+                try:
+                    df2, msg = run_update_price_only(df.copy(), user_rates, tkr)
+                    changed = True
+                except TypeError:
+                    try:
+                        df2, msg = run_update_price_only(df.copy(), tkr)
+                        changed = True
+                    except TypeError:
+                        df2, msg = run_update_price_only(tkr, df.copy())
+                        changed = True
+
+                if changed and isinstance(df2, pd.DataFrame):
+                    try:
+                        spara_data(df2)
+                        df_out = df2
+                        st.sidebar.success(f"Kurs uppdaterad för {tkr}.")
+                        if msg:
+                            st.sidebar.caption(str(msg))
+                    except Exception as e:
+                        st.sidebar.error(f"Kunde inte spara uppdaterad kurs: {e}")
                 else:
-                    log_miss[tkr] = ["(inga nya fält)"]
+                    st.sidebar.info("Ingen förändring upptäcktes.")
             except Exception as e:
-                log_miss[tkr] = [f"error: {e}"]
-            bar.progress(i / n, text=f"Kör batch: {i}/{n}")
+                st.sidebar.error(f"Fel vid kursuppdatering: {e}")
 
-        spara_data(df2, do_snapshot=False)
-        st.session_state["_df_ref"] = df2
-        st.session_state["_last_log"] = {"changed": log_changed, "misses": log_miss}
-        st.session_state["_batch_cursor"] = end
-        st.sidebar.success(f"Klar. Körde {n} tickers (index {start}–{end-1}).")
-        return df2
+    if do_full:
+        if not _HAVE_UPDATE:
+            st.sidebar.warning("Modulen 'stockapp.update' saknas – kan inte göra full auto-uppdatering.")
+        else:
+            try:
+                changed = False
+                # Tillåt olika signaturer beroende på modulens version
+                try:
+                    df2, log, note = run_update_full(df.copy(), user_rates, tkr)
+                    changed = True
+                    extra = note
+                except TypeError:
+                    try:
+                        df2, log, note = run_update_full(df.copy(), tkr, user_rates)
+                        changed = True
+                        extra = note
+                    except TypeError:
+                        df2, log = run_update_full(df.copy(), tkr)
+                        changed = True
+                        extra = None
 
-    return df
+                if changed and isinstance(df2, pd.DataFrame):
+                    try:
+                        spara_data(df2)
+                        df_out = df2
+                        st.sidebar.success(f"Full auto uppdaterad: {tkr}")
+                        if extra:
+                            st.sidebar.caption(str(extra))
+                        if log:
+                            st.sidebar.caption("Logg (kort):")
+                            st.sidebar.json(log, expanded=False)
+                    except Exception as e:
+                        st.sidebar.error(f"Kunde inte spara: {e}")
+                else:
+                    st.sidebar.info("Ingen förändring upptäcktes.")
+            except Exception as e:
+                st.sidebar.error(f"Fel vid full uppdatering: {e}")
 
-
-def _sidebar_logs():
+    # Batch-panel om modul finns
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📒 Senaste körlogg")
-    log = st.session_state.get("_last_log", {})
-    if not log:
-        st.sidebar.info("Ingen körlogg ännu.")
-        return
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        st.sidebar.markdown("**Ändringar**")
-        st.sidebar.json(log.get("changed", {}))
-    with col2:
-        st.sidebar.markdown("**Missar**")
-        st.sidebar.json(log.get("misses", {}))
-
-
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
-def main():
-    _init_session_defaults()
-    st.title(APP_TITLE)
-
-    # Läs data (en gång per session) & säkerställ schema
-    if st.session_state["_df_ref"] is None:
-        df = hamta_data()
-        df = ensure_schema(df)
-        st.session_state["_df_ref"] = df
+    st.sidebar.subheader("🧰 Batch")
+    if _HAVE_BATCH:
+        try:
+            # sidebar_batch_controls förväntas själv hantera UI och körning.
+            # Den kan ev. returnera nytt df om något ändrats, annars None.
+            df2 = sidebar_batch_controls(df_out, user_rates)
+            if isinstance(df2, pd.DataFrame) and not df2.equals(df_out):
+                try:
+                    spara_data(df2)
+                    st.sidebar.success("Batch: ändringar sparade.")
+                    df_out = df2
+                except Exception as e:
+                    st.sidebar.error(f"Batch: kunde inte spara: {e}")
+        except Exception as e:
+            st.sidebar.error(f"Batch-panel fel: {e}")
     else:
-        df = st.session_state["_df_ref"]
+        st.sidebar.info("Batch-modul saknas (stockapp.batch).")
 
-    # Sidopanel – valutakurser först (innan andra knappar)
+    return df_out
+
+# -------------------------------------------------------
+# Huvudkörning
+# -------------------------------------------------------
+def main():
+    st.title("📊 Aktieanalys & Investeringsförslag")
+
+    # Ladda data
+    try:
+        df = hamta_data()
+    except Exception as e:
+        st.error(f"Kunde inte läsa Google Sheet: {e}")
+        df = pd.DataFrame()
+
+    # Säkerställ schema
+    df = ensure_schema(df)
+
+    # Sidopanel: valutakurser
     user_rates = _sidebar_rates()
 
-    # Sidopanel – snabba uppdateringar & batch
-    df = _sidebar_updates(df)
-    df = _sidebar_batch(df)
-    _sidebar_logs()
+    # Sidopanel: uppdateringsverktyg (kan returnera nytt df)
+    df = _sidebar_updates(df, user_rates)
+
+    # Behåll referens
+    st.session_state["_df_ref"] = df
 
     # Meny
-    st.sidebar.markdown("---")
-    meny = st.sidebar.radio("📌 Välj vy", ["Kontroll", "Analys", "Lägg till / uppdatera bolag", "Investeringsförslag", "Portfölj"], index=0)
+    if _HAVE_VIEWS:
+        val = st.sidebar.radio(
+            "📌 Välj vy",
+            ["Investeringsförslag", "Kontroll", "Analys", "Lägg till / uppdatera bolag", "Portfölj"],
+            index=0,
+        )
+    else:
+        val = st.sidebar.radio(
+            "📌 Välj vy",
+            ["Investeringsförslag"],
+            index=0,
+        )
 
-    # Vyer
-    if meny == "Kontroll":
+    # Kör vald vy
+    if val == "Investeringsförslag":
+        # default_style: "growth" eller "income" beroende på vad du vill ha som standard
+        visa_investeringsforslag(st.session_state["_df_ref"], user_rates, default_style="growth")
+
+    elif val == "Kontroll" and _HAVE_VIEWS:
         kontrollvy(st.session_state["_df_ref"])
-    elif meny == "Analys":
-        analysvy(st.session_state["_df_ref"], user_rates)
-    elif meny == "Lägg till / uppdatera bolag":
-        df2 = lagg_till_eller_uppdatera(st.session_state["_df_ref"], user_rates)
-        # Spara ev. ändringar från formen
-        if df2 is not None and not df2.equals(st.session_state["_df_ref"]):
-            spara_data(df2, do_snapshot=False)
-            st.session_state["_df_ref"] = df2
-    elif meny == "Investeringsförslag":
-        visa_investeringsforslag(st.session_state["_df_ref"], user_rates)
-    elif meny == "Portfölj":
-        visa_portfolj(st.session_state["_df_ref"], user_rates)
 
+    elif val == "Analys" and _HAVE_VIEWS:
+        analysvy(st.session_state["_df_ref"], user_rates)
+
+    elif val == "Lägg till / uppdatera bolag" and _HAVE_VIEWS:
+        df2 = lagg_till_eller_uppdatera(st.session_state["_df_ref"], user_rates)
+        if isinstance(df2, pd.DataFrame) and not df2.equals(st.session_state["_df_ref"]):
+            try:
+                spara_data(df2)
+                st.session_state["_df_ref"] = df2
+                st.success("Ändringar sparade.")
+            except Exception as e:
+                st.error(f"Kunde inte spara ändringar: {e}")
+
+    elif val == "Portfölj" and _HAVE_VIEWS:
+        visa_portfolj(st.session_state["_df_ref"], user_rates)
 
 if __name__ == "__main__":
     main()

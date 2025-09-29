@@ -25,7 +25,7 @@ def _is_present(val) -> bool:
         v = float(val)
         if np.isnan(v):
             return False
-        # för kvoter och procentsatser kan noll vara giltigt; räkna allt som "present" så länge det inte är NaN
+        # 0 kan vara giltigt; räkna allt som inte NaN
         return True
     except Exception:
         return str(val).strip() != ""
@@ -33,7 +33,6 @@ def _is_present(val) -> bool:
 def _coverage_fields(mode: str) -> List[str]:
     if mode == "Utdelning":
         return [
-            # utdelningsfokus
             "Årlig utdelning",
             "Aktuell kurs",
             "Market Cap",
@@ -42,8 +41,8 @@ def _coverage_fields(mode: str) -> List[str]:
             "Debt/Equity",
             "Bruttomarginal (%)",
             "Netto-marginal (%)",
-            "Utdelningskvot FCF (%)",   # om du har denna
-            "Utdelningskvot Vinst (%)"  # om du har denna
+            "Utdelningskvot FCF (%)",
+            "Utdelningskvot Vinst (%)",
         ]
     # Tillväxt
     return [
@@ -79,8 +78,7 @@ def _potential_pct(row: pd.Series, riktkurs_col: str) -> float:
 
 def _normalize_potential(pct: float) -> float:
     """
-    Begränsa och normalisera potential. -50%..+150% ⇒ 0..1 (linjärt).
-    Stora extrema värden får inte dominera.
+    Begränsa och normalisera potential. -50%..+150% ⇒ 0..1.
     """
     lo, hi = -50.0, 150.0
     x = max(lo, min(hi, pct))
@@ -120,8 +118,13 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
     if sektor != "Alla":
         base = base[base.get("Sektor", "").astype(str) == sektor]
 
-    # Risklabel filtrering
-    base["_RiskLabel"] = base.get("Market Cap", 0).apply(risk_label_from_mcap)
+    # Robust risklabel även om "Market Cap" saknas
+    if "Market Cap" in base.columns:
+        mcap_series = pd.to_numeric(base["Market Cap"], errors="coerce")
+    else:
+        mcap_series = pd.Series([np.nan] * len(base), index=base.index, dtype="float64")
+    base["_RiskLabel"] = mcap_series.apply(risk_label_from_mcap)
+
     if risk_choice != "Alla":
         base = base[base["_RiskLabel"] == risk_choice]
 
@@ -139,9 +142,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]) -> 
         base["_BaseScore"] = base.apply(lambda r: growth_score(r, riktkurs_col=riktkurs_val), axis=1)
 
     # Slutlig poäng med stark vikt på täckning
-    #   - coverage exponent 1.25 straffar låg täckning mer
-    #   - + 15 * coverage ger alltid lite upp för fler datapunkter
-    #   - + 0.2 * potential_norm (lätt studs från riktkurs)
     base["_FinalScore"] = (
         base["_BaseScore"] * (base["_Coverage"] ** 1.25)
         + 15.0 * base["_Coverage"]

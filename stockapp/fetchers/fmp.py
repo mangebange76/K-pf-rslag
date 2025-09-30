@@ -1,195 +1,171 @@
 # -*- coding: utf-8 -*-
 """
 FinancialModelingPrep (FMP) fetcher
-Returnerar (data, facts, log) för en ticker.
-- data  : dict med nyckeltal (svenska fältnamn som i appen)
-- facts : dict med {fält: "FMP/<endpoint>"} för spårbarhet
-- log   : list[str] med händelser
-Kräver st.secrets["FMP_API_KEY"].
+
+Publik:
+    fetch_fmp(ticker: str) -> (data: dict, status_code: int, source: str)
+
+Hämtar:
+  - Namn, Sektor, Bransch
+  - Senaste kurs, Market Cap, Utestående aktier (milj.)
+  - P/S (beräknat) samt P/S Q1..Q4 via rullande TTM (4 kvartal)
+  - Marginaler: Bruttomarginal, Operating margin, Net margin
+  - Debt/Equity, P/B, Dividend yield (om tillgängligt)
+
+Kräver:
+  st.secrets["FMP_API_KEY"]
+Valfritt:
+  st.secrets["FMP_BASE"] (default: https://financialmodelingprep.com)
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple, Optional
-import time
+from typing import Dict, Any, Tuple, Optional, List
+from datetime import datetime
 import requests
 import streamlit as st
 
-FMP_BASE = st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
-FMP_KEY  = st.secrets.get("FMP_API_KEY", "")
+TIMEOUT = 15
 
-def _get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20):
-    if not params:
+
+# ---------------------------- helpers ----------------------------
+def _base() -> str:
+    return st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
+
+
+def _apikey() -> str:
+    return st.secrets.get("FMP_API_KEY", "")
+
+
+def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], int]:
+    if params is None:
         params = {}
-    params["apikey"] = FMP_KEY
-    url = f"{FMP_BASE}{path}"
-    r = requests.get(url, params=params, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code} for {url}")
-    js = r.json()
-    return js if js is not None else {}
-
-def _safe_float(x) -> Optional[float]:
+    params = dict(params)
+    k = _apikey()
+    if k:
+        params["apikey"] = k
+    url = f"{_base()}{path}"
     try:
-        if x in (None, "", "NaN"):
-            return None
-        return float(x)
+        r = requests.get(url, params=params, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return None, r.status_code
+        j = r.json()
+        return j, r.status_code
     except Exception:
-        return None
+        return None, 599
 
-def fetch_fmp(ticker: str) -> Tuple[Dict[str, Any], Dict[str, str], List[str]]:
+
+def _take_first(lst: Any) -> Dict[str, Any]:
+    if isinstance(lst, list) and lst:
+        if isinstance(lst[0], dict):
+            return lst[0]
+    return {}
+
+
+def _sum4(qvals: List[float], start: int) -> Optional[float]:
+    seg = qvals[start:start+4]
+    if len(seg) == 4 and all(x is not None for x in seg):
+        return float(sum(seg))
+    return None
+
+
+# ---------------------------- core fetch ----------------------------
+def fetch_fmp(ticker: str) -> Tuple[Dict[str, Any], int, str]:
     """
-    Huvudfunktion. Hämtar profil/quote/ttm-mått/balans/kassaflöde m.m.
+    Returnerar (data, status_code, "FMP").
+    data är anpassad till vårt schema.
     """
-    data: Dict[str, Any]  = {}
-    facts: Dict[str, str] = {}
-    log:  List[str]       = []
+    if not _apikey():
+        # Svara tydligt att FMP ej aktivt – låt orchestrator falla vidare.
+        return {}, 460, "FMP (saknar API-nyckel)"
 
-    if not FMP_KEY:
-        log.append("FMP: Ingen API-nyckel – hoppar över.")
-        return data, facts, log
+    # 1) Profil + quote
+    prof, sc1 = _get(f"/api/v3/profile/{ticker}")
+    quote, sc2 = _get(f"/api/v3/quote/{ticker}")
 
-    t0 = time.time()
+    # 2) Kvartals-IS för TTM-bygge (8 st räcker)
+    inc_q, sc3 = _get(f"/api/v3/income-statement/{ticker}", {"period": "quarter", "limit": 8})
 
-    # --- Profile (bolagsnamn, sektor/industri, utdelningsdetaljer mm)
-    try:
-        prof = _get(f"/api/v3/profile/{ticker}")
-        if isinstance(prof, list) and prof:
-            p = prof[0]
-            if p.get("companyName"):
-                data["Namn"] = p["companyName"]; facts["Namn"] = "FMP/profile"
-            if p.get("sector"):
-                data["Sektor"] = p["sector"];     facts["Sektor"] = "FMP/profile"
-            if p.get("industry"):
-                data["Bransch"] = p["industry"];   facts["Bransch"] = "FMP/profile"
-            # Trailing dividend yield (om tillgänglig)
-            dy = _safe_float(p.get("lastDiv"))
-            px = _safe_float(p.get("price"))
-            if dy is not None and px and px > 0:
-                # grov annualiserad yield om lastDiv är kvartalsutdelning
-                data["Dividend yield (%)"] = float(dy * 4.0 / px * 100.0)
-                facts["Dividend yield (%)"] = "FMP/profile(lastDiv)"
-    except Exception as e:
-        log.append(f"FMP profile: {e}")
+    # 3) Ratios TTM (marginaler, D/E, P/B, Dividend yield)
+    ratios_ttm, sc4 = _get(f"/api/v3/ratios-ttm/{ticker}", {"limit": 1})
 
-    # --- Quote (pris, market cap, antal aktier)
-    try:
-        q = _get(f"/api/v3/quote/{ticker}")
-        if isinstance(q, list) and q:
-            q0 = q[0]
-            mcap  = _safe_float(q0.get("marketCap"))
-            price = _safe_float(q0.get("price"))
-            shares = _safe_float(q0.get("sharesOutstanding"))
+    # Om ALLT failar -> ge upp
+    if all(sc not in (200,) for sc in (sc1, sc2, sc3, sc4)):
+        return {}, (sc1 or sc2 or sc3 or sc4 or 599), "FMP"
 
-            if mcap is not None:
-                data["Market Cap"] = float(mcap)
-                facts["Market Cap"] = "FMP/quote"
-            if shares is not None:
-                data["Utestående aktier (milj.)"] = float(shares) / 1e6
-                facts["Utestående aktier (milj.)"] = "FMP/quote"
-            if price is not None:
-                data["Senaste kurs"] = float(price)
-                facts["Senaste kurs"] = "FMP/quote"
-    except Exception as e:
-        log.append(f"FMP quote: {e}")
+    info: Dict[str, Any] = {}
 
-    # --- Key metrics TTM (P/B, FCF yield, ROE, mm)
-    try:
-        km = _get(f"/api/v3/key-metrics-ttm/{ticker}")
-        if isinstance(km, list) and km:
-            k0 = km[0]
-            pb = _safe_float(k0.get("pbRatioTTM")) or _safe_float(k0.get("priceToBookRatioTTM"))
-            if pb is not None:
-                data["P/B"] = float(pb); facts["P/B"] = "FMP/key-metrics-ttm"
+    # -------- profil/quote --------
+    p = _take_first(prof)
+    q = _take_first(quote)
 
-            roe = _safe_float(k0.get("roeTTM")) or _safe_float(k0.get("returnOnEquityTTM"))
-            if roe is not None:
-                data["ROE (%)"] = float(roe) * 100.0; facts["ROE (%)"] = "FMP/key-metrics-ttm"
+    name = p.get("companyName") or p.get("companyNameShort") or p.get("symbol")
+    sector = p.get("sector")
+    industry = p.get("industry")
 
-            fcf_ttm = _safe_float(k0.get("freeCashFlowTTM"))
-            if fcf_ttm is not None:
-                data["FCF (TTM)"] = float(fcf_ttm); facts["FCF (TTM)"] = "FMP/key-metrics-ttm"
-                if data.get("Market Cap") and data["Market Cap"] > 0:
-                    data["FCF Yield (%)"] = float(fcf_ttm) / float(data["Market Cap"]) * 100.0
-                    facts["FCF Yield (%)"] = "FMP/key-metrics-ttm"
-    except Exception as e:
-        log.append(f"FMP key-metrics-ttm: {e}")
+    price = q.get("price", p.get("price"))
+    mcap = q.get("marketCap", p.get("mktCap"))
+    shares = q.get("sharesOutstanding", p.get("sharesOutstanding"))
 
-    # --- Ratios TTM (marginaler mm)
-    try:
-        rr = _get(f"/api/v3/ratios-ttm/{ticker}")
-        if isinstance(rr, list) and rr:
-            r0 = rr[0]
-            gm = _safe_float(r0.get("grossProfitMarginTTM"))
-            om = _safe_float(r0.get("operatingProfitMarginTTM"))
-            nm = _safe_float(r0.get("netProfitMarginTTM"))
-            if gm is not None:
-                data["Bruttomarginal (%)"] = float(gm) * 100.0; facts["Bruttomarginal (%)"] = "FMP/ratios-ttm"
-            if om is not None:
-                data["Operating margin (%)"] = float(om) * 100.0; facts["Operating margin (%)"] = "FMP/ratios-ttm"
-            if nm is not None:
-                data["Net margin (%)"] = float(nm) * 100.0; facts["Net margin (%)"] = "FMP/ratios-ttm"
-    except Exception as e:
-        log.append(f"FMP ratios-ttm: {e}")
+    info["Namn"] = name
+    info["Sektor"] = sector
+    info["Bransch"] = industry
+    info["Senaste kurs"] = float(price) if isinstance(price, (int, float)) else None
+    info["Market Cap"] = float(mcap) if isinstance(mcap, (int, float)) else None
+    info["Utestående aktier (milj.)"] = (float(shares) / 1e6) if isinstance(shares, (int, float)) else None
 
-    # --- Income statement TTM (EBITDA, för nettoskuld/EBITDA)
-    ebitda_ttm: Optional[float] = None
-    try:
-        ist = _get(f"/api/v3/income-statement-ttm/{ticker}")
-        if isinstance(ist, list) and ist:
-            ebitda_ttm = _safe_float(ist[0].get("ebitdaTTM"))
-    except Exception as e:
-        log.append(f"FMP income-statement-ttm: {e}")
+    # -------- ratios (TTM) --------
+    rt = _take_first(ratios_ttm)
+    # marginaler i procent
+    gm = rt.get("grossProfitMarginTTM")
+    opm = rt.get("operatingProfitMarginTTM")
+    npm = rt.get("netProfitMarginTTM")
+    de = rt.get("debtEquityRatioTTM")
+    pb = rt.get("priceToBookRatioTTM")
+    dy = rt.get("dividendYieldTTM")  # ibland None för tillväxtbolag
 
-    # --- Balance sheet (skuld, kassa, equity) och Debt/Equity
-    total_debt = None
-    cash_eq = None
-    equity = None
-    try:
-        bs = _get(f"/api/v3/balance-sheet-statement/{ticker}", params={"limit": 1, "period": "quarter"})
-        if isinstance(bs, list) and bs:
-            b0 = bs[0]
-            total_debt = _safe_float(b0.get("totalDebt")) or _safe_float(b0.get("shortLongTermDebtTotal"))
-            cash_eq    = _safe_float(b0.get("cashAndCashEquivalents"))
-            equity     = _safe_float(b0.get("totalStockholdersEquity")) or _safe_float(b0.get("totalEquity"))
-            if cash_eq is not None:
-                data["Kassa"] = float(cash_eq); facts["Kassa"] = "FMP/balance-sheet"
-            if equity and total_debt is not None and equity != 0:
-                data["Debt/Equity"] = float(total_debt) / float(equity)
-                facts["Debt/Equity"] = "FMP/balance-sheet"
-    except Exception as e:
-        log.append(f"FMP balance-sheet: {e}")
+    info["Bruttomarginal (%)"] = float(gm) * 100.0 if isinstance(gm, (int, float)) else None
+    info["Operating margin (%)"] = float(opm) * 100.0 if isinstance(opm, (int, float)) else None
+    info["Net margin (%)"] = float(npm) * 100.0 if isinstance(npm, (int, float)) else None
+    info["Debt/Equity"] = float(de) if isinstance(de, (int, float)) else None
+    info["P/B"] = float(pb) if isinstance(pb, (int, float)) else None
+    info["Dividend yield (%)"] = float(dy) * 100.0 if isinstance(dy, (int, float)) else None
 
-    # --- Net debt/EBITDA
-    try:
-        if total_debt is not None and ebitda_ttm and ebitda_ttm != 0:
-            net_debt = float(total_debt) - float(cash_eq or 0.0)
-            data["Net debt / EBITDA"] = float(net_debt) / float(ebitda_ttm)
-            facts["Net debt / EBITDA"] = "FMP(balance+income-ttm)"
-    except Exception as e:
-        log.append(f"FMP ND/EBITDA: {e}")
+    # -------- P/S (TTM) + historik --------
+    q_rows = inc_q if isinstance(inc_q, list) else []
+    # FMP kvartalsfält är "revenue"
+    q_pairs: List[Tuple[str, Optional[float]]] = []
+    for row in q_rows:
+        d = row.get("date")  # '2025-01-26' etc
+        rev = row.get("revenue")
+        if d:
+            try:
+                # validera datum
+                datetime.fromisoformat(d)
+                q_pairs.append((d, float(rev) if isinstance(rev, (int, float)) else None))
+            except Exception:
+                pass
+    # nyast först
+    q_pairs.sort(key=lambda x: x[0], reverse=True)
 
-    # --- Dividend payout vs FCF (grovt): summan utdelningar TTM / FCF TTM
-    try:
-        divs = _get(f"/api/v3/historical-price-full/stock_dividend/{ticker}", params={"serietype": "line"})
-        ttm_div = 0.0
-        if isinstance(divs, dict):
-            hist = divs.get("historical", []) or []
-            # summera ~senaste 4 st (om kvartalsutdelare)
-            for d in hist[:4]:
-                v = _safe_float(d.get("dividend"))
-                if v:
-                    ttm_div += float(v)
-        # multiplicera per aktie med antal aktier ≈ market cap / price
-        price = data.get("Senaste kurs")
-        mcap  = data.get("Market Cap")
-        fcf   = data.get("FCF (TTM)")
-        if price and mcap and fcf and fcf != 0 and ttm_div > 0:
-            approx_shares = float(mcap) / float(price)
-            total_div_cash = ttm_div * approx_shares
-            data["Dividend payout (FCF) (%)"] = float(total_div_cash) / float(fcf) * 100.0
-            facts["Dividend payout (FCF) (%)"] = "FMP/stock_dividend + quote + FCF"
-    except Exception as e:
-        log.append(f"FMP payout(FCF) beräkning: {e}")
+    q_vals = [v for _, v in q_pairs]
+    q_dates = [d for d, _ in q_pairs]
 
-    log.append(f"FMP klart på {time.time() - t0:.2f}s")
-    return data, facts, log
+    # TTM revenue (nyaste 4)
+    ttm = _sum4(q_vals, 0)
+    if ttm and info.get("Market Cap"):
+        info["P/S"] = float(info["Market Cap"]) / float(ttm)
+    else:
+        info["P/S"] = None  # ingen tvingad fallback om vi inte har båda delarna
+    # Yahoo-nyckeln finns inte här – lämna None
+    info["P/S (Yahoo)"] = None
+
+    # P/S Q1..Q4 via rullande fönster, baserat på NUVARANDE mcap (approx)
+    for idx, label in enumerate(["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]):
+        ps_val = None
+        if info.get("Market Cap"):
+            ttm_i = _sum4(q_vals, idx)
+            if ttm_i and ttm_i > 0:
+                ps_val = float(info["Market Cap"]) / float(ttm_i)
+        info[label] = ps_val
+
+    return info, 200, "FMP"

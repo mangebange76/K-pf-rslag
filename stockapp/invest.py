@@ -2,310 +2,324 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from .rates import hamta_valutakurs
-from .utils import safe_float
+from .utils import format_large_number
 
-# ------------------------------------------------------------
-# Hjälpare
-# ------------------------------------------------------------
-def risk_label_from_mcap(mcap: float) -> str:
-    if mcap is None or np.isnan(mcap) or mcap <= 0:
+# ---------------------------------------------------------------------
+# Hjälpfunktioner
+# ---------------------------------------------------------------------
+def _risk_label_from_mcap(mcap: float) -> str:
+    """
+    Enkelt risklabel baserat på market cap i lokal valuta.
+    Trösklarna är ungefärliga och kan justeras.
+    """
+    if mcap is None or not np.isfinite(mcap) or mcap <= 0:
         return "Okänd"
-    # USD kap-segment (kan justeras vid behov)
-    # Micro <0.3B, Small <2B, Mid <10B, Large <200B, Mega >=200B
-    if mcap < 3e8:
+    # Trösklar (miljoner i lokal valuta): <300 => Micro, <2 000 => Small, <10 000 => Mid, <200 000 => Large, annars Mega
+    if mcap < 300:           # < 0.3 B
         return "Micro"
-    if mcap < 2e9:
+    if mcap < 2_000:         # < 2 B
         return "Small"
-    if mcap < 1e10:
+    if mcap < 10_000:        # < 10 B
         return "Mid"
-    if mcap < 2e11:
+    if mcap < 200_000:       # < 200 B
         return "Large"
     return "Mega"
 
-def _get_shares_outstanding(row: pd.Series) -> Optional[float]:
-    for col in ["Utestående aktier", "Shares Outstanding", "Antal utestående aktier"]:
+
+def _safe_float(x) -> Optional[float]:
+    try:
+        v = float(x)
+        if np.isfinite(v):
+            return v
+        return None
+    except Exception:
+        return None
+
+
+def _pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """
+    Procentuell skillnad (a/b - 1). Returnerar None om omöjligt.
+    """
+    if a is None or b is None:
+        return None
+    if b == 0:
+        return None
+    return a / b - 1.0
+
+
+def _winsorize(series: pd.Series, p: float = 0.02) -> pd.Series:
+    """
+    Skär av extrema outliers (för robustare normalisering).
+    """
+    if series.empty:
+        return series
+    lo = series.quantile(p)
+    hi = series.quantile(1 - p)
+    return series.clip(lower=lo, upper=hi)
+
+
+def _normalize_higher_better(s: pd.Series) -> pd.Series:
+    """
+    0–1 normalisering där högre är bättre.
+    """
+    s2 = _winsorize(s.astype(float))
+    mn, mx = s2.min(), s2.max()
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx - mn == 0:
+        return pd.Series([0.5] * len(s), index=s.index)
+    return (s2 - mn) / (mx - mn)
+
+
+def _normalize_lower_better(s: pd.Series) -> pd.Series:
+    """
+    0–1 normalisering där lägre är bättre.
+    """
+    return 1.0 - _normalize_higher_better(s)
+
+
+def _calc_target_price_row(row: pd.Series) -> Optional[float]:
+    """
+    Räkna riktkurs om den inte finns:
+    pris = (P/S-snitt * Omsättning nästa år [miljoner]) / Utestående aktier [miljoner]
+    Antas vara i samma valuta som aktien.
+    """
+    # Om det redan finns en riktkurs för 1 år – använd den
+    for col in ["Riktkurs om 1 år", "Riktkurs idag"]:
         if col in row.index:
-            v = safe_float(row[col], None)
+            v = _safe_float(row.get(col))
             if v and v > 0:
-                return v
+                return float(v)
+
+    ps_s = _safe_float(row.get("P/S-snitt"))
+    rev_next = _safe_float(row.get("Omsättning nästa år"))
+    shares_m = _safe_float(row.get("Utestående aktier"))
+    if ps_s and rev_next and shares_m and shares_m > 0:
+        return float((ps_s * rev_next) / shares_m)
     return None
 
-def _ps_avg_from_row(row: pd.Series) -> Optional[float]:
-    # Primärt snitt av Q1..Q4 om de finns, annars fallback på "P/S snitt (4)", därefter "P/S"
-    qcols = [c for c in ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"] if c in row.index]
-    vals = []
-    for c in qcols:
-        v = safe_float(row[c], None)
-        if v is not None and v > 0 and v < 1e5:
-            vals.append(v)
-    if len(vals) >= 2:
-        return float(np.mean(vals))
-    if "P/S snitt (4)" in row.index:
-        v = safe_float(row["P/S snitt (4)"], None)
-        if v and v > 0 and v < 1e5:
-            return float(v)
-    if "P/S" in row.index:
-        v = safe_float(row["P/S"], None)
-        if v and v > 0 and v < 1e5:
-            return float(v)
+
+def _completeness_score(row: pd.Series, expected_cols: List[str]) -> float:
+    """
+    Hur komplett radens data är (0..1). Bara kolumner som faktiskt existerar i df räknas.
+    """
+    have = 0
+    total = 0
+    for c in expected_cols:
+        if c in row.index:
+            total += 1
+            if row.get(c) not in (None, "", np.nan):
+                try:
+                    # För numeriska: kräver finite
+                    if isinstance(row.get(c), (int, float, np.floating)):
+                        if np.isfinite(float(row.get(c))):
+                            have += 1
+                    else:
+                        have += 1
+                except Exception:
+                    pass
+    if total == 0:
+        return 0.3  # minimistraff om vi inte vet något alls om schemat
+    return have / total
+
+
+def _valuation_gap(row: pd.Series) -> Optional[float]:
+    """
+    Gap = target_price / current_price - 1.
+    """
+    cur = _safe_float(row.get("Aktuell kurs"))
+    tgt = _calc_target_price_row(row)
+    if cur and tgt:
+        return tgt / cur - 1.0
     return None
 
-def _currency(row: pd.Series) -> str:
-    v = str(row.get("Valuta", "USD") or "USD").upper().strip()
-    return v if v else "USD"
 
-def _sector(row: pd.Series) -> str:
-    return str(row.get("Sector", "Unknown") or "Unknown")
+def _label_from_gap_and_score(gap: Optional[float], score: Optional[float]) -> str:
+    """
+    Köp/Håll/Trimma/Sälj baserat på värderingsgap och totalpoäng.
+    Tydliga trösklar som kan finjusteras.
+    """
+    if gap is None or score is None:
+        return "Osäker"
 
-def _industry(row: pd.Series) -> str:
-    return str(row.get("Industry", "") or "")
+    # Gap i %
+    g = gap * 100.0
 
-def _fmt_money(v: Optional[float]) -> str:
-    if v is None or np.isnan(v):
-        return "-"
-    # skriv i tusentals/miljoner/miljarder/triljoner
-    abs_v = abs(v)
-    if abs_v >= 1e12:
-        return f"{v/1e12:.2f} T"
-    if abs_v >= 1e9:
-        return f"{v/1e9:.2f} B"
-    if abs_v >= 1e6:
-        return f"{v/1e6:.2f} M"
-    if abs_v >= 1e3:
-        return f"{v/1e3:.2f} k"
-    return f"{v:.0f}"
+    # Grov tröskellogik:
+    if g >= 30 and score >= 0.65:
+        return "Köp"
+    if g >= 10 and score >= 0.55:
+        return "Överväg köp"
+    if -10 <= g < 10:
+        return "Behåll"
+    if g < -10 and score < 0.55:
+        return "Trimma"
+    if g < -25 and score < 0.50:
+        return "Sälj"
+    return "Behåll"
 
-def _fmt_pct(v: Optional[float]) -> str:
-    if v is None or np.isnan(v):
-        return "-"
-    return f"{v:.2f}%"
 
-def _present_cols(row: pd.Series, cols: List[str]) -> int:
-    n = 0
-    for c in cols:
-        if c in row.index and pd.notna(row[c]) and str(row[c]).strip() != "":
-            n += 1
-    return n
+# ---------------------------------------------------------------------
+# Viktning per fokus och per sektor
+# ---------------------------------------------------------------------
+DEFAULT_EXPECTED_COLS = [
+    "Aktuell kurs", "P/S", "P/S-snitt", "Omsättning idag", "Omsättning nästa år",
+    "Utestående aktier", "Market Cap", "Bruttomarginal (%)", "Nettomarginal (%)",
+    "Debt/Equity", "EV/EBITDA", "FCF (ttm)", "Kassa & ekvivalenter", "Utdelningsyield (%)"
+]
 
-# ------------------------------------------------------------
-# Sektorsvikter (förenklat – fallback om du inte har i config)
-# ------------------------------------------------------------
-# Poängsättning bygger på 0..1-normalisering lokalt per kolumn (robust z/percentil)
-# och sektorspecifika vikter. Saknas en kolumn → vikt ignoreras och omfördelas.
-_DEFAULT_SECTOR_WEIGHTS: Dict[str, Dict[str, float]] = {
-    # generella nycklar: 'ps', 'gm', 'nm', 'ev_ebitda', 'de', 'fcy', 'runway', 'dy', 'payout_cfo'
-    "Technology": {"ps": 0.35, "gm": 0.15, "nm": 0.10, "ev_ebitda": 0.15, "de": 0.05, "fcy": 0.10, "runway": 0.10},
-    "Communication Services": {"ps": 0.30, "gm": 0.10, "nm": 0.10, "ev_ebitda": 0.20, "de": 0.05, "fcy": 0.10, "runway": 0.15},
-    "Consumer Discretionary": {"ps": 0.30, "gm": 0.10, "nm": 0.10, "ev_ebitda": 0.20, "de": 0.05, "fcy": 0.10, "runway": 0.15},
-    "Health Care": {"ps": 0.30, "gm": 0.10, "nm": 0.10, "ev_ebitda": 0.20, "de": 0.05, "fcy": 0.10, "runway": 0.15},
-    "Financials": {"ps": 0.15, "gm": 0.05, "nm": 0.20, "ev_ebitda": 0.25, "de": 0.10, "fcy": 0.10, "runway": 0.15},
-    "Industrials": {"ps": 0.25, "gm": 0.10, "nm": 0.10, "ev_ebitda": 0.25, "de": 0.10, "fcy": 0.10, "runway": 0.10},
-    "Materials": {"ps": 0.20, "gm": 0.10, "nm": 0.10, "ev_ebitda": 0.25, "de": 0.10, "fcy": 0.10, "runway": 0.15},
-    "Energy": {"ps": 0.15, "gm": 0.05, "nm": 0.10, "ev_ebitda": 0.30, "de": 0.10, "fcy": 0.15, "runway": 0.15, "dy": 0.05, "payout_cfo": 0.05},
-    "Utilities": {"ps": 0.10, "gm": 0.05, "nm": 0.15, "ev_ebitda": 0.25, "de": 0.20, "fcy": 0.10, "runway": 0.10, "dy": 0.05, "payout_cfo": 0.05},
-    "Real Estate": {"ps": 0.10, "gm": 0.05, "nm": 0.10, "ev_ebitda": 0.35, "de": 0.15, "fcy": 0.15, "runway": 0.10},
-    "Consumer Staples": {"ps": 0.15, "gm": 0.15, "nm": 0.15, "ev_ebitda": 0.25, "de": 0.10, "fcy": 0.10, "runway": 0.10},
-    "Unknown": {"ps": 0.25, "gm": 0.10, "nm": 0.10, "ev_ebitda": 0.25, "de": 0.05, "fcy": 0.10, "runway": 0.15},
+# Basvikter (Mix)
+BASE_WEIGHTS = {
+    "P/S-snitt_rel": 0.18,        # lägre än sektor-median är bra
+    "GrossMargin": 0.12,          # högre bättre
+    "NetMargin": 0.12,            # högre bättre
+    "DebtToEquity": 0.14,         # lägre bättre
+    "EVEBITDA_rel": 0.12,         # lägre bättre (om finns)
+    "FCF_Positive": 0.10,         # positivt FCF premieras
+    "DividendYield": 0.07,        # högre bättre (men inte allt)
+    "ValuationGap": 0.15          # högre bättre
 }
 
-# nycklar → kolumnnamn i df
-_COLMAP = {
-    "ps": None,  # hanteras via _ps_avg_from_row
-    "gm": "Bruttomarginal (%)",
-    "nm": "Netto-marginal (%)",
-    "ev_ebitda": "EV/EBITDA",
-    "de": "Skuldsättning (Debt/Equity)",
-    "fcy": "FCF (milj)",         # free cash flow i miljoner (bolagets valuta)
-    "runway": "Runway (kvartal)",
-    "dy": "Direktavkastning (%)",
-    "payout_cfo": "Payout ratio (CFO) (%)",
+# Justering per fokus
+FOCUS_ADJUST = {
+    "Mix":   {"DividendYield": 1.0, "ValuationGap": 1.0, "P/S-snitt_rel": 1.0, "EVEBITDA_rel": 1.0},
+    "Tillväxt": {"DividendYield": 0.4, "ValuationGap": 1.1, "P/S-snitt_rel": 1.2, "EVEBITDA_rel": 0.9},
+    "Utdelning": {"DividendYield": 1.6, "ValuationGap": 0.9, "P/S-snitt_rel": 0.8, "EVEBITDA_rel": 1.1},
 }
 
-# ------------------------------------------------------------
-# Normalisering och score
-# ------------------------------------------------------------
-def _winsorize_series(s: pd.Series, low_q=0.05, high_q=0.95) -> pd.Series:
-    s = s.astype(float)
-    lo = s.quantile(low_q)
-    hi = s.quantile(high_q)
-    s = s.clip(lower=lo, upper=hi)
-    return s
+# Sektorspecifika nyanser (lätta, så det funkar även när data saknas)
+SECTOR_TILT = {
+    "Technology":   {"P/S-snitt_rel": 1.15, "GrossMargin": 1.1, "EVEBITDA_rel": 0.9},
+    "Consumer Cyclical": {"P/S-snitt_rel": 1.05, "NetMargin": 1.05},
+    "Consumer Defensive": {"DividendYield": 1.2, "DebtToEquity": 1.05},
+    "Healthcare":   {"GrossMargin": 1.1, "NetMargin": 1.05},
+    "Energy":       {"EVEBITDA_rel": 1.2, "DebtToEquity": 1.1, "DividendYield": 1.1},
+    "Financial Services": {"EVEBITDA_rel": 1.15, "DebtToEquity": 1.15},
+    "Industrials":  {"EVEBITDA_rel": 1.1, "NetMargin": 1.05},
+    "Materials":    {"EVEBITDA_rel": 1.1, "DebtToEquity": 1.05},
+    "Utilities":    {"DividendYield": 1.4, "DebtToEquity": 1.1},
+    "Real Estate":  {"DividendYield": 1.5, "DebtToEquity": 1.15},
+}
 
-def _normalize_positive_good(s: pd.Series) -> pd.Series:
-    s = _winsorize_series(s.dropna())
-    if s.empty or s.max() == s.min():
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - s.min()) / (s.max() - s.min())
 
-def _normalize_negative_good(s: pd.Series) -> pd.Series:
-    # lägre är bättre (t.ex. EV/EBITDA, Debt/Equity) → invertera
-    pos = _normalize_positive_good(s)
-    return 1.0 - pos
-
-def _build_scoring_table(df: pd.DataFrame) -> pd.DataFrame:
+def _sector_weighted_score(df: pd.DataFrame, focus: str) -> pd.Series:
+    """
+    Räknar ut en totalpoäng 0..1 per rad, med sektorvikter och fokusjustering.
+    Använder robust normalisering mot sektormedianer / winsorize.
+    """
     work = df.copy()
 
-    # extrahera ps_avg
-    work["_ps_avg"] = work.apply(_ps_avg_from_row, axis=1)
+    # Sektormedianer för relativa mått
+    def sector_median(col: str) -> pd.Series:
+        if col not in work.columns:
+            return pd.Series([np.nan] * len(work), index=work.index)
+        return work.groupby("Sektor")[col].transform("median")
 
-    # kolumner med normalisering
-    norm_cols = {}
-    # ps → lägre P/S bättre i värderingsperspektiv (negativt bra)
-    if work["_ps_avg"].notna().sum() > 0:
-        s = work["_ps_avg"].astype(float)
-        norm_cols["ps"] = _normalize_negative_good(s[s.notna()])
-    # gm, nm, fcy, runway, dy → högre bättre
-    for key in ["gm", "nm", "fcy", "runway", "dy"]:
-        col = _COLMAP[key]
-        if col in work.columns:
-            s = pd.to_numeric(work[col], errors="coerce")
-            if s.notna().sum() > 0:
-                norm_cols[key] = _normalize_positive_good(s[s.notna()])
-    # ev/ebitda, de, payout_cfo → lägre bättre
-    for key in ["ev_ebitda", "de", "payout_cfo"]:
-        col = _COLMAP[key]
-        if col in work.columns:
-            s = pd.to_numeric(work[col], errors="coerce")
-            if s.notna().sum() > 0:
-                norm_cols[key] = _normalize_negative_good(s[s.notna()])
-
-    # init score=0
-    work["_score_raw"] = 0.0
-    work["_score_terms"] = 0.0  # antal faktiskt vägda termer för omfördelning
-
-    # räkna ut sektorspecifik viktning per rad
-    def _row_score(ix, row):
-        sector = _sector(row)
-        weights = _DEFAULT_SECTOR_WEIGHTS.get(sector, _DEFAULT_SECTOR_WEIGHTS["Unknown"]).copy()
-
-        # håll bara vikter med data
-        use_weights = {}
-        for k, w in weights.items():
-            if k == "ps" and row["_ps_avg"] is not None:
-                use_weights[k] = w
-            elif k != "ps":
-                col = _COLMAP.get(k)
-                if col and col in df.columns and pd.notna(row.get(col)):
-                    use_weights[k] = w
-
-        if not use_weights:
-            return 0.0, 0
-
-        # normalisera vikter till 1.0
-        s = sum(use_weights.values())
-        if s <= 0:
-            return 0.0, 0
-        for k in list(use_weights.keys()):
-            use_weights[k] = use_weights[k] / s
-
-        # samla ihop normaliserade poäng
-        score = 0.0
-        terms = 0
-        for k, w in use_weights.items():
-            if k == "ps":
-                # hämta normaliserat värde från norm_cols["ps"]
-                if "ps" in norm_cols and ix in norm_cols["ps"].index:
-                    score += w * float(norm_cols["ps"].loc[ix])
-                    terms += 1
-            else:
-                col = _COLMAP[k]
-                if k in norm_cols and ix in norm_cols[k].index:
-                    score += w * float(norm_cols[k].loc[ix])
-                    terms += 1
-                elif col in df.columns and pd.notna(row.get(col)):
-                    # om inte normaliseringsserie innehåller detta index (borde inte hända), räkna 0
-                    terms += 1
-
-        return float(score), int(terms)
-
-    for ix, row in work.iterrows():
-        sc, tm = _row_score(ix, row)
-        work.at[ix, "_score_raw"] = sc
-        work.at[ix, "_score_terms"] = tm
-
-    # datapålitlighet/komplettering – boost om fler nyckeltal finns
-    key_cols = [
-        "Bruttomarginal (%)", "Netto-marginal (%)", "EV/EBITDA", "Skuldsättning (Debt/Equity)",
-        "FCF (milj)", "Kassa (milj)", "Runway (kvartal)",
-        "Direktavkastning (%)", "Payout ratio (CFO) (%)", "Payout ratio (EPS) (%)",
-        "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S snitt (4)"
-    ]
-    present_cnt = work.apply(lambda r: _present_cols(r, key_cols), axis=1)
-    present_max = max(1, int(np.nanmax(present_cnt.values)))  # undvik division med 0
-    completeness = present_cnt / present_max
-    # 60% bas + 40% * completeness
-    work["_score"] = work["_score_raw"] * (0.6 + 0.4 * completeness)
-
-    return work
-
-
-# ------------------------------------------------------------
-# Riktkurs & etiketter
-# ------------------------------------------------------------
-def _compute_targets(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
-    w = df.copy()
-    w["_ps_avg"] = w["_ps_avg"].astype(float)
-    w["_target_price"] = np.nan
-    w["_upside_pct"] = np.nan
-
-    for ix, row in w.iterrows():
-        px = safe_float(row.get("Aktuell kurs"), None)
-        ps_avg = row.get("_ps_avg", None)
-        rev = safe_float(row.get("Omsättning idag"), None)  # i miljoner, bolagets valuta
-        shares = _get_shares_outstanding(row)
-        cur = _currency(row)
-
-        if ps_avg and rev and rev > 0 and shares and shares > 0:
-            # Target mcap (i bolagets valuta) = rev(milj) * 1e6 * ps_avg
-            target_mcap = float(rev) * 1e6 * float(ps_avg)
-            target_price = target_mcap / float(shares)  # i bolagets valuta
-            w.at[ix, "_target_price"] = target_price
-            if px and px > 0:
-                w.at[ix, "_upside_pct"] = (target_price / float(px) - 1.0) * 100.0
-
-    # risklabel
-    if "Market Cap" in w.columns:
-        w["_RiskLabel"] = w["Market Cap"].apply(lambda x: risk_label_from_mcap(safe_float(x, np.nan)))
+    # Bygg features
+    # Relativ P/S mot sektor (lägre bättre)
+    if "P/S-snitt" in work.columns:
+        ps_rel = work["P/S-snitt"] / sector_median("P/S-snitt")
+        work["_feat_ps_rel"] = _normalize_lower_better(ps_rel.replace([np.inf, -np.inf], np.nan).fillna(ps_rel.median()))
     else:
-        w["_RiskLabel"] = "Okänd"
+        work["_feat_ps_rel"] = 0.5
 
-    return w
+    # EV/EBITDA (lägre bättre)
+    if "EV/EBITDA" in work.columns:
+        work["_feat_ebitda_rel"] = _normalize_lower_better(_winsorize(work["EV/EBITDA"].astype(float).replace([np.inf, -np.inf], np.nan).fillna(work["EV/EBITDA"].median())))
+    else:
+        work["_feat_ebitda_rel"] = 0.5
 
-def _valuation_label(upside_pct: Optional[float], score: Optional[float]) -> str:
-    """
-    Kombinerar uppsida och totalpoäng till en etikett.
-    Justera trösklar vid behov.
-    """
-    s = 0.0 if score is None or np.isnan(score) else float(score)
-    u = -999.0 if upside_pct is None or np.isnan(upside_pct) else float(upside_pct)
+    # Debt/Equity (lägre bättre)
+    if "Debt/Equity" in work.columns:
+        work["_feat_de"] = _normalize_lower_better(_winsorize(work["Debt/Equity"].astype(float).replace([np.inf, -np.inf], np.nan).fillna(work["Debt/Equity"].median())))
+    else:
+        work["_feat_de"] = 0.5
 
-    # primär bas på uppsida
-    if u >= 30 and s >= 0.65:
-        return "KÖP (stark)"
-    if u >= 15 and s >= 0.55:
-        return "Köp"
-    if u >= 5 and s >= 0.45:
-        return "Håll / Lägg bevakning"
-    if -10 <= u < 5:
-        return "Fair värderad"
-    if -25 <= u < -10:
-        return "Trimma / försiktig"
-    if u < -25 and s <= 0.45:
-        return "Övervärderad – säljvakt"
-    return "Ok"
+    # Marginaler
+    if "Bruttomarginal (%)" in work.columns:
+        work["_feat_gm"] = _normalize_higher_better(_winsorize(work["Bruttomarginal (%)"].astype(float).fillna(work["Bruttomarginal (%)"].median())))
+    else:
+        work["_feat_gm"] = 0.5
+    if "Nettomarginal (%)" in work.columns:
+        work["_feat_nm"] = _normalize_higher_better(_winsorize(work["Nettomarginal (%)"].astype(float).fillna(work["Nettomarginal (%)"].median())))
+    else:
+        work["_feat_nm"] = 0.5
 
-# ------------------------------------------------------------
-# UI – Investeringsförslag (bläddringsläge som standard)
-# ------------------------------------------------------------
+    # FCF positivt?
+    if "FCF (ttm)" in work.columns:
+        fcf = work["FCF (ttm)"].astype(float)
+        work["_feat_fcfpos"] = (fcf > 0).astype(float)  # 1 om positivt, annars 0
+    else:
+        work["_feat_fcfpos"] = 0.5
+
+    # Utdelningsyield (högre bättre)
+    if "Utdelningsyield (%)" in work.columns:
+        work["_feat_div"] = _normalize_higher_better(_winsorize(work["Utdelningsyield (%)"].astype(float).fillna(0.0)))
+    else:
+        work["_feat_div"] = 0.5
+
+    # Värderingsgap (högre bättre)
+    # Beräkna per rad
+    gaps = []
+    for _, r in work.iterrows():
+        gaps.append(_safe_float(_valuation_gap(r)))
+    gaps = pd.Series([g if g is not None else np.nan for g in gaps], index=work.index)
+    work["_feat_gap"] = _normalize_higher_better(_winsorize(gaps.fillna(gaps.median() if np.isfinite(gaps.median()) else 0.0)))
+
+    # Basvikter + fokusjustering + sektortilt
+    w = BASE_WEIGHTS.copy()
+    adj = FOCUS_ADJUST.get(focus, FOCUS_ADJUST["Mix"])
+    for k in w:
+        if k in adj:
+            w[k] *= adj[k]
+
+    # Sektortilt per rad
+    sector_tilt = []
+    for _, r in work.iterrows():
+        s = r.get("Sektor", "Other")
+        tilt = SECTOR_TILT.get(s, {})
+        sector_tilt.append(tilt)
+    # Beräkna totalpoäng
+    score = (
+        work["_feat_ps_rel"]   * (w["P/S-snitt_rel"]  * np.array([t.get("P/S-snitt_rel", 1.0) for t in sector_tilt])) +
+        work["_feat_gm"]       * (w["GrossMargin"]    * np.array([t.get("GrossMargin", 1.0) for t in sector_tilt])) +
+        work["_feat_nm"]       * (w["NetMargin"]      * np.array([t.get("NetMargin", 1.0) for t in sector_tilt])) +
+        work["_feat_de"]       * (w["DebtToEquity"]   * np.array([t.get("DebtToEquity", 1.0) for t in sector_tilt])) +
+        work["_feat_ebitda_rel"] * (w["EVEBITDA_rel"] * np.array([t.get("EVEBITDA_rel", 1.0) for t in sector_tilt])) +
+        work["_feat_fcfpos"]   * (w["FCF_Positive"]   * np.array([t.get("FCF_Positive", 1.0) for t in sector_tilt])) +
+        work["_feat_div"]      * (w["DividendYield"]  * np.array([t.get("DividendYield", 1.0) for t in sector_tilt])) +
+        work["_feat_gap"]      * (w["ValuationGap"]   * np.array([t.get("ValuationGap", 1.0) for t in sector_tilt]))
+    )
+
+    # Normalisera viktsumman så att summan ~1.0
+    wsum = (
+        (w["P/S-snitt_rel"]) + (w["GrossMargin"]) + (w["NetMargin"]) + (w["DebtToEquity"]) +
+        (w["EVEBITDA_rel"]) + (w["FCF_Positive"]) + (w["DividendYield"]) + (w["ValuationGap"])
+    )
+    score = score / max(wsum, 1e-9)
+
+    # Datakompletthets-penalty per rad
+    expected = DEFAULT_EXPECTED_COLS[:]
+    comp = []
+    for _, r in work.iterrows():
+        comp.append(_completeness_score(r, expected))
+    comp = np.array(comp)
+
+    # Liten exponent för att straffa ofullständighet men inte döma ut helt
+    final_score = np.clip(score * (0.6 + 0.4 * comp), 0.0, 1.0)
+    return pd.Series(final_score, index=work.index)
+
+
+# ---------------------------------------------------------------------
+# Huvudvy
+# ---------------------------------------------------------------------
 def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
-    st.subheader("Investeringsförslag")
+    st.header("🧭 Investeringsförslag")
 
     if df.empty:
         st.info("Inga bolag i databasen ännu.")
@@ -313,152 +327,180 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
 
     base = df.copy()
 
-    # Risklabel (cap-segment)
-    if "Market Cap" in base.columns:
-        base["_RiskLabel"] = base["Market Cap"].apply(lambda x: risk_label_from_mcap(safe_float(x, np.nan)))
-    else:
-        base["_RiskLabel"] = "Okänd"
+    # Risklabel om saknas
+    if "Risklabel" not in base.columns:
+        base["Risklabel"] = base.get("Market Cap", 0).apply(lambda x: _risk_label_from_mcap(_safe_float(x)))
 
-    sectors = ["Alla"] + sorted(list({str(x) for x in base.get("Sector", pd.Series(dtype=str)).fillna("Unknown")}))
-
-    c1, c2, c3 = st.columns([1.2, 1.2, 1])
-    with c1:
-        sector_f = st.selectbox("Filtrera sektor", sectors, index=0)
-    with c2:
-        cap_f = st.selectbox("Filtrera cap-segment", ["Alla", "Micro", "Small", "Mid", "Large", "Mega"], index=0)
-    with c3:
-        view_mode = st.selectbox("Visningsläge", ["Bläddra", "Tabell"], index=0)
+    # Filterpanel
+    cols_f = st.columns([1, 1, 1, 2])
+    with cols_f[0]:
+        fokus = st.selectbox("Fokus", ["Mix", "Tillväxt", "Utdelning"], index=0)
+    with cols_f[1]:
+        sektorer = sorted([s for s in base.get("Sektor", pd.Series(["Okänd"])).dropna().unique().tolist() if s])
+        valda_sektorer = st.multiselect("Sektorfilter", options=sektorer, default=sektorer)
+    with cols_f[2]:
+        risk_opts = ["Micro", "Small", "Mid", "Large", "Mega", "Okänd"]
+        valda_risk = st.multiselect("Risklabel", options=risk_opts, default=risk_opts)
+    with cols_f[3]:
+        cap_filter_tip = "Filtrera bort bolag utan riktkurs-beräkning?"
+        must_have_target = st.checkbox("Kräv beräknad riktkurs", value=False, help=cap_filter_tip)
 
     # Filtrera
-    if sector_f != "Alla":
-        base = base.loc[base["Sector"].fillna("Unknown") == sector_f].copy()
-    if cap_f != "Alla":
-        base = base.loc[base["_RiskLabel"] == cap_f].copy()
+    if "Sektor" in base.columns:
+        base = base[base["Sektor"].isin(valda_sektorer)]
+    base = base[base["Risklabel"].isin(valda_risk)]
+
+    # Beräkna riktkurs och gap
+    tprices = []
+    gaps = []
+    for _, r in base.iterrows():
+        tp = _calc_target_price_row(r)
+        tprices.append(tp)
+        gaps.append(_safe_float(_valuation_gap(r)))
+    base["_TargetPrice"] = tprices
+    base["_ValGap"] = gaps
+
+    if must_have_target:
+        base = base[base["_TargetPrice"].notna()]
 
     if base.empty:
-        st.info("Inga bolag matchade filtret.")
+        st.warning("Inga bolag matchar filtren.")
         return
 
-    # Scoring
-    scored = _build_scoring_table(base)
+    # Totalpoäng sektor-viktad
+    score = _sector_weighted_score(base, fokus)
+    base["_Score"] = score
 
-    # Targets & uppsida
-    scored = _compute_targets(scored, user_rates)
-    scored["_ValuationLabel"] = scored.apply(lambda r: _valuation_label(r.get("_upside_pct"), r.get("_score")), axis=1)
+    # Köp/Håll/Trimma/Sälj
+    labels = []
+    for _, r in base.iterrows():
+        labels.append(_label_from_gap_and_score(r["_ValGap"], r["_Score"]))
+    base["_Betyg"] = labels
 
-    # sortering (högst score överst)
-    scored = scored.sort_values(by=["_score", "_upside_pct"], ascending=[False, False])
+    # Sortera på totalpoäng (högst först)
+    base = base.sort_values(by="_Score", ascending=False).reset_index(drop=True)
 
-    # Visning
-    if view_mode == "Tabell":
-        # visa kompakt tabell
-        show = ["Ticker", "Bolagsnamn", "Sector", "Industry", "_RiskLabel",
-                "_score", "_upside_pct", "Aktuell kurs", "_target_price",
-                "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S snitt (4)",
-                "Market Cap"]
-        show = [c for c in show if c in scored.columns]
-        tbl = scored[show].rename(columns={
-            "_score": "Score",
-            "_upside_pct": "Uppsida (%)",
-            "_target_price": "Riktkurs",
-        })
-        st.dataframe(tbl.reset_index(drop=True), use_container_width=True, hide_index=True)
-        return
+    # Bläddringsfunktion
+    st.session_state.setdefault("invest_idx", 0)
+    st.session_state["invest_idx"] = int(
+        np.clip(st.session_state.get("invest_idx", 0), 0, max(0, len(base) - 1))
+    )
 
-    # Bläddringsläge
-    st.session_state.setdefault("_inv_idx", 0)
-    n = len(scored)
-    cL, cM, cR = st.columns([1, 2, 1])
-    with cL:
-        if st.button("◀ Föregående", key="inv_prev"):
-            st.session_state["_inv_idx"] = max(0, int(st.session_state["_inv_idx"]) - 1)
-    with cR:
-        if st.button("Nästa ▶", key="inv_next"):
-            st.session_state["_inv_idx"] = min(n - 1, int(st.session_state["_inv_idx"]) + 1)
-    with cM:
-        st.markdown(f"<div style='text-align:center; font-weight:600;'>Post {int(st.session_state['_inv_idx'])+1} av {n}</div>", unsafe_allow_html=True)
+    col_prev, col_mid, col_next = st.columns([1, 4, 1])
+    with col_prev:
+        if st.button("⬅️ Föregående", key="inv_prev"):
+            st.session_state["invest_idx"] = max(0, st.session_state["invest_idx"] - 1)
+    with col_next:
+        if st.button("➡️ Nästa", key="inv_next"):
+            st.session_state["invest_idx"] = min(len(base) - 1, st.session_state["invest_idx"] + 1)
+    with col_mid:
+        st.write(f"Post {st.session_state['invest_idx'] + 1}/{len(base)}")
 
-    idx = int(st.session_state["_inv_idx"])
-    row = scored.iloc[idx]
+    r = base.iloc[st.session_state["invest_idx"]]
 
-    # Rubrik
-    tkr = str(row.get("Ticker", ""))
-    name = str(row.get("Bolagsnamn", "") or "")
-    sector = _sector(row)
-    industry = _industry(row)
-    st.markdown(f"### {tkr} — {name}")
-    st.caption(f"{sector} / {industry} • Cap: **{row.get('_RiskLabel','Okänd')}**")
+    # Kort toppsammanfattning
+    top_cols = [c for c in [
+        "Ticker", "Bolagsnamn", "Sektor", "Risklabel",
+        "Aktuell kurs", "Valuta", "Market Cap", "P/S-snitt",
+        "_TargetPrice", "_ValGap", "_Score", "_Betyg"
+    ] if c in base.columns]
+    head_df = pd.DataFrame([r[top_cols].to_dict()])
 
-    # Huvudmetrikrad
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        st.metric("Score", f"{float(row.get('_score',0))*100:.0f}/100")
-    with c2:
-        up = row.get("_upside_pct")
-        st.metric("Uppsida (%)", "-" if up is None or np.isnan(up) else f"{up:.1f}%")
-    with c3:
-        cur = safe_float(row.get("Aktuell kurs"), None)
-        st.metric("Aktuell kurs", "-" if cur is None else f"{cur:.2f} { _currency(row)}")
-    with c4:
-        tgt = row.get("_target_price")
-        st.metric("Riktkurs", "-" if tgt is None or np.isnan(tgt) else f"{float(tgt):.2f} { _currency(row)}")
-    with c5:
-        st.metric("Etikett", row.get("_ValuationLabel", "Ok"))
+    # Formatera lite
+    if "Market Cap" in head_df.columns:
+        head_df["Market Cap"] = head_df["Market Cap"].apply(lambda x: format_large_number(_safe_float(x) or 0.0, r.get("Valuta", "SEK")))
+    if "_ValGap" in head_df.columns:
+        head_df["_ValGap"] = head_df["_ValGap"].apply(lambda x: f"{x*100:.1f}%" if x is not None else "–")
+    if "_Score" in head_df.columns:
+        head_df["_Score"] = head_df["_Score"].apply(lambda s: f"{s:.2f}")
 
-    # Expander – alla nyckeltal
-    with st.expander("Visa nyckeltal & detaljer", expanded=False):
-        left, right = st.columns(2)
+    st.subheader(f"{r.get('Bolagsnamn','?')} ({r.get('Ticker','?')})")
+    st.dataframe(head_df, use_container_width=True, hide_index=True)
 
-        # Vänster: värdering/struktur
-        with left:
-            st.write("**Värdering & struktur**")
-            st.write(f"- **Market Cap:** { _fmt_money(safe_float(row.get('Market Cap'), np.nan)) }")
-            st.write(f"- **Utestående aktier:** { _fmt_money(_get_shares_outstanding(row) or np.nan) }")
-            st.write(f"- **Valuta:** { _currency(row) }")
-            pa = _ps_avg_from_row(row)
-            st.write(f"- **P/S snitt (4):** { '-' if pa is None else f'{pa:.2f}' }")
-            for c in ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S"]:
-                if c in row.index and pd.notna(row[c]):
-                    st.write(f"- **{c}:** {safe_float(row[c], None)}")
-            if "EV/EBITDA" in row.index and pd.notna(row["EV/EBITDA"]):
-                st.write(f"- **EV/EBITDA:** {safe_float(row['EV/EBITDA'], None)}")
-            if "Skuldsättning (Debt/Equity)" in row.index and pd.notna(row["Skuldsättning (Debt/Equity)"]):
-                st.write(f"- **Debt/Equity:** {safe_float(row['Skuldsättning (Debt/Equity)'], None)}")
+    # Expander: Nyckeltal
+    with st.expander("📊 Nyckeltal & detaljer", expanded=False):
+        show_keys = [
+            # Värdering/omsättning
+            "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
+            "Omsättning idag", "Omsättning nästa år",
+            # Multiplar
+            "EV/EBITDA", "Debt/Equity",
+            # Marginaler
+            "Bruttomarginal (%)", "Nettomarginal (%)",
+            # Kassaflöde/kassa
+            "FCF (ttm)", "Kassa & ekvivalenter", "Kassaburn (ttm)", "Runway (kvartal)",
+            # Utdelning
+            "Utdelningsyield (%)", "Årlig utdelning",
+            # Antal aktier
+            "Utestående aktier", "Antal aktier",
+            # Riktkurser
+            "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+            # Tidsstämplar
+            "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa",
+        ]
 
-            if "Omsättning idag" in row.index and pd.notna(row["Omsättning idag"]):
-                st.write(f"- **Omsättning (i år, manuell):** { _fmt_money(safe_float(row['Omsättning idag'], None) * 1e6 if safe_float(row['Omsättning idag'], None) else None) }")
+        rows = []
+        for k in show_keys:
+            if k in base.columns:
+                val = r.get(k)
+                # lätt formattering
+                if k in ("FCF (ttm)", "Kassa & ekvivalenter", "Kassaburn (ttm)"):
+                    rows.append((k, format_large_number(_safe_float(val) or 0.0, r.get("Valuta", "SEK"))))
+                elif k in ("Omsättning idag", "Omsättning nästa år"):
+                    rows.append((k, format_large_number(_safe_float(val) or 0.0, r.get("Valuta", "SEK"))))
+                elif k == "Utdelningsyield (%)":
+                    rows.append((k, f"{_safe_float(val) or 0:.2f}%"))
+                elif k.startswith("Riktkurs"):
+                    rows.append((k, f"{_safe_float(val) or 0:.2f} {r.get('Valuta','')}"))
+                else:
+                    # default
+                    rows.append((k, val if (val is not None and val != "") else "–"))
+        if "_TargetPrice" in r.index:
+            rows.append(("Beräknad riktkurs (fallback)", f"{_safe_float(r['_TargetPrice']) or 0:.2f} {r.get('Valuta','')}"))
+        if "_ValGap" in r.index:
+            rows.append(("Värderingsgap mot mål", f"{(r['_ValGap']*100.0):.1f}%" if r["_ValGap"] is not None else "–"))
+        rows.append(("Totalpoäng (0–1)", f"{r.get('_Score',0):.2f}"))
+        rows.append(("Betyg", r.get("_Betyg", "Osäker")))
+        det_df = pd.DataFrame(rows, columns=["Nyckeltal", "Värde"])
+        st.dataframe(det_df, use_container_width=True, hide_index=True)
 
-        # Höger: lönsamhet/utdelning/kassa
-        with right:
-            st.write("**Lönsamhet & kassaflöde**")
-            if "Bruttomarginal (%)" in row.index and pd.notna(row["Bruttomarginal (%)"]):
-                st.write(f"- **Bruttomarginal:** {_fmt_pct(safe_float(row['Bruttomarginal (%)'], None))}")
-            if "Netto-marginal (%)" in row.index and pd.notna(row["Netto-marginal (%)"]):
-                st.write(f"- **Netto-marginal:** {_fmt_pct(safe_float(row['Netto-marginal (%)'], None))}")
-            if "FCF (milj)" in row.index and pd.notna(row["FCF (milj)"]):
-                st.write(f"- **Free Cash Flow (milj):** {safe_float(row['FCF (milj)'], None)}")
-            if "Kassa (milj)" in row.index and pd.notna(row["Kassa (milj)"]):
-                st.write(f"- **Kassa (milj):** {safe_float(row['Kassa (milj)'], None)}")
-            if "Runway (kvartal)" in row.index and pd.notna(row["Runway (kvartal)"]):
-                st.write(f"- **Runway (kvartal):** {safe_float(row['Runway (kvartal)'], None)}")
+    # Kort motivering
+    st.markdown("#### 🧠 Motivering")
+    bullets = []
+    if r.get("_ValGap") is not None:
+        g = r["_ValGap"] * 100.0
+        if g >= 20:
+            bullets.append("Stor uppsida relativt mål (värderingsgap ≥ 20%).")
+        elif g <= -10:
+            bullets.append("Negativt gap mot mål (risk för övervärdering).")
+    if r.get("Debt/Equity") is not None:
+        de = _safe_float(r["Debt/Equity"]) or 0.0
+        if de < 0.8:
+            bullets.append("Låg skuldsättning.")
+        elif de > 2.0:
+            bullets.append("Hög skuldsättning – bevaka.")
+    if r.get("FCF (ttm)") is not None:
+        fcf = _safe_float(r["FCF (ttm)"]) or 0.0
+        bullets.append("Positivt fritt kassaflöde." if fcf > 0 else "Negativt fritt kassaflöde.")
+    if r.get("Utdelningsyield (%)") is not None:
+        y = _safe_float(r["Utdelningsyield (%)"]) or 0.0
+        if y >= 4:
+            bullets.append("Attraktiv direktavkastning.")
+    if not bullets:
+        bullets.append("Underlag delvis ofullständigt – bedömning med förbehåll.")
+    st.write("\n".join([f"- {b}" for b in bullets]))
 
-            st.write("**Utdelning**")
-            if "Direktavkastning (%)" in row.index and pd.notna(row["Direktavkastning (%)"]):
-                st.write(f"- **Direktavkastning:** {_fmt_pct(safe_float(row['Direktavkastning (%)'], None))}")
-            if "Payout ratio (CFO) (%)" in row.index and pd.notna(row["Payout ratio (CFO) (%)"]):
-                st.write(f"- **Payout (CFO):** {_fmt_pct(safe_float(row['Payout ratio (CFO) (%)'], None))}")
-            if "Payout ratio (EPS) (%)" in row.index and pd.notna(row["Payout ratio (EPS) (%)"]):
-                st.write(f"- **Payout (EPS):** {_fmt_pct(safe_float(row['Payout ratio (EPS) (%)'], None))}")
-            if "Utdelningstillväxt 5y (%)" in row.index and pd.notna(row["Utdelningstillväxt 5y (%)"]):
-                st.write(f"- **Utdeln.tillväxt 5y:** {_fmt_pct(safe_float(row['Utdelningstillväxt 5y (%)'], None))}")
-            if "Utdelningstillväxt 3y (%)" in row.index and pd.notna(row["Utdelningstillväxt 3y (%)"]):
-                st.write(f"- **Utdeln.tillväxt 3y:** {_fmt_pct(safe_float(row['Utdelningstillväxt 3y (%)'], None))}")
-            if "Utdelning år i rad" in row.index and pd.notna(row["Utdelning år i rad"]):
-                st.write(f"- **År av utdelning i rad:** {int(safe_float(row['Utdelning år i rad'], 0))}")
-
-    # Mini-topplista för kontext
-    st.markdown("---")
-    st.caption("Topp 10 (score-baserad):")
-    mini = scored[["Ticker", "Bolagsnamn", "_score", "_upside_pct", "_ValuationLabel"]].head(10).reset_index(drop=True)
-    mini = mini.rename(columns={"_score": "Score", "_upside_pct": "Uppsida (%)", "_ValuationLabel": "Etikett"})
-    st.dataframe(mini, use_container_width=True, hide_index=True)
+    # Liten topplista (för sammanhang)
+    st.divider()
+    st.subheader("🏆 Topp 10 enligt din filtrering")
+    show = ["Ticker", "Bolagsnamn", "Sektor", "Risklabel", "_Score", "_Betyg", "_ValGap", "_TargetPrice", "P/S-snitt"]
+    show = [c for c in show if c in base.columns]
+    top = base[show].head(10).copy()
+    if "_ValGap" in top.columns:
+        top["_ValGap"] = top["_ValGap"].apply(lambda x: f"{x*100:.1f}%" if x is not None else "–")
+    if "_Score" in top.columns:
+        top["_Score"] = top["_Score"].apply(lambda s: f"{s:.2f}")
+    if "_TargetPrice" in top.columns:
+        # visa med valuta om möjligt (blandad valuta -> lämna utan)
+        top["_TargetPrice"] = top["_TargetPrice"].apply(lambda x: f"{x:.2f}" if x is not None else "–")
+    st.dataframe(top.reset_index(drop=True), use_container_width=True, hide_index=True)

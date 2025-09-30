@@ -518,7 +518,7 @@ def visa_portfolj(df: pd.DataFrame, user_rates: Dict[str, float]):
     port["Andel (%)"] = np.where(total_värde > 0, port["Värde (SEK)"] / total_värde * 100.0, 0.0)
     port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
 
-    st.markdown(f"**Totalt portföljvärde:** {format_large_number(total_värde, \"SEK\")}")
+    st.markdown(f"**Totalt portföljvärde:** {format_large_number(total_värde, 'SEK')}")
     tot_utd = float(port["Total årlig utdelning (SEK)"].sum())
     st.markdown(f"**Total kommande utdelning:** {format_large_number(tot_utd, 'SEK')}")
     st.markdown(f"**Ungefärlig månadsutdelning:** {format_large_number(tot_utd/12.0, 'SEK')}")

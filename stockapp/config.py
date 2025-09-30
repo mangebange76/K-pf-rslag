@@ -1,109 +1,186 @@
-# stockapp/config.py
 # -*- coding: utf-8 -*-
-
 """
-Central konfiguration & kolumnschema för appen.
+Central konfig för appen.
 
-Viktigt:
-- SHEET_NAME: huvudbladet i Google Sheet (databasen)
-- RATES_SHEET_NAME: bladet där valutakurser sparas
-- STANDARD_VALUTAKURSER: start-/fallbackkurser
-- TS_FIELDS: vilka fält som har TS_-kolumner
-- FINAL_COLS: fullständig kolumnlista som appen förväntar sig
-  (vi inkluderar även extra nyckeltal så vyer/score kan köras utan KeyError)
+Här ligger endast KONSTANTER och små hjälpfunktioner som inte
+pratar nätverk eller Streamlit-UI.
+
+Andra moduler importerar härifrån:
+- Sheets/ark-namn
+- Standardvalutor
+- Stapel av "finala" kolumner i databladet
+- Flaggor för vilka källor som används (Yahoo/FMP/SEC)
 """
 
-# --- Google Sheets-flikar ----------------------------------------------------
-SHEET_NAME = "Blad1"
-RATES_SHEET_NAME = "Valutakurser"
+from __future__ import annotations
+from typing import Dict
+import os
 
-# --- Valutakurser (fallback/startvärden) -------------------------------------
-STANDARD_VALUTAKURSER = {
-    "USD": 9.75,
-    "NOK": 0.95,
-    "CAD": 7.05,
-    "EUR": 11.18,
-    "SEK": 1.0,
+# --------------------------------------------------------------------
+# Google Sheet
+# --------------------------------------------------------------------
+# URL till Google Sheet hämtas primärt från Streamlit secrets i körning,
+# men vi har en fallback-variabel här så verktyg/test kan importera modulen.
+SHEET_URL_FALLBACK: str = os.environ.get("SHEET_URL", "")
+SHEET_NAME: str = os.environ.get("SHEET_NAME", "Data")
+RATES_SHEET_NAME: str = os.environ.get("RATES_SHEET_NAME", "Valutakurser")
+
+# --------------------------------------------------------------------
+# Valutor – default/fallbackvärden (SEK per 1 enhet basvaluta)
+# Dessa används om blad/extern hämtning inte går.
+# --------------------------------------------------------------------
+STANDARD_VALUTAKURSER: Dict[str, float] = {
+    "USD": 10.50,
+    "EUR": 11.30,
+    "CAD": 7.70,
+    "NOK": 1.00,
+    "SEK": 1.00,  # alltid 1:1 som bas
 }
 
-# --- Tidsstämpel-spårning ----------------------------------------------------
-TS_FIELDS = {
-    "Utestående aktier": "TS_Utestående aktier",
-    "P/S": "TS_P/S",
-    "P/S Q1": "TS_P/S Q1",
-    "P/S Q2": "TS_P/S Q2",
-    "P/S Q3": "TS_P/S Q3",
-    "P/S Q4": "TS_P/S Q4",
-    "Omsättning idag": "TS_Omsättning idag",
-    "Omsättning nästa år": "TS_Omsättning nästa år",
-}
-
-# --- Fullständig kolumnlista -------------------------------------------------
-# Notera:
-# - "Utestående aktier" lagras i MILJONER (styck/1e6)
-# - Omsättning/FCF/Kassa i MILJONER av bolagets valuta
-# - Market cap kan sparas både i bolagsvaluta och SEK om du vill
+# --------------------------------------------------------------------
+# Databladets kolumnordning (”schema”)
+# OBS! Håll namn identiska mot det du vill se i Google Sheet.
+# Lägg hellre till längst bak än att byta namn på befintliga.
+# --------------------------------------------------------------------
 FINAL_COLS = [
-    # Grundidentitet
-    "Ticker", "Bolagsnamn", "Valuta",
+    # Identitet
+    "Ticker",
+    "Namn",
+    "Sektor",
+    "Bransch",
 
-    # Pris & aktiedata
-    "Aktuell kurs", "Utestående aktier",
+    # Basdata/Marknad
+    "Senaste kurs",
+    "Market Cap",
+    "Utestående aktier (milj.)",
 
-    # P/S & historik (TTM/Q)
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
+    # Värdering & P/S-historik
+    "P/S (Yahoo)",
+    "P/S",
+    "P/S Q1",
+    "P/S Q2",
+    "P/S Q3",
+    "P/S Q4",
 
-    # Omsättning (M, bolagsvaluta)
-    "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
+    # Skuld & marginaler
+    "Debt/Equity",
+    "Net debt / EBITDA",
+    "Bruttomarginal (%)",
+    "Operating margin (%)",
+    "Net margin (%)",
+    "ROE (%)",
+    "P/B",
 
-    # Riktkurser (bolagsvaluta)
-    "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+    # Kassaflöde/Utdelning
+    "FCF (TTM)",
+    "FCF Yield (%)",
+    "Dividend yield (%)",
+    "Dividend payout (FCF) (%)",
+    "Kassa",
 
-    # Portfölj
-    "Antal aktier", "Årlig utdelning", "GAV (SEK)",
+    # Prognoser (manuella)
+    "Omsättning (i år, prognos)",
+    "Omsättning (nästa år, prognos)",
 
-    # Tillväxt & övrigt
-    "CAGR 5 år (%)",
+    # Portföljfält
+    "GAV (SEK)",
+    "Antal aktier du äger",
 
-    # --- Extra nyckeltal för scoring/analys ---
-    # Marknadsvärde
-    "Market Cap (valuta)", "Market Cap (SEK)",
+    # Tidsstämplar (ISO8601 strängar)
+    "Senast kurs-uppdaterad",
+    "Senast uppdaterad",
 
-    # Lönsamhet/marginaler (%)
-    "Bruttomarginal (%)", "Nettomarginal (%)",
-
-    # Kassaflöde / skuld / kassa (alla i M, bolagsvaluta)
-    "FCF (M)", "Debt/Equity", "Kassa (M)", "Runway (kvartal)",
-
-    # Multiplar
-    "EV/EBITDA",
-
-    # Dividend
-    "Dividend Yield (%)", "Payout Ratio CF (%)",
-
-    # Klassning
-    "Risklabel", "Sektor", "Industri",
-
-    # Käll- & datumfält
-    "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa",
-
-    # TS-kolumner (en per spårat fält)
-    TS_FIELDS["Utestående aktier"],
-    TS_FIELDS["P/S"], TS_FIELDS["P/S Q1"], TS_FIELDS["P/S Q2"], TS_FIELDS["P/S Q3"], TS_FIELDS["P/S Q4"],
-    TS_FIELDS["Omsättning idag"], TS_FIELDS["Omsättning nästa år"],
+    # Interna hjälp/etiketter (valfritt)
+    "Notering",
 ]
 
-# (Valfritt) För appens rubrik/branding
-APP_TITLE = "📊 Aktieanalys och investeringsförslag"
+# --------------------------------------------------------------------
+# Källflaggor: slå på/av fetchers (kan även överskridas av st.secrets)
+# --------------------------------------------------------------------
+USE_FMP: bool = os.environ.get("USE_FMP", "true").lower() not in ("0", "false", "no")
+USE_SEC: bool = os.environ.get("USE_SEC", "true").lower() not in ("0", "false", "no")
 
-# (Valfritt) Risklabel-trösklar (MCAP i bolagsvaluta, ungefärliga nivåer – justera i scoring om du vill)
-RISK_BUCKET_LIMITS = {
-    "Microcap": 300_000_000,    # < 300M
-    "Smallcap": 2_000_000_000,  # < 2B
-    "Midcap": 10_000_000_000,   # < 10B
-    "Largecap": float("inf"),   # >= 10B
+# --------------------------------------------------------------------
+# Risklabel-trösklar (Market Cap i USD)
+# används av scoring/visningar för snabb etikett
+# --------------------------------------------------------------------
+RISKLABEL_BINS_USD = [
+    (0,            "Nano"),     # < 50M
+    (50e6,         "Micro"),    # 50M – 300M
+    (300e6,        "Small"),    # 300M – 2B
+    (2e9,          "Mid"),      # 2B – 10B
+    (10e9,         "Large"),    # 10B – 200B
+    (200e9,        "Mega"),     # > 200B
+]
+
+def risk_label_from_mcap(mcap_usd: float | None) -> str:
+    """Returnerar etikett baserat på Market Cap (USD)."""
+    if mcap_usd is None or mcap_usd <= 0:
+        return "Okänd"
+    label = "Nano"
+    for thr, name in RISKLABEL_BINS_USD:
+        if mcap_usd >= thr:
+            label = name
+        else:
+            break
+    return label
+
+# --------------------------------------------------------------------
+# Sektorvikter (exempel – används av scoring/investeringsförslag)
+# värdena är relativa och används som multiplikatorer i poängberäkning
+# --------------------------------------------------------------------
+SECTOR_WEIGHTS: Dict[str, Dict[str, float]] = {
+    # Exempel: Tech prioriterar marginaler/ROE lite högre än P/B
+    "Technology": {
+        "ps": 1.0, "margin": 1.2, "roe": 1.2, "de": 1.0, "pb": 0.9, "fcf": 1.2,
+    },
+    "Communication Services": {
+        "ps": 1.0, "margin": 1.1, "roe": 1.1, "de": 1.0, "pb": 1.0, "fcf": 1.0,
+    },
+    "Consumer Discretionary": {
+        "ps": 1.0, "margin": 1.0, "roe": 1.0, "de": 1.0, "pb": 1.0, "fcf": 1.0,
+    },
+    "Consumer Staples": {
+        "ps": 0.9, "margin": 1.0, "roe": 1.1, "de": 1.2, "pb": 1.0, "fcf": 1.1,
+    },
+    "Financials": {
+        "ps": 0.8, "margin": 0.9, "roe": 1.3, "de": 1.2, "pb": 1.2, "fcf": 0.9,
+    },
+    "Health Care": {
+        "ps": 1.0, "margin": 1.1, "roe": 1.0, "de": 1.0, "pb": 1.0, "fcf": 1.0,
+    },
+    "Industrials": {
+        "ps": 1.0, "margin": 1.0, "roe": 1.0, "de": 1.0, "pb": 1.0, "fcf": 1.0,
+    },
+    "Energy": {
+        "ps": 0.9, "margin": 1.0, "roe": 1.0, "de": 1.1, "pb": 1.0, "fcf": 1.2,
+    },
+    "Utilities": {
+        "ps": 0.8, "margin": 1.0, "roe": 1.0, "de": 1.3, "pb": 1.0, "fcf": 1.0,
+    },
+    "Real Estate": {
+        "ps": 0.7, "margin": 0.9, "roe": 1.0, "de": 1.3, "pb": 1.1, "fcf": 0.9,
+    },
+    "Materials": {
+        "ps": 0.9, "margin": 1.0, "roe": 1.0, "de": 1.0, "pb": 1.0, "fcf": 1.0,
+    },
 }
 
-# (Valfritt) Standardinställningar för batch
-DEFAULT_BATCH_SIZE = 10
-DEFAULT_BATCH_SORT = "Äldst TS"  # eller "A–Ö"
+# --------------------------------------------------------------------
+# Presentation – hur stora tal formatteras (Market Cap, FCF etc.)
+# --------------------------------------------------------------------
+MCAP_UNITS = [
+    (1_000_000_000_000, " tn"),
+    (1_000_000_000,     " md"),
+    (1_000_000,         " mn"),
+]
+
+def format_money_short(value: float | None, unit_suffix: str = " USD") -> str:
+    """Gör 4.35e12 -> '4.35 tn USD' osv."""
+    if value is None:
+        return "—"
+    v = float(value)
+    for thr, lab in MCAP_UNITS:
+        if v >= thr:
+            return f"{v/thr:.2f}{lab}{unit_suffix}"
+    return f"{v:.0f}{unit_suffix}"

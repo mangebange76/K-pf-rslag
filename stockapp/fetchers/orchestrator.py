@@ -1,314 +1,229 @@
 # -*- coding: utf-8 -*-
 """
-Orchestrator: sammanfogar Yahoo + SEC (+ valfritt FMP) till en enhetlig dict.
+stockapp/orchestrator.py
 
-Publik:
-    fetch_all(ticker: str) -> (vals: dict, meta: dict)
+Orkestrerar hämtning från Yahoo + SEC + FMP, mergar och sätter tidsstämplar.
+- run_update_full(ticker, df_row=None, user_rates=None)  -> (vals, debug, meta)
+- run_update_price_only(ticker, df_row=None, user_rates=None) -> (vals, debug, meta)
 
-vals innehåller fält anpassade för din databas/app:
-  - "Bolagsnamn", "Valuta", "Aktuell kurs"
-  - "Utestående aktier" (miljoner)
-  - "Market Cap"
-  - "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"
-  - "_rev_quarterly": lista på kvartalsintäkter [{end, value, unit}] (nyast→äldst)
-  - "_ttm": lista [(end_date_str, ttm_value_px_ccy)] (nyast→äldst) i prisvaluta
-  - ev. pass-through från Yahoo: "Årlig utdelning", "CAGR 5 år (%)", "Sektor", "Bransch"
-
-meta innehåller:
-  - "sources": vilka källor som användes
-  - "shares_source": vilken källa som valdes för shares
-  - "notes": fria kommentarer
-  - "errors": ev fel/undantag som inträffat
-
-OBS:
-  - Orchestrator hämtar INTE "Omsättning i år/nästa år" (ska matas in manuellt enligt ditt önskemål).
-  - SEC används främst för robusta kvartalsintäkter (inkl dec/jan) och aktier (fallback).
-  - P/S-historik Q1–Q4 räknas med *samma* antal aktier (senaste kända) och historiska priser (Yahoo) “på eller strax före” periodens slutdatum.
+Returnerar alltid en 3-tuple (vals, debug, meta) för att matcha batch-runnern.
 """
 
 from __future__ import annotations
-from typing import Dict, Any, Tuple, Optional, List
-from datetime import date, datetime, timedelta
-import math
+from typing import Dict, Any, Tuple, Optional, Callable
+from datetime import datetime
 
-import requests
-import yfinance as yf
+import streamlit as st
 
-# --- Importera käll-fetchers ---
-from .yahoo import fetch_yahoo  # måste finnas
-from .sec import fetch_sec      # måste finnas
+# Våra fetchers
+from .fetchers import yahoo as fyahoo
+from .fetchers import sec as fsec
+from .fetchers import fmp as ffmp
 
-# FMP är valfri. Om modulen inte finns hoppar vi den.
-try:
-    from .fmp import fetch_fmp  # optional
-    _HAS_FMP = True
-except Exception:
-    _HAS_FMP = False
+# Hjälp & konfiguration
+from .config import TS_FIELDS  # dict: fältnamn -> tidsstämpelkolumn (t.ex. "P/S" -> "P/S TS")
+from .utils import now_stamp
 
+# ------------------------------------------------------------
+# Policy: vilka fält är MANUELLA och ska aldrig auto-överskrivas?
+# ------------------------------------------------------------
+MANUAL_FIELDS = {
+    "Omsättning i år (prognos, manuell)",
+    "Omsättning nästa år (prognos, manuell)",
+    "GAV (SEK)",
+}
 
-# ============================== Hjälpare ==============================
+# ------------------------------------------------------------
+# Hjälpare
+# ------------------------------------------------------------
+def _coalesce(*vals, default=None):
+    for v in vals:
+        if v is not None:
+            return v
+    return default
 
-def _parse_iso(d: str) -> Optional[date]:
-    if not d:
-        return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dZ"):
-        try:
-            return datetime.strptime(d.replace("Z", ""), "%Y-%m-%d").date()
-        except Exception:
-            pass
+def _apply_timestamps(vals: Dict[str, Any], ts_fields: Dict[str, str], ts: Optional[str] = None) -> None:
+    """
+    Sätter tidsstämpel för alla fält som finns i 'vals' och har en TS-kolumn definierad.
+    Krav från användaren: datum ska uppdateras även om värdet inte ändrats.
+    """
+    stamp = ts or now_stamp()
+    for key, val in list(vals.items()):
+        if key in ts_fields:
+            vals[ts_fields[key]] = stamp
+
+def _safe_call(fn: Callable, *args, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     try:
-        # sista utväg
-        return datetime.fromisoformat(d.replace("Z", "+00:00")).date()
-    except Exception:
-        return None
+        out, dbg = fn(*args, **kwargs)
+        if not isinstance(out, dict):
+            out = {}
+        if not isinstance(dbg, dict):
+            dbg = {}
+        return out, dbg
+    except Exception as e:
+        return {}, {"error": str(e)}
 
-
-def _ttm_windows(rows: List[Dict[str, Any]], need: int = 5) -> List[Tuple[str, float]]:
+def _hist_price_lookup_from_yahoo(ticker: str) -> Optional[Callable]:
     """
-    rows = [{"end": "YYYY-MM-DD", "value": float, "unit": "USD"}, ...] nyast→äldst
-    returnerar upp till 'need' TTM-summor: [(end_date_str, ttm_sum), ...]
+    Försök få en historisk pris-funktion från Yahoo-fetchern.
+    Om fetchern inte exponerar fabriksfunktion, returnera None (SEC P/S Qx hoppat).
     """
-    if not rows or len(rows) < 4:
-        return []
-    out: List[Tuple[str, float]] = []
-    for i in range(0, min(need, len(rows) - 3)):
-        ttm = 0.0
-        for j in range(i, i+4):
-            ttm += float(rows[j]["value"] or 0.0)
-        out.append((rows[i]["end"], float(ttm)))
-    return out
-
-
-def _fx_rate(base: str, quote: str, timeout: int = 12) -> float:
-    """
-    Enkel FX via Frankfurter -> exchangerate.host som fallback.
-    """
-    base = (base or "").upper()
-    quote = (quote or "").upper()
-    if not base or not quote or base == quote:
-        return 1.0
-    # Frankfurter
     try:
-        r = requests.get("https://api.frankfurter.app/latest",
-                         params={"from": base, "to": quote}, timeout=timeout)
-        if r.status_code == 200:
-            j = r.json() or {}
-            v = (j.get("rates") or {}).get(quote)
-            if v:
-                return float(v)
+        if hasattr(fyahoo, "make_hist_price_lookup"):
+            return fyahoo.make_hist_price_lookup(ticker)
     except Exception:
         pass
-    # exchangerate.host
-    try:
-        r = requests.get("https://api.exchangerate.host/latest",
-                         params={"base": base, "symbols": quote}, timeout=timeout)
-        if r.status_code == 200:
-            j = r.json() or {}
-            v = (j.get("rates") or {}).get(quote)
-            if v:
-                return float(v)
-    except Exception:
-        pass
-    return 1.0
+    return None
 
-
-def _historical_prices_yf(ticker: str, dates: List[date]) -> Dict[date, float]:
+# ------------------------------------------------------------
+# Merge-policy
+# ------------------------------------------------------------
+def _merge_vals(yv: Dict[str, Any], sv: Dict[str, Any], fv: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Hämtar dagliga 'Close' från yfinance för ett intervall som täcker alla datum,
-    och väljer priset på eller närmast FÖRE respektive datum (stänger luckor vid helg/helgdag).
+    Mergar fält från Yahoo (yv), SEC (sv), FMP (fv) enligt enkel policy:
+    - Bas: Yahoo (pris, valuta, mcap, sektor/industri)
+    - SEC vinner för Utestående aktier, P/S & P/S Q1..Q4, TTM-baserade PS (när finns)
+    - FMP fyller på kvalitetsmått (EV/EBITDA, marginaler, skuld, kassor, CF, FCF osv)
+    - Manuella fält i MANUAL_FIELDS lämnas orörda (de sätts inte här)
     """
-    if not dates:
-        return {}
-    dmin = min(dates) - timedelta(days=14)
-    dmax = max(dates) + timedelta(days=2)
-    try:
-        t = yf.Ticker(ticker)
-        hist = t.history(start=dmin, end=dmax, interval="1d")
-        if hist is None or hist.empty:
-            return {}
-        hist = hist.sort_index()
-        idx = [i.date() for i in hist.index]
-        closes = list(hist["Close"].values)
-        out: Dict[date, float] = {}
-        for d in dates:
-            px = None
-            # gå baklänges för att hitta närmast före/likamed
-            for j in range(len(idx)-1, -1, -1):
-                if idx[j] <= d:
-                    try:
-                        px = float(closes[j])
-                    except Exception:
-                        px = None
-                    break
-            if px is not None:
-                out[d] = px
-        return out
-    except Exception:
-        return {}
-
-
-def _safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-
-# ============================== Orchestrator ==============================
-
-def fetch_all(ticker: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    meta: Dict[str, Any] = {"sources": [], "errors": [], "notes": []}
     out: Dict[str, Any] = {}
 
-    # ---------- Yahoo (för kurs/valuta/MCAP/namn/sektor m.m.) ----------
-    try:
-        ydat, ysc, ysrc = fetch_yahoo(ticker)
-        meta["sources"].append(f"{ysrc}:{ysc}")
-    except Exception as e:
-        ydat, ysc, ysrc = {}, 599, "Yahoo"
-        meta["errors"].append(f"Yahoo error: {e}")
+    # 1) Börja med Yahoo-bas
+    for k, v in (yv or {}).items():
+        if k in MANUAL_FIELDS:
+            continue
+        out[k] = v
 
-    # ---------- SEC (kvartalsintäkter + shares fallback) ----------
-    try:
-        sdat, ssc, ssrc = fetch_sec(ticker)
-        meta["sources"].append(f"{ssrc}:{ssc}")
-    except Exception as e:
-        sdat, ssc, ssrc = {}, 599, "SEC"
-        meta["errors"].append(f"SEC error: {e}")
+    # 2) Lägg SEC för sina domäner
+    sec_prefer = {
+        "Utestående aktier",
+        "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+        # om du i framtiden adderar TTM-namn här: "Revenue TTM", etc.
+    }
+    for k, v in (sv or {}).items():
+        if k in MANUAL_FIELDS:
+            continue
+        if k in sec_prefer or k not in out:
+            out[k] = v
 
-    # ---------- FMP (valfritt) ----------
-    if _HAS_FMP:
-        try:
-            fdat, fsc, fsrc = fetch_fmp(ticker)
-            meta["sources"].append(f"{fsrc}:{fsc}")
-        except Exception as e:
-            fdat, fsc, fsrc = {}, 599, "FMP"
-            meta["errors"].append(f"FMP error: {e}")
-    else:
-        fdat, fsc, fsrc = {}, 0, "FMP(N/A)"
+    # 3) Lägg FMP för kvalitativa mått / komplettering
+    for k, v in (fv or {}).items():
+        if k in MANUAL_FIELDS:
+            continue
+        if (k not in out) or (out.get(k) in (None, "", 0, 0.0)):
+            out[k] = v
 
-    # ================== Grundfält från Yahoo ==================
-    out["Bolagsnamn"] = ydat.get("Namn") or ydat.get("Bolagsnamn") or ""
-    out["Valuta"] = (ydat.get("Valuta") or "USD").upper()
-    out["Aktuell kurs"] = _safe_float(ydat.get("Senaste kurs") or ydat.get("Aktuell kurs"))
-    out["Market Cap"] = _safe_float(ydat.get("Market Cap"))
-    out["Årlig utdelning"] = _safe_float(ydat.get("Dividend (ttm)") or ydat.get("Årlig utdelning"))
-    out["CAGR 5 år (%)"] = _safe_float(ydat.get("CAGR 5 år (%)"))
-    out["Sektor"] = ydat.get("Sektor") or ""
-    out["Bransch"] = ydat.get("Bransch") or ""
+    # Sätt alltid Ticker (om Yahoo inte lyckades sätta)
+    if "Ticker" not in out and yv.get("Ticker"):
+        out["Ticker"] = yv.get("Ticker")
 
-    px_ccy = out["Valuta"]
+    return out
 
-    # ================== Utestående aktier (välja bästa) ==================
-    shares_src = "unknown"
-    implied = 0.0
-    if out["Market Cap"] > 0 and out["Aktuell kurs"] > 0:
-        implied = out["Market Cap"] / out["Aktuell kurs"]
+# ------------------------------------------------------------
+# Publika funktioner
+# ------------------------------------------------------------
+def run_update_price_only(*args, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """
+    Uppdatera endast kurs/market cap/valuta/namn/sektor/industri (Yahoo).
+    Kan anropas som:
+        run_update_price_only(ticker)
+        run_update_price_only(ticker, df_row, user_rates)
+        run_update_price_only(ticker=t, user_rates=...)
+    Returnerar (vals, debug, meta)
+    """
+    # Flexibel args-parsning
+    ticker = None
+    if args:
+        ticker = args[0]
+    ticker = kwargs.get("ticker", ticker)
+    if not ticker:
+        return {}, {"error": "missing ticker"}, {"runner": "price_only"}
 
-    if implied > 0:
-        shares = implied
-        shares_src = "Yahoo implied (mcap/price)"
-    else:
-        # yahoo explicit shares?
-        y_sh = _safe_float(ydat.get("Utestående aktier (milj.)")) * 1e6 or _safe_float(ydat.get("Utestående aktier"))
-        if y_sh > 0:
-            shares = y_sh
-            shares_src = "Yahoo shares"
-        else:
-            # SEC robust
-            s_sh = _safe_float(sdat.get("Utestående aktier (milj.)")) * 1e6
-            if s_sh > 0:
-                shares = s_sh
-                shares_src = "SEC robust shares"
-            else:
-                # FMP fallback om finns
-                f_sh = _safe_float(fdat.get("Utestående aktier (milj.)")) * 1e6 or _safe_float(fdat.get("shares"))
-                if f_sh > 0:
-                    shares = f_sh
-                    shares_src = "FMP shares"
-                else:
-                    shares = 0.0
+    yv, ydbg = _safe_call(fyahoo.fetch_yahoo_combo, ticker)
+    vals = {}
+    # Plocka basfält
+    for key in ("Ticker", "Namn", "Valuta", "Kurs", "Market Cap", "Sektor", "Industri", "Land"):
+        if key in yv:
+            vals[key] = yv[key]
 
-    meta["shares_source"] = shares_src
-    out["Utestående aktier"] = round(shares / 1e6, 6) if shares > 0 else 0.0  # i miljoner
+    # Tidsstämpla
+    _apply_timestamps(vals, TS_FIELDS)
+    meta = {"runner": "price_only", "sources": ["yahoo"]}
+    debug = {"yahoo": ydbg}
+    return vals, debug, meta
 
-    # ================== Kvartalsintäkter (SEC prioriteras) ==================
-    rev_rows = sdat.get("_SEC_rev_quarterly") or []
-    rev_unit = (sdat.get("_SEC_rev_unit") or "").upper()
-    if not rev_rows:
-        # Fallback: Yahoo quarterly revenues om din yahoo-fetcher exponerar dem
-        y_rev = ydat.get("_YF_rev_quarterly") or []
-        # för kompatibilitet, mappa om
-        rev_rows = [{"end": r.get("end"), "value": _safe_float(r.get("value")), "unit": (ydat.get("financialCurrency") or px_ccy)} for r in y_rev]
-        rev_unit = (ydat.get("financialCurrency") or px_ccy).upper()
 
-    # städa + sortera rev_rows nyast→äldst och deduplicera per end
-    tmp = {}
-    for r in rev_rows:
-        d = _parse_iso(str(r.get("end", "")))
-        v = _safe_float(r.get("value"))
-        if d and v > 0:
-            tmp[d] = v
-    rev_pairs = sorted(tmp.items(), key=lambda t: t[0], reverse=True)
-    rev_rows = [{"end": d.strftime("%Y-%m-%d"), "value": v, "unit": rev_unit} for (d, v) in rev_pairs]
-    out["_rev_quarterly"] = rev_rows  # spara rådata för debug
+def run_update_full(*args, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """
+    Full auto-uppdatering:
+    - Yahoo bas (kurs, valuta, mcap, namn, sektor/industri, ev. hist-pris-fn)
+    - SEC (aktier, kvartalsintäkter->TTM, P/S, P/S Q1..Q4 via hist-pris)
+    - FMP (EV/EBITDA, marginaler, skuld/kassa, CF/FCF m.m.)
+    Sätter tidsstämplar för allt som skrivs.
 
-    # ================== Bygg TTM i prisvaluta ==================
-    ttm_list = _ttm_windows(rev_rows, need=5)  # [(end_str, ttm_value_native)]
-    if ttm_list:
-        # valuta-konvertering om behövs
-        if rev_unit and rev_unit != px_ccy:
-            fx = _fx_rate(rev_unit, px_ccy) or 1.0
-        else:
-            fx = 1.0
-        ttm_px = [(d, float(ttm) * fx) for (d, ttm) in ttm_list]
-    else:
-        ttm_px = []
-    out["_ttm"] = ttm_px
+    Anrop:
+        run_update_full(ticker)
+        run_update_full(ticker, df_row, user_rates)
+        run_update_full(ticker=t, user_rates=...)
 
-    # ================== P/S (nu) ==================
-    ps_now = 0.0
-    if out["Market Cap"] > 0 and ttm_px:
-        ltm = _safe_float(ttm_px[0][1])
-        if ltm > 0:
-            ps_now = out["Market Cap"] / ltm
-    out["P/S"] = round(ps_now, 4) if ps_now > 0 else 0.0
+    Return: (vals, debug, meta)
+    """
+    # Flexibel args-parsning för batch-runner-kompatibilitet
+    # args: (ticker, df_row, user_rates)
+    # kwargs: ticker=..., df_row=..., user_rates=...
+    ticker = None
+    df_row = None
+    user_rates = None
+    if len(args) >= 1:
+        ticker = args[0]
+    if len(args) >= 2:
+        df_row = args[1]
+    if len(args) >= 3:
+        user_rates = args[2]
+    ticker = kwargs.get("ticker", ticker)
+    df_row = kwargs.get("df_row", df_row)
+    user_rates = kwargs.get("user_rates", user_rates)
 
-    # ================== P/S Q1–Q4 (historik) ==================
-    out["P/S Q1"] = 0.0
-    out["P/S Q2"] = 0.0
-    out["P/S Q3"] = 0.0
-    out["P/S Q4"] = 0.0
+    if not ticker:
+        return {}, {"error": "missing ticker"}, {"runner": "full"}
 
-    if shares > 0 and ttm_px:
-        # vilka kvartalsslut?
-        q_dates: List[date] = []
-        for (ds, _) in ttm_px[:4]:
-            dd = _parse_iso(ds)
-            if dd:
-                q_dates.append(dd)
-        # hämta historiska priser
-        px_map = _historical_prices_yf(ticker, q_dates)
-        for i, (ds, ttm_v) in enumerate(ttm_px[:4], start=1):
-            dd = _parse_iso(ds)
-            if not dd:
-                continue
-            p = _safe_float(px_map.get(dd))
-            if p > 0 and ttm_v > 0:
-                mcap_hist = shares * p
-                ps_hist = mcap_hist / float(ttm_v)
-                out[f"P/S Q{i}"] = round(ps_hist, 4)
+    debug: Dict[str, Any] = {}
+    sources_used = []
 
-    # ================== Avrunda vissa fält snyggt ==================
-    if out["Aktuell kurs"] > 0:
-        out["Aktuell kurs"] = float(f"{out['Aktuell kurs']:.6g}")
-    if out["Market Cap"] > 0:
-        out["Market Cap"] = float(f"{out['Market Cap']:.6g}")
+    # 1) Yahoo
+    yv, ydbg = _safe_call(fyahoo.fetch_yahoo_combo, ticker)
+    debug["yahoo"] = ydbg
+    sources_used.append("yahoo")
 
-    # ================== Meta-kommentarer ==================
-    if not ttm_px:
-        meta["notes"].append("TTM kunde inte räknas (saknar 4 kvartal).")
-    if out["P/S"] == 0.0:
-        meta["notes"].append("P/S nu kunde inte räknas (saknar mcap/ttm).")
+    # Hämta market cap & prisvaluta för SEC/FMP-kontext
+    mcap = _coalesce(yv.get("Market Cap"), None)
+    price_ccy = _coalesce(yv.get("Valuta"), "USD")
 
-    return out, meta
+    # Historisk prisfunktion för SEC P/S Qx (om möjlig)
+    hist_price_fn = _hist_price_lookup_from_yahoo(ticker)
+
+    # 2) SEC (snåla inte med parametrar om vi har dem)
+    sv, sdbg = _safe_call(
+        fsec.fetch_sec_combo,
+        ticker,
+        market_cap=mcap,
+        price_ccy=price_ccy,
+        hist_price_lookup=hist_price_fn,
+        override_shares=None,
+    )
+    debug["sec"] = sdbg
+    sources_used.append("sec")
+
+    # 3) FMP
+    fv, fdbg = _safe_call(ffmp.fetch_fmp_combo, ticker)
+    debug["fmp"] = fdbg
+    sources_used.append("fmp")
+
+    # 4) Merge
+    merged = _merge_vals(yv, sv, fv)
+
+    # 5) Sätt tidsstämplar för allt vi faktiskt skriver
+    _apply_timestamps(merged, TS_FIELDS)
+
+    meta = {"runner": "full", "sources": sources_used}
+    return merged, debug, meta

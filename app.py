@@ -1,4 +1,12 @@
-# app.py — komplett
+import streamlit as st, traceback
+try:
+    from stockapp.config import FINAL_COLS  # snabbtest
+    st.sidebar.success("config.py import OK")
+except Exception as e:
+    st.sidebar.error(f"Import error i stockapp.config: {e!r}")
+    st.sidebar.code("".join(traceback.format_exc()))
+    raise
+    # app.py — komplett
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 

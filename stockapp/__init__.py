@@ -1,8 +1,11 @@
-# stockapp/__init__.py
 # -*- coding: utf-8 -*-
 """
-Håll detta minimalt för att undvika cirkulära imports.
-Inga imports härifrån – moduler importeras direkt där de behövs.
+stockapp package initializer.
+
+Viktigt: Håll denna fil MINIMAL för att undvika cirkulära importproblem.
+Importera INTE tunga moduler här. Låt appen/modulerna importera varandra direkt.
+
+Denna fil markerar bara mappen som ett paket och exponerar ingen publik API-yta.
 """
 
-__all__ = []
+__all__ = []  # avsiktligt tomt – inga wildcard-exports

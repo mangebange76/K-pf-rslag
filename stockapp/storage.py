@@ -1,99 +1,94 @@
+# stockapp/storage.py
 # -*- coding: utf-8 -*-
-from __future__ import annotations
-from typing import List, Tuple
+"""
+Läser/skriv­er portföljdatan mot Google Sheets.
+Frikopplad från övriga moduler (inga imports från utils) för att undvika cirkulära beroenden.
 
-import numpy as np
+Publikt API:
+- hamta_data() -> pd.DataFrame
+- spara_data(df: pd.DataFrame) -> None
+"""
+
+from __future__ import annotations
+
+import time
+from typing import List, Any
+
 import pandas as pd
 import streamlit as st
 
 from .sheets import get_ws
-from .config import FINAL_COLS, SHEET_NAME
-from .utils import ensure_schema, with_backoff, dedupe_tickers
 
 
-TEXT_LIKE = {"Ticker", "Bolagsnamn", "Valuta", "Sektor", "Risklabel"}
+# ---------------------------------------------------------------------
+# Lokal backoff (ingen utils-dependency)
+# ---------------------------------------------------------------------
+def _with_backoff(fn, *args, **kwargs):
+    delay = 0.5
+    last_err: Exception | None = None
+    for _ in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # vi vill bubbla upp sista felet
+            last_err = e
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    if last_err:
+        raise last_err
+    raise RuntimeError("Okänt fel i _with_backoff")
 
 
-def _find_header_row(rows: List[List[str]]) -> int:
-    """
-    Hitta rubrikraden. Vi letar efter en rad som innehåller 'Ticker' (case-insensitive).
-    Returnerar radindex (0-baserat). Om ingen hittas: 0.
-    """
-    for i, r in enumerate(rows):
-        joined = " ".join([str(x) for x in r]).lower()
-        if "ticker" in joined:
-            return i
-    return 0
-
-
-def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
-    """Försöker konvertera numeriska kolumner (ej text & ej TS-kolumner) till float."""
-    for col in df.columns:
-        if col in TEXT_LIKE or col.endswith(" TS"):
-            continue
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
+# ---------------------------------------------------------------------
+# Läs/skriv
+# ---------------------------------------------------------------------
 def hamta_data() -> pd.DataFrame:
     """
-    Läser HE-LA arket robust:
-      - Hämtar alla värden
-      - Hittar rubrikrad ('Ticker')
-      - Bygger DataFrame och fyller på saknade FINAL_COLS
-      - Konverterar numeriska kolumner
-      - Tar bort uppenbart tomma rader (saknar Ticker)
+    Läser alla rader från aktuellt worksheet.
+    Förväntar att första raden i arket är kolumnrubriker.
+    Returnerar alltid en DataFrame (kan vara tom).
     """
-    ws = get_ws(SHEET_NAME)
-    values: List[List[str]] = with_backoff(ws.get_all_values)
+    ws = get_ws()  # använder default från sheets.py (SHEET_NAME i secrets)
+    # get_all_records läser med rubrikrad som header och resten som data
+    rows: List[dict[str, Any]] = _with_backoff(ws.get_all_records, empty_value="")
+    if not rows:
+        # Om helt tomt (eller bara header i arket), försök hämta header separat
+        try:
+            header = _with_backoff(ws.row_values, 1)
+        except Exception:
+            header = []
+        if header:
+            return pd.DataFrame(columns=header)
+        return pd.DataFrame()
 
-    if not values:
-        # Tomt ark => returnera tomt med korrekt schema
-        return pd.DataFrame(columns=FINAL_COLS)
+    df = pd.DataFrame(rows)
 
-    header_idx = _find_header_row(values)
-    headers = [str(h).strip() for h in values[header_idx]]
-    body = values[header_idx + 1 :]
-
-    # Trimma body till header-längd
-    trimmed = [row[: len(headers)] for row in body]
-
-    df = pd.DataFrame(trimmed, columns=headers)
-    # Rensa tomma strängar
-    df = df.replace({"": np.nan})
-
-    # Ta bort helt tomma rader
-    if "Ticker" in df.columns:
-        df = df[~df["Ticker"].isna() & (df["Ticker"].astype(str).str.strip() != "")]
-    df = df.reset_index(drop=True)
-
-    # Säkerställ schema
-    df = ensure_schema(df, FINAL_COLS)
-
-    # Datatyper
-    df = _coerce_types(df)
-
-    # Dubblettskydd i minnet (appens spar-logik får bestämma senare om sammanfogning)
-    df, _ = dedupe_tickers(df)
-
+    # Normalisera kolumnnamn (trimma whitespace)
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def spara_data(df: pd.DataFrame, do_snapshot: bool = False) -> None:
+def spara_data(df: pd.DataFrame) -> None:
     """
-    Skriver tillbaka hela tabellen:
-      - Kolumnordning enligt FINAL_COLS
-      - Tomma celler -> "" (inte NaN)
+    Skriver hela DataFrame till bladet.
+    - Rensar arket
+    - Skriver header + värden
+    Bevarar kolumnordningen enligt df.columns.
     """
-    ws = get_ws(SHEET_NAME)
-    # Se till att kolumner finns i rätt ordning
-    out = ensure_schema(df.copy(), FINAL_COLS)
-    out = out[FINAL_COLS]
+    if df is None:
+        return
 
-    # Gör om NaN -> ""
-    out = out.replace({np.nan: ""})
-    values = [list(out.columns)]
-    values += out.astype(str).values.tolist()
+    ws = get_ws()
+    # Säkerställ strängrubriker
+    headers = [str(c) for c in df.columns.tolist()]
 
-    with_backoff(ws.clear)
-    with_backoff(ws.update, values)
+    # Konvertera DataFrame till listor
+    if len(df) > 0:
+        values = df.astype(object).where(pd.notna(df), "").values.tolist()
+    else:
+        values = []
+
+    body: List[List[Any]] = [headers] + values
+
+    # Skriv med backoff (clear + update)
+    _with_backoff(ws.clear)
+    _with_backoff(ws.update, body)

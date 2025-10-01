@@ -66,7 +66,7 @@ def safe_float(x, default=np.nan) -> float:
 
 def parse_date(x) -> pd.Timestamp:
     """Parsa datum/timestamp till pandas Timestamp, annars NaT."""
-    if x is None or (isinstance(x, float) and math.isnan(x)):
+    if x is None or (isinstance(x, float) and math.isfinite(x) and math.isnan(x)):
         return pd.NaT
     try:
         return pd.to_datetime(x, utc=False, errors="coerce")

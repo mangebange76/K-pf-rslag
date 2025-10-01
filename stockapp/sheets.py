@@ -1,93 +1,82 @@
-# stockapp/sheets.py
 # -*- coding: utf-8 -*-
 """
-Enkla hjälpare för Google Sheets:
-- get_spreadsheet()           -> Spreadsheet-objektet (via st.secrets["SHEET_URL"])
-- get_ws(name, create=True)   -> Worksheet med angivet namn (skapar om saknas)
-- ensure_ws(name, header=...) -> Samma som get_ws men kan skriva rubrikrad om bladet är tomt
-
-Krav i st.secrets:
-- GOOGLE_CREDENTIALS : service account JSON (dict)
-- SHEET_URL          : fullständig URL till ditt Google Sheet
+stockapp.sheets
+----------------
+Säker, återanvändbar koppling till Google Sheets via gspread.
+- get_ws(title=None): öppnar rätt kalkylblad och worksheet
+- list_worksheets(): listar blad
+- safe_get_all_values(ws): robust hämtning av alla värden
 """
 
 from __future__ import annotations
-from typing import List, Optional
 
+from typing import List, Optional
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
+from .config import SHEET_URL, SHEET_NAME
 from .utils import with_backoff
 
 
-# ---------------------------------------------------------------------
-# Autentisering & klient
-# ---------------------------------------------------------------------
-def _gspread_client() -> gspread.Client:
-    creds_info = st.secrets.get("GOOGLE_CREDENTIALS")
-    if not creds_info:
-        raise RuntimeError("GOOGLE_CREDENTIALS saknas i st.secrets.")
+def _client() -> gspread.Client:
     scope = [
-        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(creds_info, scopes=scope)
-    return gspread.authorize(creds)
+    creds_info = st.secrets.get("GOOGLE_CREDENTIALS")
+    if not creds_info:
+        raise RuntimeError("Saknar GOOGLE_CREDENTIALS i st.secrets.")
+    credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
+    return gspread.authorize(credentials)
 
 
-def get_spreadsheet() -> gspread.Spreadsheet:
-    """
-    Öppnar kalkylarket via URL i st.secrets["SHEET_URL"].
-    """
-    url = st.secrets.get("SHEET_URL")
+def _spreadsheet() -> gspread.Spreadsheet:
+    url = st.secrets.get("SHEET_URL", SHEET_URL)
     if not url:
-        raise RuntimeError("SHEET_URL saknas i st.secrets.")
-    client = _gspread_client()
-    return client.open_by_url(url)
+        raise RuntimeError("SHEET_URL saknas i st.secrets och config.")
+    cli = _client()
+    return cli.open_by_url(url)
 
 
-# ---------------------------------------------------------------------
-# Worksheet-access
-# ---------------------------------------------------------------------
-def get_ws(name: str, create_if_missing: bool = True) -> gspread.Worksheet:
-    """
-    Hämtar ett worksheet. Skapar om det saknas (default).
-    """
-    ss = get_spreadsheet()
+def list_worksheets() -> List[str]:
     try:
-        return ss.worksheet(name)
-    except Exception:
-        if not create_if_missing:
-            raise
-        with_backoff(ss.add_worksheet, title=name, rows=1000, cols=50)
-        return ss.worksheet(name)
+        ss = _spreadsheet()
+        return [ws.title for ws in ss.worksheets()]
+    except Exception as e:
+        st.error(f"⚠️ Kunde inte lista worksheet: {e}")
+        return []
 
 
-def ensure_ws(
-    name: str,
-    header: Optional[List[str]] = None,
-    rows: int = 1000,
-    cols: int = 50,
-) -> gspread.Worksheet:
+def get_ws(title: Optional[str] = None) -> gspread.Worksheet:
     """
-    Säkerställer att ett worksheet finns. Om header anges och bladet är tomt,
-    skrivs headern in som första rad.
+    Öppnar worksheet. Om 'title' saknas används SHEET_NAME.
+    Faller tillbaka till första arkfliken om den angivna inte hittas.
+    Skapar INTE nya blad här (skrivmodul gör det), för att undvika
+    att råka skapa fel blad vid stavfel i namn.
     """
-    ss = get_spreadsheet()
+    ss = _spreadsheet()
+    want = (title or SHEET_NAME or "").strip()
+
+    if want:
+        try:
+            return ss.worksheet(want)
+        except Exception:
+            st.warning(f"Angivet worksheet '{want}' hittades inte. Faller tillbaka till första bladet.")
+    # fallback: första bladet
+    wss = ss.worksheets()
+    if not wss:
+        raise RuntimeError("Kalkylbladet saknar helt worksheets.")
+    return wss[0]
+
+
+def safe_get_all_values(ws: gspread.Worksheet) -> List[List[str]]:
+    """
+    Hämtar alla cellvärden (inklusive ev. tomma). Returnerar alltid list (kan vara []).
+    """
     try:
-        ws = ss.worksheet(name)
-        if header:
-            try:
-                existing = ws.get_all_values()
-                if not existing:
-                    with_backoff(ws.update, [header])
-            except Exception:
-                pass
-        return ws
-    except Exception:
-        with_backoff(ss.add_worksheet, title=name, rows=max(10, rows), cols=max(5, cols))
-        ws = ss.worksheet(name)
-        if header:
-            with_backoff(ws.update, [header])
-        return ws
+        vals = with_backoff(ws.get_all_values)
+        return vals or []
+    except Exception as e:
+        st.error(f"⚠️ Kunde inte läsa data från Google Sheet: {e}")
+        return []

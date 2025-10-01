@@ -57,6 +57,8 @@ except Exception:
 from stockapp.storage import hamta_data, spara_data
 from stockapp.utils import (
     add_oldest_ts_col,
+    canonicalize_df_columns,   # <— NYTT
+    debug_df_overview,         # <— NYTT
     dedupe_tickers,
     ensure_schema,
     format_large_number,
@@ -118,13 +120,15 @@ def _init_state_defaults():
 
 
 def _load_df() -> pd.DataFrame:
-    """Hämta df från Google Sheet – säkra schema och varna om problem."""
+    """Hämta df från Google Sheet – normalisera rubriker och säkra schema."""
     try:
         df = hamta_data()
+        # 1) normalisera rubriker (Aktuell kurs -> Kurs, Market Cap (valuta) -> Market Cap, etc.)
+        df = canonicalize_df_columns(df)
+        # 2) säkerställ att alla väntade kolumner finns
         df = ensure_schema(df, FINAL_COLS)
     except Exception as e:
         st.warning(f"⚠️ Kunde inte läsa data från Google Sheet: {e}")
-        # Fortsätt med tom i minnet
         df = pd.DataFrame(columns=FINAL_COLS)
 
     # dubblettskydd (i minnet)
@@ -135,9 +139,10 @@ def _load_df() -> pd.DataFrame:
 
 
 def _save_df(df: pd.DataFrame):
-    """Spara df till Google Sheet – robust med backoff."""
+    """Spara df till Google Sheet – robust, och normalisera innan write."""
     try:
-        spara_data(df)
+        out = canonicalize_df_columns(df.copy())
+        spara_data(out)
         st.success("✅ Ändringar sparade.")
     except Exception as e:
         st.error(f"🚫 Kunde inte spara till Google Sheet: {e}")
@@ -252,6 +257,8 @@ def _runner_price(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> T
         if price and price > 0:
             df.loc[ridx, "Kurs"] = float(price)
             df = stamp_fields_ts(df, ["Kurs"], ts_suffix=" TS")
+            # normalisera efter uppdatering
+            df = canonicalize_df_columns(df)
             return df, "OK"
         return df, "Pris saknas"
     except Exception as e:
@@ -267,9 +274,10 @@ def _runner_full(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> Tu
         out = run_update_full(df, tkr, user_rates)  # type: ignore
         if isinstance(out, tuple) and len(out) == 2:
             df2, msg = out
+            df2 = canonicalize_df_columns(df2)
             return df2, str(msg)
-        # om orkestrator returnerar bara df
         if isinstance(out, pd.DataFrame):
+            out = canonicalize_df_columns(out)
             return out, "OK"
         return df, "Orchestrator: oväntat svar"
     except Exception as e:
@@ -296,10 +304,8 @@ def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[s
         done += 1
         bar.progress(done / total, text=f"{done}/{total}")
         log_lines.append(f"{tkr}: {msg}")
-
         # plocka bort från kö
         st.session_state["batch_queue"] = [x for x in st.session_state["batch_queue"] if x != tkr]
-
         if done % 5 == 0:
             _save_df(work)
 
@@ -378,8 +384,10 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
         with st.container(border=True):
             st.subheader(f"{row.get('Bolagsnamn', '')} ({row.get('Ticker', '')})")
             cols = st.columns(4)
-            cols[0].metric("P/S (TTM)", f"{safe_float(row.get('P/S'), np.nan):.2f}" if not math.isnan(safe_float(row.get("P/S"), np.nan)) else "–")
-            cols[1].metric("P/S-snitt (4Q)", f"{safe_float(row.get('P/S-snitt (Q1..Q4)'), np.nan):.2f}" if not math.isnan(safe_float(row.get("P/S-snitt (Q1..Q4)"), np.nan)) else "–")
+            ps_val = safe_float(row.get("P/S"), np.nan)
+            ps_avg = safe_float(row.get("P/S-snitt (Q1..Q4)"), np.nan)
+            cols[0].metric("P/S (TTM)", f"{ps_val:.2f}" if not math.isnan(ps_val) else "–")
+            cols[1].metric("P/S-snitt (4Q)", f"{ps_avg:.2f}" if not math.isnan(ps_avg) else "–")
             mcap_disp = format_large_number(row.get("Market Cap", np.nan), "USD")
             cols[2].metric("Market Cap (nu)", mcap_disp)
             cols[3].write(f"**Risklabel:** {row.get('Risklabel', 'Unknown')}")
@@ -389,7 +397,6 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
                 for c in ["Sektor", "Valuta", "Debt/Equity", "Bruttomarginal (%)", "Nettomarginal (%)", "Utestående aktier (milj.)", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]:
                     if c in df.columns:
                         info.append((c, row.get(c)))
-                # formattera market cap tydligt
                 info.insert(0, ("Market Cap (nu)", mcap_disp))
                 for k, v in info:
                     if isinstance(v, (int, float)) and not math.isnan(float(v)):
@@ -397,7 +404,6 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
                     else:
                         st.write(f"- **{k}:** –")
 
-            # bedömning enklare etikett om Score finns
             if "Score" in df.columns and not pd.isna(row.get("Score")):
                 sc = float(row.get("Score"))
                 if sc >= 85:
@@ -443,12 +449,14 @@ def vy_edit(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
         df2, msg = _runner_price(df, current_tkr, user_rates)
         st.toast(f"{current_tkr}: {msg}")
         if df2 is not None:
+            df2 = canonicalize_df_columns(df2)
             _save_df(df2)
             st.session_state["_df_ref"] = df2
     if coly.button("Full uppdatering"):
         df2, msg = _runner_full(df, current_tkr, user_rates)
         st.toast(f"{current_tkr}: {msg}")
         if df2 is not None:
+            df2 = canonicalize_df_columns(df2)
             _save_df(df2)
             st.session_state["_df_ref"] = df2
 
@@ -531,12 +539,16 @@ def main():
 
     # Läs data
     df = _load_df()
+    # Visa översikt av den normaliserade tabellen (frivilligt men bra vid felsökning)
+    debug_df_overview(df, "Inläst tabell (efter normalisering)")
     st.session_state["_df_ref"] = df
 
     # Sidopanel – valutor & batch
     user_rates = _sidebar_rates()
     df2 = _sidebar_batch(st.session_state["_df_ref"], user_rates)
     if df2 is not st.session_state["_df_ref"]:
+        # normalisera om något ändrats
+        df2 = canonicalize_df_columns(df2)
         st.session_state["_df_ref"] = df2
 
     # Välj vy
@@ -551,6 +563,7 @@ def main():
     elif st.session_state["view"] == "Lägg till / uppdatera":
         df3 = vy_edit(st.session_state["_df_ref"], user_rates)
         if df3 is not st.session_state["_df_ref"]:
+            df3 = canonicalize_df_columns(df3)
             st.session_state["_df_ref"] = df3
     else:
         vy_portfolio(st.session_state["_df_ref"], user_rates)

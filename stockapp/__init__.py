@@ -1,11 +1,8 @@
+# stockapp/__init__.py
 # -*- coding: utf-8 -*-
 """
-Minimal init för stockapp.
-
-VIKTIGT:
-- Importera INTE andra delmoduler här.
-- Låt appen/modulerna själva importera det de behöver.
-Detta undviker cirkulära importer (t.ex. när app.py importerar stockapp.utils).
+Håll detta minimalt för att undvika cirkulära imports.
+Inga imports härifrån – moduler importeras direkt där de behövs.
 """
 
-__all__ = []  # håll tomt för att undvika oavsiktlig wildcard-export
+__all__ = []

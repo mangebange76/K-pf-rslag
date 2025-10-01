@@ -1,233 +1,212 @@
+# stockapp/utils.py
 # -*- coding: utf-8 -*-
+"""
+Fristående hjälpfunktioner (inga beroenden till andra stockapp-moduler):
+- with_backoff(fn, *args, **kwargs)
+- safe_float(x, default=np.nan)
+- parse_date(x) -> pd.Timestamp | pd.NaT
+- now_stamp() -> str
+- stamp_fields_ts(df, fields, ts_suffix=" TS")
+- ensure_schema(df, cols)
+- dedupe_tickers(df) -> (df_no_dups, removed_list)
+- add_oldest_ts_col(df, dest_col="__oldest_ts__", ts_suffix=" TS")
+- format_large_number(value, currency="SEK")
+- risk_label_from_mcap(mcap_usd_or_local) -> str
+"""
+
 from __future__ import annotations
 
 import math
-import re
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import time
+from typing import Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
-import streamlit as st
+
 
 # ------------------------------------------------------------
-# Hjälpare för robust DataFrame-hantering
+# Backoff/retry
 # ------------------------------------------------------------
+def with_backoff(fn, *args, **kwargs):
+    """Exekvera fn med enkel exponential backoff."""
+    delay = 0.5
+    last_err: Exception | None = None
+    for _ in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    if last_err:
+        raise last_err
+    raise RuntimeError("Okänt fel i with_backoff")
 
-# 1) Lista av "alias" -> kanoniskt namn.
-#    Poängen: du har redan *din* rubrikstandard i arket. Vi mappar *till dina namn*.
-#    Lägg gärna till fler alias efterhand (vänster = variant; höger = din rubrik).
-COLUMN_ALIASES: Dict[str, str] = {
-    # identitet/metadata
-    "ticker": "Ticker",
-    "symbol": "Ticker",
-    "bolagsnamn": "Bolagsnamn",
-    "company": "Bolagsnamn",
-    "company name": "Bolagsnamn",
-    "valuta": "Valuta",
-    "currency": "Valuta",
 
-    # priser/kap
-    "kurs": "Aktuell kurs",
-    "pris": "Aktuell kurs",
-    "last": "Aktuell kurs",
-    "market cap": "Market Cap (SEK)",
-    "market cap (nu)": "Market Cap (SEK)",
-    "marketcap (sek)": "Market Cap (SEK)",
-    "market cap (sek)": "Market Cap (SEK)",
-    "market cap (currency)": "Market Cap (valuta)",
-    "market cap (valuta)": "Market Cap (valuta)",
+# ------------------------------------------------------------
+# Robust parsing/konvertering
+# ------------------------------------------------------------
+def safe_float(x, default=np.nan) -> float:
+    """Konvertera till float, annars default."""
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float, np.floating)):
+            return float(x)
+        s = str(x).strip().replace(" ", "").replace("\u00A0", "")
+        s = s.replace(",", ".")
+        # ta bort tusentals-separatorer om det ser ut som 1.234.567,89
+        if s.count(".") > 1 and "," not in s:
+            parts = s.split(".")
+            s = "".join(parts[:-1]) + "." + parts[-1]
+        return float(s)
+    except Exception:
+        return default
 
-    # shares
-    "shares outstanding": "Utestående aktier",
-    "utestående aktier": "Utestående aktier",
 
-    # P/S
-    "p/s": "P/S",
-    "ps": "P/S",
-    "p/s q1": "P/S Q1",
-    "p/s q2": "P/S Q2",
-    "p/s q3": "P/S Q3",
-    "p/s q4": "P/S Q4",
-    "p/s-snitt": "P/S-snitt",
-    "p/s 4q-snitt": "P/S-snitt",
-    "p/s-snitt (4 kvartal)": "P/S-snitt",
-
-    # revenue / omsättning
-    "omsättning idag": "Omsättning idag",
-    "omsättning i år": "Omsättning idag",
-    "revenue ttm": "Omsättning idag",
-    "revenue this year": "Omsättning idag",
-    "omsättning nästa år": "Omsättning nästa år",
-    "omsättning om 2 år": "Omsättning om 2 år",
-    "omsättning om 3 år": "Omsättning om 3 år",
-
-    # riktkurser
-    "riktkurs idag": "Riktkurs idag",
-    "riktkurs om 1 år": "Riktkurs om 1 år",
-    "riktkurs om 2 år": "Riktkurs om 2 år",
-    "riktkurs om 3 år": "Riktkurs om 3 år",
-
-    # portfölj
-    "antal aktier": "Antal aktier",
-    "ägda aktier": "Antal aktier",
-    "gav (sek)": "GAV (SEK)",
-    "gav": "GAV (SEK)",
-
-    # utdelningsdata
-    "årlig utdelning": "Årlig utdelning",
-    "dividend yield (%)": "Dividend Yield (%)",
-    "payout ratio cf (%)": "Payout Ratio CF (%)",
-
-    # övriga nyckeltal
-    "cagr 5 år (%)": "CAGR 5 år (%)",
-    "bruttomarginal (%)": "Bruttomarginal (%)",
-    "nettomarginal (%)": "Nettomarginal (%)",
-    "fcf (m)": "FCF (M)",
-    "kassa (m)": "Kassa (M)",
-    "runway (kvartal)": "Runway (kvartal)",
-    "debt/equity": "Debt/Equity",
-    "ev/ebitda": "EV/EBITDA",
-
-    # klassning
-    "risklabel": "Risklabel",
-    "risk label": "Risklabel",
-    "sektor": "Sektor",
-    "sector": "Sektor",
-    "industri": "Industri",
-    "industry": "Industri",
-
-    # tidsstämplar
-    "senast manuellt uppdaterad": "Senast manuellt uppdaterad",
-    "senast auto-uppdaterad": "Senast auto-uppdaterad",
-    "senast uppdaterad källa": "Senast uppdaterad källa",
-
-    # TS-fält
-    "ts_utestående aktier": "TS_Utestående aktier",
-    "ts_p/s": "TS_P/S",
-    "ts_p/s q1": "TS_P/S Q1",
-    "ts_p/s q2": "TS_P/S Q2",
-    "ts_p/s q3": "TS_P/S Q3",
-    "ts_p/s q4": "TS_P/S Q4",
-    "ts_omsättning idag": "TS_Omsättning idag",
-    "ts_omsättning nästa år": "TS_Omsättning nästa år",
-}
-
-# Kolumner som med hög sannolikhet ska vara numeriska (konverteras robust)
-LIKELY_NUMERIC: Tuple[str, ...] = (
-    "Aktuell kurs",
-    "Utestående aktier",
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
-    "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-    "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier",
-    "Årlig utdelning",
-    "GAV (SEK)",
-    "CAGR 5 år (%)",
-    "Market Cap (valuta)",
-    "Market Cap (SEK)",
-    "Bruttomarginal (%)",
-    "Nettomarginal (%)",
-    "FCF (M)",
-    "Debt/Equity",
-    "Kassa (M)",
-    "Runway (kvartal)",
-    "EV/EBITDA",
-    "Dividend Yield (%)",
-    "Payout Ratio CF (%)",
-)
-
-def _clean_header(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
-
-def canonicalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - Trim/casefold på rubriker
-    - Mappa alias -> dina kanoniska namn (enligt COLUMN_ALIASES)
-    - Skapa 'säkra' standardkolumner om de saknas (med vettiga defaultar)
-    - Konvertera troliga numeriska kolumner robust (komma -> punkt; tusentals-sep)
-    """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Ticker", "Bolagsnamn", "Valuta"])
-
-    # 1) bygg nytt columns-lexikon
-    mapping: Dict[str, str] = {}
-    for c in df.columns:
-        key = _clean_header(c)
-        mapping[c] = COLUMN_ALIASES.get(key, COLUMN_ALIASES.get(key.strip(), None))
-        if mapping[c] is None:
-            # Ingen alias-träff: behåll originalnamnet
-            mapping[c] = str(c).strip()
-
-    df = df.rename(columns=mapping)
-
-    # 2) se till att grundkolumner finns
-    base_defaults = {
-        "Ticker": "",
-        "Bolagsnamn": "",
-        "Valuta": "USD",
-        "Antal aktier": 0.0,
-    }
-    for k, v in base_defaults.items():
-        if k not in df.columns:
-            df[k] = v
-
-    # 3) trim stringkolumner
-    for col in ("Ticker", "Bolagsnamn", "Valuta", "Risklabel", "Sektor", "Industri",
-                "Senast manuellt uppdaterad", "Senast auto-uppdaterad", "Senast uppdaterad källa"):
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-
-    # 4) robust numerik-konvertering
-    for col in LIKELY_NUMERIC:
-        if col in df.columns:
-            # ersätt tusentals-separatorer och komma-decimal
-            s = (
-                df[col]
-                .astype(str)
-                .str.replace(r"\s", "", regex=True)
-                .str.replace(",", ".", regex=False)
-                .str.replace(" ", "", regex=False)  # smal NBSP
-            )
-            df[col] = pd.to_numeric(s, errors="coerce")
-
-    # 5) normalisera ticker & valuta
-    df["Ticker"] = df["Ticker"].astype(str).str.upper()
-    df["Valuta"] = df["Valuta"].astype(str).str.upper()
-
-    # 6) deduplicera på Ticker (första företräde)
-    if "Ticker" in df.columns:
-        df = df[~df["Ticker"].duplicated(keep="first")]
-
-    return df.reset_index(drop=True)
-
-def pick_col(df: pd.DataFrame, candidates: Sequence[str], default: Optional[str] = None) -> Optional[str]:
-    """Returnera första kolumnen som finns i df av 'candidates' (namnsträng); annars default."""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return default
-
-def format_large_number(x: Union[float, int, None], curr: str = "") -> str:
-    """Formatera stort tal med tn/mdr/milj – utan att kasta på NaN."""
+def parse_date(x) -> pd.Timestamp:
+    """Parsa datum/timestamp till pandas Timestamp, annars NaT."""
     if x is None or (isinstance(x, float) and math.isnan(x)):
-        return "–"
-    n = float(x)
-    sign = "-" if n < 0 else ""
-    n = abs(n)
-    if n >= 1e12:
-        s = f"{n/1e12:.2f} tn"
-    elif n >= 1e9:
-        s = f"{n/1e9:.2f} mdr"
-    elif n >= 1e6:
-        s = f"{n/1e6:.2f} milj"
-    else:
-        s = f"{n:.0f}"
-    return f"{sign}{s} {curr}".strip()
+        return pd.NaT
+    try:
+        return pd.to_datetime(x, utc=False, errors="coerce")
+    except Exception:
+        return pd.NaT
 
-def debug_df_overview(df: pd.DataFrame, title: str = "Datakoll"):
-    """Liten diagnosruta i UI så vi ser vad som faktiskt finns."""
-    with st.expander(f"🛠 {title}", expanded=False):
-        st.write(f"Rader: **{len(df)}**")
-        st.write("Kolumner:", list(df.columns))
-        if len(df) > 0:
-            st.dataframe(df.head(10), use_container_width=True)
+
+def now_stamp() -> str:
+    """ISO-liknande tidsstämpel (lokal tid)."""
+    return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+
+
+# ------------------------------------------------------------
+# DataFrame utilities
+# ------------------------------------------------------------
+def stamp_fields_ts(df: pd.DataFrame, fields: Iterable[str], ts_suffix: str = " TS") -> pd.DataFrame:
+    """
+    Stämpla fält med tidsstämpel-kolumner (alltid stämpla, även om värdet är oförändrat).
+    Skapar kolumnen '<fält><ts_suffix>' om den saknas.
+    """
+    ts = now_stamp()
+    out = df.copy()
+    for f in fields:
+        ts_col = f"{f}{ts_suffix}"
+        if ts_col not in out.columns:
+            out[ts_col] = np.nan
+        out.loc[:, ts_col] = ts
+    return out
+
+
+def ensure_schema(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """
+    Säkerställ att alla kolumner i 'cols' finns i df.
+    Saknade kolumner läggs till med NaN / tomma strängar beroende på typ.
+    """
+    out = df.copy()
+    # normalisera kolumnnamn
+    out.columns = [str(c).strip() for c in out.columns]
+    for c in cols:
+        if c not in out.columns:
+            out[c] = np.nan
+    # flytta om kolumnordning så BEGINNING följer 'cols' först, resten efter
+    ordered = [c for c in cols if c in out.columns] + [c for c in out.columns if c not in cols]
+    out = out[ordered]
+    return out
+
+
+def dedupe_tickers(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Ta bort dubbletter baserat på kolumn 'Ticker' (behåll första förekomsten).
+    Returnerar (df_utan_dubletter, lista_med_borttagna_tickrar)
+    """
+    if "Ticker" not in df.columns:
+        return df.copy(), []
+    out = df.copy()
+    out["__TKR__"] = out["Ticker"].astype(str).str.upper().str.strip()
+    dup_mask = out["__TKR__"].duplicated(keep="first")
+    removed = out.loc[dup_mask, "Ticker"].astype(str).tolist()
+    out = out.loc[~dup_mask].drop(columns="__TKR__")
+    return out.reset_index(drop=True), removed
+
+
+def add_oldest_ts_col(df: pd.DataFrame, dest_col: str = "__oldest_ts__", ts_suffix: str = " TS") -> pd.DataFrame:
+    """
+    Beräkna äldsta (minsta) tidsstämpeln bland alla kolumner som slutar på ts_suffix.
+    Lägger resultatet i 'dest_col' (pd.Timestamp). NaT ignoreras i min-beräkningen.
+    """
+    out = df.copy()
+    ts_cols = [c for c in out.columns if str(c).endswith(ts_suffix)]
+    if not ts_cols:
+        out[dest_col] = pd.NaT
+        return out
+
+    def _row_oldest(s: pd.Series):
+        vals = [parse_date(s[c]) for c in ts_cols]
+        vals = [v for v in vals if not pd.isna(v)]
+        if not vals:
+            return pd.NaT
+        return min(vals)
+
+    out[dest_col] = out.apply(_row_oldest, axis=1)
+    return out
+
+
+# ------------------------------------------------------------
+# Presentation
+# ------------------------------------------------------------
+def format_large_number(value, currency: str = "SEK") -> str:
+    """
+    Formatera stora tal med svenska enheter:
+    - tn  (triljoner)
+    - mdr (miljarder)
+    - m   (miljoner)
+    - k   (tusen)
+    Ex: 4_250_000_000_000 -> '4,25 tn USD'
+    """
+    v = safe_float(value, default=np.nan)
+    if pd.isna(v):
+        return "–"
+    neg = v < 0
+    v = abs(v)
+
+    unit = ""
+    if v >= 1_000_000_000_000:
+        v = v / 1_000_000_000_000
+        unit = " tn"
+    elif v >= 1_000_000_000:
+        v = v / 1_000_000_000
+        unit = " mdr"
+    elif v >= 1_000_000:
+        v = v / 1_000_000
+        unit = " m"
+    elif v >= 1_000:
+        v = v / 1_000
+        unit = " k"
+
+    s = f"{'-' if neg else ''}{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+    # Lägg på valuta sist
+    return f"{s}{unit} {currency}"
+
+
+def risk_label_from_mcap(mcap) -> str:
+    """
+    Grov storleksklass baserat på market cap (antar samma valuta för jämförelse).
+    Trösklar ungefär:
+      Micro < 0,3 mdr
+      Small < 2 mdr
+      Mid   < 10 mdr
+      Large < 200 mdr
+      Mega  ≥ 200 mdr
+    """
+    x = safe_float(mcap, default=np.nan)
+    if pd.isna(x):
+        return "Unknown"
+    if x < 300_000_000:
+        return "Micro"
+    if x < 2_000_000_000:
+        return "Small"
+    if x < 10_000_000_000:
+        return "Mid"
+    if x < 200_000_000_000:
+        return "Large"
+    return "Mega"

@@ -1,156 +1,231 @@
+# stockapp/utils.py
 # -*- coding: utf-8 -*-
-"""
-stockapp.utils
---------------
-Gemensamma hjälp-funktioner:
-- normalize_columns(df)
-- ensure_schema(df, cols)
-- dedupe_tickers(df)
-- with_backoff(fn, *args, **kwargs)
-- now_stamp(), stamp_fields_ts(df, cols)
-- to_float(x), to_int(x)
-"""
-
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, List, Sequence, Tuple
+import math
+import re
 import time
-import datetime as dt
+from datetime import datetime, date
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-
-# ---- Enkel backoff för gspread/HTTP-anrop -----------------------------------
-def with_backoff(fn: Callable, *args, **kwargs):
-    delays = [0.0, 0.5, 1.0, 2.0, 3.0]
-    last_exc = None
-    for d in delays:
-        try:
-            if d:
-                time.sleep(d)
-            return fn(*args, **kwargs)
-        except Exception as e:
-            last_exc = e
-            continue
-    raise last_exc
+__all__ = [
+    "now_stamp",
+    "with_backoff",
+    "safe_float",
+    "parse_date",
+    "format_large_number",
+    "ensure_schema",
+    "stamp_fields_ts",
+    "dedupe_tickers",
+    "add_oldest_ts_col",
+    "risk_label_from_mcap",
+]
 
 
-# ---- Datumstämplar -----------------------------------------------------------
+# --------------------------------------------------------------------
+# Tids- & backoff-hjälpare
+# --------------------------------------------------------------------
 def now_stamp() -> str:
-    return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    """ISO8601 med sekundprecision, lokal tid."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def stamp_fields_ts(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
-    ts = now_stamp()
-    for c in cols:
-        if c in df.columns:
-            df.loc[:, c] = ts
-    return df
+def with_backoff(fn: Callable, *args, retries: int = 5, base_delay: float = 0.6, **kwargs):
+    """
+    Kör fn(*args, **kwargs) med exponentiell backoff.
+    Returnerar fn:s returvärde eller re-raisar sista felet.
+    """
+    last_exc: Optional[BaseException] = None
+    for i in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            sleep_s = base_delay * (2**i)
+            time.sleep(sleep_s)
+    if last_exc:
+        raise last_exc
 
 
-# ---- Numeriska konverterare --------------------------------------------------
-def to_float(x) -> float:
+# --------------------------------------------------------------------
+# Parsning & format
+# --------------------------------------------------------------------
+def safe_float(x: Any, default: float = float("nan")) -> float:
+    """
+    Robust str->float: hanterar kommatecken, whitespace, "N/A", None.
+    """
     if x is None:
-        return 0.0
+        return default
     if isinstance(x, (int, float, np.number)):
-        return float(x)
-    s = str(x).strip().replace(" ", "").replace("\u202f", "").replace(",", ".")
-    if s in ("", "nan", "None", "-"):
-        return 0.0
+        try:
+            return float(x)
+        except Exception:
+            return default
+    s = str(x).strip()
+    if s == "" or s.upper() in {"NA", "N/A", "NONE", "NULL", "-", "—"}:
+        return default
+    s = s.replace(" ", "").replace("\xa0", "").replace(",", ".")
+    # plocka ut första talet i strängen
+    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+    if not m:
+        return default
     try:
-        return float(s)
+        return float(m.group(0))
     except Exception:
-        return 0.0
+        return default
 
 
-def to_int(x) -> int:
-    return int(round(to_float(x)))
+def parse_date(x: Any) -> Optional[datetime]:
+    """Försöker tolkas som datum/tid -> datetime eller None."""
+    if x is None or x == "":
+        return None
+    try:
+        return pd.to_datetime(x, errors="coerce")
+    except Exception:
+        try:
+            return datetime.fromisoformat(str(x))
+        except Exception:
+            return None
 
 
-# ---- Kolumn-normalisering & schema ------------------------------------------
-_NORMALIZE_MAP: Dict[str, str] = {
-    # namn
-    "bolagsnamn": "Namn",
-    "company": "Namn",
-    "name": "Namn",
-    # ticker lämnas som "Ticker"
-    # valuta
-    "currency": "Valuta",
-    # antal aktier
-    "antal": "Antal aktier",
-    "antal aktier du äger": "Antal aktier",
-    "antal aktier (st)": "Antal aktier",
-    "qty": "Antal aktier",
-    "quantity": "Antal aktier",
-    # GAV
-    "gav": "GAV (SEK)",
-    "gav (sek)": "GAV (SEK)",
-    "gav sek": "GAV (SEK)",
-    # sektor
-    "sector": "Sektor",
-    "sektor": "Sektor",
-}
+def format_large_number(n: Any, currency: Optional[str] = None, decimals: int = 2) -> str:
+    """
+    Snygg formattering: 4.34 biljoner USD, 56.8 miljarder SEK, 125.3 miljoner NOK, etc.
+    Antag n i 'hela valutanheter' (t.ex. 4_340_000_000_000 = 4.34 biljoner).
+    """
+    v = safe_float(n, default=float("nan"))
+    if math.isnan(v):
+        return "–"
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+
+    unit = ""
+    scaled = v
+    if v >= 1_000_000_000_000:
+        scaled = v / 1_000_000_000_000.0
+        unit = "biljoner"
+    elif v >= 1_000_000_000:
+        scaled = v / 1_000_000_000.0
+        unit = "miljarder"
+    elif v >= 1_000_000:
+        scaled = v / 1_000_000.0
+        unit = "miljoner"
+
+    cur = f" {currency}" if currency else ""
+    if unit:
+        return f"{sign}{scaled:.{decimals}f} {unit}{cur}"
+    # mindre än miljoner – visa med tusavgränsare
+    return f"{sign}{scaled:,.{decimals}f}{cur}".replace(",", " ").replace(".", ",")
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Byter kolumnnamn enligt _NORMALIZE_MAP och trimmar whitespace."""
-    if df is None or df.empty:
-        return df
-
-    new_cols = []
-    for c in df.columns:
-        base = (c or "").strip()
-        key = base.lower()
-        new_cols.append(_NORMALIZE_MAP.get(key, base))
-    df = df.rename(columns=dict(zip(df.columns, new_cols)))
-    # trimma strängkolumner
-    for c in df.columns:
-        if pd.api.types.is_object_dtype(df[c]):
-            df[c] = df[c].astype(str).str.strip()
-    # Ticker alltid VERSAL
-    if "Ticker" in df.columns:
-        df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
-    return df
-
-
+# --------------------------------------------------------------------
+# DataFrame-stöd
+# --------------------------------------------------------------------
 def ensure_schema(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
     """
-    Säkerställ att alla förväntade kolumner finns. Saknade läggs till med default.
-    Default för numeriska nyckeltal = 0.0, strängfält = "".
+    Säkerställ att alla kolumner i `cols` finns, i rätt ordning.
+    Behåll övriga kolumner efter `cols`.
     """
-    if df is None or df.empty:
-        df = pd.DataFrame(columns=list(cols))
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.DataFrame(columns=list(cols))
 
-    # Normalisera först (för att få t.ex. 'Bolagsnamn' -> 'Namn')
-    df = normalize_columns(df)
-
-    # Lägg till saknade kolumnnamn
+    work = df.copy()
     for c in cols:
-        if c not in df.columns:
-            df[c] = ""  # sätts om till 0.0 för numeriska längre ner
+        if c not in work.columns:
+            work[c] = np.nan
 
-    # rimliga defaultar för numeriska nyckeltal
-    numeric_like = {
-        "Antal aktier",
-        "GAV (SEK)",
-        "Market Cap",
-        "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Utestående aktier (milj.)",
-        "Debt/Equity", "P/B", "ROE (%)",
-        "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
-        "FCF Yield (%)", "Dividend yield (%)", "Dividend payout (FCF) (%)",
-        "Net debt / EBITDA",
-        "Pris", "Kurs", "Vikt (%)", "Andel (%)",
-    }
-    for c in df.columns:
-        if c in numeric_like:
-            df[c] = df[c].apply(to_float)
-
-    return df
+    # behåll kolumner som inte finns i cols längst bak
+    other = [c for c in work.columns if c not in cols]
+    return work[list(cols) + other]
 
 
-def dedupe_tickers(df: pd.DataFrame) -> pd.DataFrame:
-    if "Ticker" not in df.columns:
+def stamp_fields_ts(
+    df: pd.DataFrame,
+    fields: Iterable[str],
+    ts_suffix: str = " TS",
+    stamp: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Sätt/uppdatera tidsstämplar för givna fält.
+    Skapar '[fält] TS' om saknas.
+    """
+    if df is None or not len(df):
         return df
-    return df.drop_duplicates(subset=["Ticker"], keep="first").reset_index(drop=True)
+    stamp = stamp or now_stamp()
+    out = df.copy()
+    for field in fields:
+        ts_col = f"{field}{ts_suffix}"
+        if ts_col not in out.columns:
+            out[ts_col] = np.nan
+        out.loc[:, ts_col] = stamp
+    return out
+
+
+def dedupe_tickers(df: pd.DataFrame, key: str = "Ticker") -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Ta bort dubbletter på Ticker (case-insensitive). Returnerar (df_utan_dup, lista_med_dup_tickers).
+    Bevarar första förekomsten.
+    """
+    if df is None or key not in df.columns:
+        return df, []
+
+    work = df.copy()
+    norm = work[key].astype(str).str.upper().str.strip()
+    dup_mask = norm.duplicated(keep="first")
+    dups = sorted(norm[dup_mask].unique().tolist())
+    if dups:
+        work = work[~dup_mask].reset_index(drop=True)
+    return work, dups
+
+
+def add_oldest_ts_col(
+    df: pd.DataFrame,
+    ts_fields: Optional[Sequence[str]] = None,
+    dest_col: str = "Senaste TS (min av två)",
+) -> pd.DataFrame:
+    """
+    Skapa en hjälpkolumn med minsta (äldsta) TS över alla TS-kolumner i df.
+    - Om ts_fields anges: använd just dessa kolumner (som redan är TS-kolumner),
+      annars alla kolumner som innehåller 'TS' i namnet.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    work = df.copy()
+    if ts_fields:
+        ts_cols = [c for c in ts_fields if c in work.columns]
+    else:
+        ts_cols = [c for c in work.columns if "TS" in str(c)]
+
+    if not ts_cols:
+        work[dest_col] = pd.NaT
+        return work
+
+    tmp = work[ts_cols].apply(pd.to_datetime, errors="coerce")
+    work[dest_col] = tmp.min(axis=1)
+    return work
+
+
+# --------------------------------------------------------------------
+# Övrigt
+# --------------------------------------------------------------------
+def risk_label_from_mcap(mcap_value: Any) -> str:
+    """
+    Klassificera bolag efter börsvärde (USD).
+    Trösklar: Micro <0.3B, Small <2B, Mid <10B, Large <200B, annars Mega.
+    """
+    v = safe_float(mcap_value, default=float("nan"))
+    if math.isnan(v) or v <= 0:
+        return "Unknown"
+    if v < 0.3e9:
+        return "Micro"
+    if v < 2e9:
+        return "Small"
+    if v < 10e9:
+        return "Mid"
+    if v < 200e9:
+        return "Large"
+    return "Mega"

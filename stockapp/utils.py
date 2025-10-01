@@ -1,265 +1,172 @@
-# stockapp/utils.py
 # -*- coding: utf-8 -*-
+"""
+Utility-funktioner som används i hela appen.
+
+Exponerar:
+- with_backoff(func, *args, **kwargs)
+- now_stamp()
+- ensure_schema(df, cols)
+- dedupe_tickers(df) -> (df2, removed_list)
+- add_oldest_ts_col(df)
+- stamp_fields_ts(row: dict, fields: list[str])  # sätter "TS <field>" = now
+- format_large_number(x, currency=None)
+- coerce_float(x)
+"""
 
 from __future__ import annotations
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-from datetime import datetime
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+import math
 import time
-import random
+import datetime as dt
 
 import pandas as pd
-import numpy as np
 
-# Läs konfig som definierar schema och TS-fält
-from .config import FINAL_COLS, TS_FIELDS
 
-# ------------------------------------------------------------
-# Små hjälpare
-# ------------------------------------------------------------
-def now_stamp() -> str:
-    """Tidsstämpel i lokal tid, kompakt och läsbar."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if x is None or (isinstance(x, str) and x.strip() == ""):
-            return default
-        return float(str(x).replace(" ", "").replace(",", "."))
-    except Exception:
-        return default
-
-def _as_upper_ticker(x: Any) -> str:
-    return ("" if x is None else str(x)).strip().upper()
-
-def coalesce(*vals):
-    for v in vals:
-        if v is not None:
-            return v
-    return None
-
-def parse_dt_maybe(s: Any) -> Optional[datetime]:
-    if s is None:
-        return None
-    if isinstance(s, datetime):
-        return s
-    txt = str(s).strip()
-    if not txt:
-        return None
-    # testa några vanliga format
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(txt, fmt)
-        except Exception:
-            pass
-    return None
-
-# ------------------------------------------------------------
-# Backoff runt API/Sheets-anrop
-# ------------------------------------------------------------
-def with_backoff(fn: Callable, *args, retries: int = 5, min_sleep: float = 0.6, max_sleep: float = 2.4, **kwargs):
+# ---------------------------------------------------------------------
+# Robust retries för Google Sheets-anrop
+# ---------------------------------------------------------------------
+def with_backoff(func: Callable, *args, **kwargs):
     """
-    Kör fn(*args, **kwargs) med enkel backoff. Höjer sista exception om den ej lyckas.
-    Användning:
-        with_backoff(ws.update, [["A","B"]])
-        rows = with_backoff(ws.get_all_records)
+    Kör func(*args, **kwargs) med enkel exponentiell backoff.
+    Svalar typiska 429/5xx fel och försöker igen några gånger.
     """
-    last_err = None
-    for i in range(retries):
+    delays = [0.4, 0.8, 1.6, 3.2, 6.4]
+    last_exc: Optional[Exception] = None
+    for d in delays:
         try:
-            return fn(*args, **kwargs)
+            return func(*args, **kwargs)
         except Exception as e:
-            last_err = e
-            # slumpa lite så parallella körningar inte synkar sönder kvoterna
-            slp = min_sleep + random.random() * (max_sleep - min_sleep)
-            time.sleep(slp)
-    # ge upp
-    raise last_err
+            last_exc = e
+            time.sleep(d)
+    # Sista, låt ev. fel bubbla upp (så vi får en tydlig traceback)
+    return func(*args, **kwargs)
 
-# ------------------------------------------------------------
-# DataFrame-schema & dubbletter
-# ------------------------------------------------------------
-def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+
+# ---------------------------------------------------------------------
+# Tid & tidsstämplar
+# ---------------------------------------------------------------------
+def now_stamp() -> str:
+    """UTC ISO8601 utan mikrosekunder + 'Z'."""
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+# ---------------------------------------------------------------------
+# DataFrame-hjälp
+# ---------------------------------------------------------------------
+def ensure_schema(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
     """
-    Säkerställ att alla kolumner i FINAL_COLS finns. Lägg till saknade med rimliga default.
-    Städa Ticker: uppercase, trim, och deduplicera.
+    Säkerställ att alla kolumner i 'cols' finns i df (läggs till som None om de saknas).
+    Ordningen bibehålls (df:s befintliga kolumner + saknade i slutet).
     """
     if df is None or not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame({c: [] for c in FINAL_COLS})
-
-    # Skapa saknade kolumner
-    for c in FINAL_COLS:
+        df = pd.DataFrame()
+    # lägg till saknade
+    for c in cols:
         if c not in df.columns:
-            # gissa typ: Ticker/namn-strängar -> "", annars 0.0
-            if c == "Ticker" or c.upper().startswith("TS_") or "Namn" in c or "Kommentar" in c:
-                df[c] = ""
-            else:
-                df[c] = 0.0
-
-    # Säkerställ Ticker-kolumn
-    if "Ticker" not in df.columns:
-        df["Ticker"] = ""
-
-    # Normalisera Ticker
-    df["Ticker"] = df["Ticker"].map(_as_upper_ticker)
-
-    # Deduplicera tickers
-    df = dedupe_tickers(df)
-
-    # Sätt kolumnordning om möjligt
-    try:
-        df = df[[c for c in FINAL_COLS if c in df.columns] + [c for c in df.columns if c not in FINAL_COLS]]
-    except Exception:
-        pass
-
-    df.reset_index(drop=True, inplace=True)
+            df[c] = None
     return df
 
-def dedupe_tickers(df: pd.DataFrame) -> pd.DataFrame:
+
+def dedupe_tickers(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Slå ihop dubbletter på Ticker (behåll första förekomsten).
+    Tar bort dubbletter på 'Ticker' (case-insensitive). Behåller första förekomsten.
+    Returnerar (ny_df, lista_med_borttagna_tickers).
     """
     if "Ticker" not in df.columns:
-        return df
-    before = len(df)
-    df = df.drop_duplicates(subset=["Ticker"], keep="first")
-    df.reset_index(drop=True, inplace=True)
-    after = len(df)
-    # Inga prints/logg här (Streamlit skriver i UI), men funktionen är robust
-    return df
+        return df.reset_index(drop=True), []
+    work = df.copy()
+    work["_T"] = work["Ticker"].astype(str).str.upper().str.strip()
+    keep = ~work["_T"].duplicated(keep="first")
+    removed = work.loc[~keep, "Ticker"].astype(str).tolist()
+    work = work.loc[keep].drop(columns=["_T"]).reset_index(drop=True)
+    return work, removed
 
-# ------------------------------------------------------------
-# TS (tidsstämplar)
-# ------------------------------------------------------------
-def _ts_col_for(field_name: str) -> str:
-    """
-    Hitta rätt TS-kolumn för ett visst datfält (via TS_FIELDS).
-    Om ej mappat -> använd 'TS_<field>'.
-    """
-    if field_name in TS_FIELDS:
-        return TS_FIELDS[field_name]
-    # fallback
-    return f"TS_{field_name}"
 
-def stamp_fields_ts(df: pd.DataFrame, row_idx: int, fields: Sequence[str]) -> pd.DataFrame:
+def add_oldest_ts_col(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Sätt TS-fält för givna fields på rad row_idx. Skapar TS-kolumner om de saknas.
-    TS stämplas alltid (även om värdet ej ändrats), för att visa när appen hämtade/satte fältet senast.
+    Lägger till kolumnen 'OldestTS' = minsta (äldsta) av alla kolumner som börjar med 'TS '.
     """
-    ts_now = now_stamp()
-    for f in fields:
-        ts_col = _ts_col_for(f)
-        if ts_col not in df.columns:
-            df[ts_col] = ""
-        df.at[row_idx, ts_col] = ts_now
-    return df
-
-def add_oldest_ts_col(df: pd.DataFrame, out_col: str = "_oldest_ts") -> pd.DataFrame:
-    """
-    Beräkna äldsta (äldsta datum) bland alla TS-kolumner i TS_FIELDS för varje rad.
-    Lagra i out_col som datetime-objekt (för sortering).
-    """
-    # Lista alla TS-kolumner
-    ts_cols = set(TS_FIELDS.values())
-    ts_cols = [c for c in ts_cols if c in df.columns]
+    work = df.copy()
+    ts_cols = [c for c in work.columns if c.startswith("TS ")]
     if not ts_cols:
-        df[out_col] = pd.NaT
-        return df
+        work["OldestTS"] = None
+        return work
 
-    def _row_min_dt(row) -> Optional[datetime]:
-        mins: List[datetime] = []
+    def _min_ts(row):
+        vals = []
         for c in ts_cols:
-            dt = parse_dt_maybe(row.get(c))
-            if dt is not None:
-                mins.append(dt)
-        if not mins:
+            v = row.get(c)
+            if pd.notna(v) and v not in (None, "", "NaT"):
+                vals.append(pd.to_datetime(v, utc=True, errors="coerce"))
+        vals = [x for x in vals if pd.notna(x)]
+        if not vals:
             return None
-        return min(mins)
+        return min(vals)
 
-    df[out_col] = df.apply(_row_min_dt, axis=1)
-    return df
+    work["OldestTS"] = work.apply(_min_ts, axis=1)
+    return work
 
-# ------------------------------------------------------------
-# Grundläggande beräkningar
-# ------------------------------------------------------------
-def _valutakurs_for(row: pd.Series, user_rates: Dict[str, float]) -> float:
+
+# ---------------------------------------------------------------------
+# TS-stämpling av fält
+# ---------------------------------------------------------------------
+def stamp_fields_ts(row: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
     """
-    Hämta valutakurs→SEK för raden (förväntar kolumn 'Valuta').
-    Saknas 'Valuta' -> 1.0
+    Sätter tidsstämpel på 'TS <field>' (om fält finns/uppdateras).
+    Den här varianten stämplar bara nu direkt; comparison mot tidigare värde
+    görs i anroparen vid behov.
     """
-    if user_rates is None:
-        return 1.0
-    cur = str(row.get("Valuta", "SEK")).strip().upper()
-    return float(user_rates.get(cur, 1.0))
+    now = now_stamp()
+    out = dict(row)
+    for f in fields:
+        ts_name = f if f.startswith("TS ") else f"TS {f}"
+        out[ts_name] = now
+    return out
 
-def _compute_value_sek(row: pd.Series, user_rates: Dict[str, float]) -> Optional[float]:
-    kurs = safe_float(row.get("Kurs"))
-    antal = safe_float(row.get("Antal"))
-    if kurs is None or antal is None:
+
+# ---------------------------------------------------------------------
+# Numerik
+# ---------------------------------------------------------------------
+def coerce_float(x: Any) -> Optional[float]:
+    """Försöker konvertera x till float. Returnerar None vid miss."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, str):
+            x = x.replace(" ", "").replace(",", ".")
+        fx = float(x)
+        if math.isnan(fx):
+            return None
+        return fx
+    except Exception:
         return None
-    rate = _valutakurs_for(row, user_rates)
-    return float(kurs) * float(antal) * float(rate)
 
-def _compute_ps_nu(row: pd.Series) -> Optional[float]:
+
+def format_large_number(x: Any, currency: Optional[str] = None) -> str:
     """
-    P/S (nu) = Market Cap / Omsättning (TTM eller 'i år (förv.)' som fallback).
-    Market Cap måste vara i samma valuta som omsättningen (vanligen bolagets rapportvaluta).
-    Vi utgår från att dessa fält redan är i rapportvaluta, inte SEK.
+    Fint format av stora tal:
+      >= 1e12  -> "{:.2f} tn"
+      >= 1e9   -> "{:.2f} mdr"
+      >= 1e6   -> "{:.2f} M"
+      annars   -> vanlig tusentals-separering
+    Lägger till valutasuffix om angivet.
     """
-    mcap = safe_float(row.get("Market Cap"))
-    if mcap is None or mcap <= 0:
-        return None
+    val = coerce_float(x)
+    if val is None:
+        return "—"
 
-    # TTM eller denna årets prognos som fallback
-    sales_ttm = safe_float(row.get("Omsättning TTM"))
-    sales_fy = safe_float(row.get("Omsättning i år (förv.)"))
+    suffix = f" {currency}" if currency else ""
+    abs_v = abs(val)
 
-    sales = sales_ttm if (sales_ttm is not None and sales_ttm > 0) else sales_fy
-    if sales is None or sales <= 0:
-        return None
-    return float(mcap) / float(sales)
+    if abs_v >= 1e12:
+        return f"{val/1e12:.2f} tn{suffix}"
+    if abs_v >= 1e9:
+        return f"{val/1e9:.2f} mdr{suffix}"
+    if abs_v >= 1e6:
+        return f"{val/1e6:.2f} M{suffix}"
 
-def _compute_upside_pct(row: pd.Series) -> Optional[float]:
-    """
-    Upside (%) = (Riktkurs / Kurs - 1) * 100
-    Båda i bolagets valuta.
-    """
-    rk = safe_float(row.get("Riktkurs (valuta)"))
-    kp = safe_float(row.get("Kurs"))
-    if rk is None or kp is None or kp <= 0:
-        return None
-    return (float(rk) / float(kp) - 1.0) * 100.0
-
-def uppdatera_berakningar(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
-    """
-    Beräkna härledda fält som används i olika vyer. Skadar aldrig – saknas kolumner ignoreras de.
-    - Värde (SEK) om 'Kurs','Antal','Valuta' finns
-    - P/S (nu) om 'Market Cap' + ('Omsättning TTM' eller 'Omsättning i år (förv.)') finns
-    - Upside (%) om 'Riktkurs (valuta)' och 'Kurs' finns
-    - Fyll vissa "visnings"-fält med sensibla default
-    """
-    if df is None or df.empty:
-        return ensure_schema(pd.DataFrame({c: [] for c in FINAL_COLS}))
-
-    df = ensure_schema(df.copy())
-
-    # Värde (SEK)
-    if all(c in df.columns for c in ("Kurs", "Antal", "Valuta")):
-        df["Värde (SEK)"] = df.apply(lambda r: _compute_value_sek(r, user_rates) or 0.0, axis=1)
-
-    # P/S (nu)
-    if "Market Cap" in df.columns and (("Omsättning TTM" in df.columns) or ("Omsättning i år (förv.)" in df.columns)):
-        df["P/S (nu)"] = df.apply(lambda r: _compute_ps_nu(r) if _compute_ps_nu(r) is not None else np.nan, axis=1)
-
-    # Upside (%)
-    if "Riktkurs (valuta)" in df.columns and "Kurs" in df.columns:
-        df["Upside (%)"] = df.apply(lambda r: _compute_upside_pct(r) if _compute_upside_pct(r) is not None else np.nan, axis=1)
-
-    # Säkerställ rimliga typer för några kolumner
-    for c in ("Antal", "Kurs", "Värde (SEK)", "Market Cap", "Omsättning TTM", "Omsättning i år (förv.)", "P/S (nu)", "Upside (%)"):
-        if c in df.columns:
-            try:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            except Exception:
-                pass
-
-    return df
+    # Vanligt heltal/decimal med tusentalsavskiljare (svensk stil: blanksteg)
+    if float(val).is_integer():
+        return f"{int(val):,}".replace(",", " ") + suffix
+    return f"{val:,.2f}".replace(",", " ") + suffix

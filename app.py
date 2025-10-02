@@ -11,7 +11,6 @@ import streamlit as st
 # ------------------------------------------------------------
 # Robust imports med fallback/guards
 # ------------------------------------------------------------
-# config
 try:
     from stockapp.config import (
         APP_TITLE,
@@ -21,7 +20,6 @@ try:
         MANUAL_PROGNOS_FIELDS,
     )
 except Exception:
-    # Fallback – minimikrav för att appen ska gå igång
     APP_TITLE = "K-pf-rslag"
     DISPLAY_CURRENCY = "SEK"
     FINAL_COLS = [
@@ -53,18 +51,15 @@ except Exception:
     ]
     MANUAL_PROGNOS_FIELDS = ["Omsättning i år (est.)", "Omsättning nästa år (est.)"]
 
-# storage / utils / rates
 from stockapp.storage import hamta_data, spara_data
 from stockapp.utils import (
     add_oldest_ts_col,
     dedupe_tickers,
     ensure_schema,
     format_large_number,
-    now_stamp,
     parse_date,
     safe_float,
     stamp_fields_ts,
-    with_backoff,
     risk_label_from_mcap,
 )
 from stockapp.rates import (
@@ -74,62 +69,60 @@ from stockapp.rates import (
     hamta_valutakurs,
 )
 
-# valfria fetchers
 try:
-    # orkestrerar full uppdatering (SEC/FMP/Yahoo)
     from stockapp.fetchers.orchestrator import run_update_full
-except Exception:  # orkestrator saknas – vi gör fallback
+except Exception:
     run_update_full = None  # type: ignore
 
 try:
-    # snabb pris-uppdatering från Yahoo
     from stockapp.fetchers.yahoo import get_live_price as _yahoo_price
 except Exception:
     _yahoo_price = None  # type: ignore
 
 
 # ------------------------------------------------------------
-# Hjälpfunktioner (lokala)
+# State init
 # ------------------------------------------------------------
 def _init_state_defaults():
-    """Sätt upp session_state nycklar innan widgets skapas."""
     if "_df_ref" not in st.session_state:
         st.session_state["_df_ref"] = pd.DataFrame(columns=FINAL_COLS)
 
-    # valutakurser – seedas EN gång från sparade
     if "_rates_seeded" not in st.session_state:
         saved = las_sparade_valutakurser()
         for key in ("USD", "EUR", "NOK", "CAD", "SEK"):
             st.session_state[f"rate_{key}"] = float(saved.get(key, 1.0))
         st.session_state["_rates_seeded"] = True
 
-    # batchkö
-    st.session_state.setdefault("batch_queue", [])
+    # Batch
     st.session_state.setdefault("batch_order_mode", "Äldst först")
+    st.session_state.setdefault("batch_ts_basis", "Kurs TS")
     st.session_state.setdefault("batch_size", 10)
-    st.session_state.setdefault("batch_ts_basis", "Kurs TS")  # NYTT
-    st.session_state.setdefault("recent_processed", [])       # NYTT
+    # Round-robin
+    st.session_state.setdefault("batch_order_list", [])      # hela ordningslistan
+    st.session_state.setdefault("batch_cursor", 0)           # pekare i listan
+    st.session_state.setdefault("batch_processed_cycle", []) # körda i pågående cykel
+    st.session_state.setdefault("batch_queue", [])           # aktuell kö som ska köras
 
-    # vyer
+    # Vyer
     st.session_state.setdefault("view", "Investeringsförslag")
     st.session_state.setdefault("page", 1)
     st.session_state.setdefault("page_size", 5)
 
-    # edit/bläddra
+    # Editor
     st.session_state.setdefault("edit_index", 0)
 
 
+# ------------------------------------------------------------
+# IO
+# ------------------------------------------------------------
 def _load_df() -> pd.DataFrame:
-    """Hämta df från Google Sheet – säkra schema och varna om problem."""
     try:
         df = hamta_data()
         df = ensure_schema(df, FINAL_COLS)
     except Exception as e:
         st.warning(f"⚠️ Kunde inte läsa data från Google Sheet: {e}")
-        # Fortsätt med tom i minnet
         df = pd.DataFrame(columns=FINAL_COLS)
 
-    # dubblettskydd (i minnet)
     df2, dups = dedupe_tickers(df)
     if dups:
         st.info(f"ℹ️ Dubbletter ignoreras i minnet: {', '.join(dups)}")
@@ -137,7 +130,6 @@ def _load_df() -> pd.DataFrame:
 
 
 def _save_df(df: pd.DataFrame):
-    """Spara df till Google Sheet – robust med backoff."""
     try:
         spara_data(df)
         st.success("✅ Ändringar sparade.")
@@ -145,14 +137,15 @@ def _save_df(df: pd.DataFrame):
         st.error(f"🚫 Kunde inte spara till Google Sheet: {e}")
 
 
+# ------------------------------------------------------------
+# Sidebar – Valutor
+# ------------------------------------------------------------
 def _sidebar_rates() -> Dict[str, float]:
-    """Sidopanel för valutakurser (utan experimental_rerun)."""
     with st.sidebar.expander("💱 Valutakurser (→ SEK)", expanded=True):
-        col1, col2 = st.columns(2)
+        col1, _ = st.columns(2)
         with col1:
             if st.button("Hämta automatiskt"):
                 fetched, misses, provider = hamta_valutakurser_auto()
-                # seed state innan widgets ritas om:
                 for k, v in fetched.items():
                     st.session_state[f"rate_{k}"] = float(v)
                 spara_valutakurser(fetched)
@@ -161,79 +154,138 @@ def _sidebar_rates() -> Dict[str, float]:
                 st.toast(f"Valutor uppdaterade via {provider}.")
                 st.rerun()
 
-        usd = st.number_input(
-            "USD",
-            key="rate_USD",
-            value=float(st.session_state["rate_USD"]),
-            step=0.01,
-        )
-        eur = st.number_input(
-            "EUR",
-            key="rate_EUR",
-            value=float(st.session_state["rate_EUR"]),
-            step=0.01,
-        )
-        nok = st.number_input(
-            "NOK",
-            key="rate_NOK",
-            value=float(st.session_state["rate_NOK"]),
-            step=0.01,
-        )
-        cad = st.number_input(
-            "CAD",
-            key="rate_CAD",
-            value=float(st.session_state["rate_CAD"]),
-            step=0.01,
-        )
-        sek = st.number_input(
-            "SEK",
-            key="rate_SEK",
-            value=float(st.session_state["rate_SEK"]),
-            step=0.01,
-        )
+        usd = st.number_input("USD", key="rate_USD", value=float(st.session_state["rate_USD"]), step=0.01)
+        eur = st.number_input("EUR", key="rate_EUR", value=float(st.session_state["rate_EUR"]), step=0.01)
+        nok = st.number_input("NOK", key="rate_NOK", value=float(st.session_state["rate_NOK"]), step=0.01)
+        cad = st.number_input("CAD", key="rate_CAD", value=float(st.session_state["rate_CAD"]), step=0.01)
+        sek = st.number_input("SEK", key="rate_SEK", value=float(st.session_state["rate_SEK"]), step=0.01)
 
         rates = {"USD": usd, "EUR": eur, "NOK": nok, "CAD": cad, "SEK": sek}
         if st.button("Spara kurser"):
             spara_valutakurser(rates)
             st.toast("Sparade valutakurser.")
-    return {"USD": usd, "EUR": eur, "NOK": nok, "CAD": cad, "SEK": sek}
+    return rates
+
+
+# ------------------------------------------------------------
+# Batch – Round-robin
+# ------------------------------------------------------------
+def _detect_ts_cols(df: pd.DataFrame, basis: str) -> Sequence[str]:
+    cols = [c for c in df.columns if isinstance(c, str)]
+    b = (basis or "").lower()
+    if "kurs" in b:
+        wanted = []
+        for key in ["Kurs TS", "TS Kurs", "Pris TS", "TS Pris"]:
+            if key in df.columns:
+                wanted.append(key)
+        return wanted or [c for c in cols if c.strip().upper().endswith(" KURS TS")]
+    if "full" in b:
+        wanted = [key for key in ["TS Full", "Full TS"] if key in df.columns]
+        return wanted
+    return []  # “Alla TS” → utils får autodetektera
+
+
+def _build_order_list(df: pd.DataFrame, mode: str, ts_basis: str) -> List[str]:
+    work = df.copy()
+    work["Ticker"] = work["Ticker"].astype(str)
+
+    if mode == "Äldst först":
+        ts_cols = _detect_ts_cols(work, ts_basis)
+        if ts_cols:
+            work = add_oldest_ts_col(work, ts_cols=ts_cols, dest_col="__oldest_ts__")
+        else:
+            work = add_oldest_ts_col(work, dest_col="__oldest_ts__")
+        work = work.sort_values(by="__oldest_ts__", ascending=True, na_position="first")
+    elif mode == "A–Ö":
+        work = work.sort_values(by="Ticker", ascending=True)
+    else:
+        work = work.sort_values(by="Ticker", ascending=False)
+
+    order = [t for t in work["Ticker"].tolist() if t and t != "nan"]
+    return order
+
+
+def _ensure_order_cache(df: pd.DataFrame):
+    """Se till att orderlista finns & är rimlig."""
+    order = st.session_state.get("batch_order_list", []) or []
+    if not order:
+        st.session_state["batch_order_list"] = _build_order_list(
+            df, st.session_state["batch_order_mode"], st.session_state["batch_ts_basis"]
+        )
+        st.session_state["batch_cursor"] = 0
+        st.session_state["batch_processed_cycle"] = []
+
+
+def _create_next_queue(df: pd.DataFrame, size: int) -> List[str]:
+    """
+    Round-robin: ta nästa 'size' tickers från orderlistan som inte redan
+    är körda i pågående cykel. Om alla är körda nollställs cykeln.
+    """
+    _ensure_order_cache(df)
+    order: List[str] = st.session_state["batch_order_list"]
+    cursor: int = int(st.session_state.get("batch_cursor", 0))
+    done_set = set(st.session_state.get("batch_processed_cycle", []) or [])
+
+    if not order:
+        return []
+
+    queue: List[str] = []
+    n = len(order)
+    i = 0
+    idx = cursor
+
+    # om alla körda → ny cykel
+    if len(done_set) >= n:
+        done_set = set()
+
+    while len(queue) < min(size, n) and i < n * 2:  # säkerhetsbroms
+        t = order[idx]
+        if t not in done_set and t not in queue:
+            queue.append(t)
+        idx = (idx + 1) % n
+        i += 1
+
+    # uppdatera cursor
+    st.session_state["batch_cursor"] = idx
+    st.session_state["batch_processed_cycle"] = list(done_set)
+    return queue
+
+
+def _rebuild_order(df: pd.DataFrame):
+    st.session_state["batch_order_list"] = _build_order_list(
+        df, st.session_state["batch_order_mode"], st.session_state["batch_ts_basis"]
+    )
+    st.session_state["batch_cursor"] = 0
+    st.session_state["batch_processed_cycle"] = []
+    st.toast(f"Ordning byggd ({len(st.session_state['batch_order_list'])} tickers).")
 
 
 def _sidebar_batch(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
-    """Sidopanel – batchkö och körning."""
     with st.sidebar.expander("⚙️ Batch", expanded=True):
         st.session_state["batch_order_mode"] = st.selectbox(
             "Sortering",
             ["Äldst först", "A–Ö", "Z–A"],
             index=["Äldst först", "A–Ö", "Z–A"].index(st.session_state["batch_order_mode"]),
         )
-        st.session_state["batch_ts_basis"] = st.selectbox(  # NYTT
+        st.session_state["batch_ts_basis"] = st.selectbox(
             "TS-bas (för 'Äldst först')",
             ["Kurs TS", "Full TS", "Alla TS (äldst av alla)"],
             index=["Kurs TS", "Full TS", "Alla TS (äldst av alla)"].index(st.session_state["batch_ts_basis"]),
-            help="Välj vilken tidsstämpel som styr urvalet när du skapar kön.",
         )
-        st.session_state["batch_size"] = st.number_input(
-            "Antal i batch", min_value=1, max_value=200, value=int(st.session_state["batch_size"])
-        )
+        st.session_state["batch_size"] = st.number_input("Antal i batch", 1, 200, int(st.session_state["batch_size"]))
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Skapa batchkö"):
-                order = _pick_order(df, st.session_state["batch_order_mode"], ts_basis=st.session_state["batch_ts_basis"])
-                # Exkludera nyligen körda tickers (för att inte få samma 10 direkt)
-                recent: List[str] = st.session_state.get("recent_processed", []) or []
-                order_filtered = [t for t in order if t not in recent]
-                # Fyll upp om för få kvar
-                if len(order_filtered) < st.session_state["batch_size"]:
-                    rest = [t for t in order if t not in order_filtered]
-                    order_filtered += rest
-                st.session_state["batch_queue"] = order_filtered[: st.session_state["batch_size"]]
-                st.toast(f"Skapade batch ({len(st.session_state['batch_queue'])} tickers).")
+            if st.button("Bygg/uppdatera ordning"):
+                _rebuild_order(df)
         with c2:
-            if st.button("Nollställ historik"):
-                st.session_state["recent_processed"] = []
-                st.toast("Historik nollställd.")
+            if st.button("Nollställ cykel"):
+                st.session_state["batch_processed_cycle"] = []
+                st.toast("Cykel nollställd.")
+
+        if st.button("Skapa batchkö"):
+            st.session_state["batch_queue"] = _create_next_queue(df, st.session_state["batch_size"])
+            st.toast(f"Kö skapad: {len(st.session_state['batch_queue'])} tickers.")
 
         if st.session_state["batch_queue"]:
             st.write("Kö:", ", ".join(st.session_state["batch_queue"]))
@@ -250,47 +302,7 @@ def _sidebar_batch(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFra
     return df
 
 
-def _detect_ts_cols(df: pd.DataFrame, basis: str) -> Sequence[str]:
-    """Hjälp: returnera relevanta TS-kolumner utifrån vald basis."""
-    cols = [c for c in df.columns if isinstance(c, str)]
-    b = (basis or "").lower()
-    if "kurs" in b:
-        wanted = []
-        for key in ["Kurs TS", "TS Kurs", "Pris TS", "TS Pris"]:
-            if key in df.columns:
-                wanted.append(key)
-        return wanted or [c for c in cols if c.strip().upper().endswith(" KURS TS")]
-    if "full" in b:
-        wanted = []
-        for key in ["TS Full", "Full TS"]:
-            if key in df.columns:
-                wanted.append(key)
-        return wanted
-    # alla TS – lämna till utils autodetektering
-    return []
-
-
-def _pick_order(df: pd.DataFrame, mode: str, ts_basis: str = "Alla TS (äldst av alla)") -> List[str]:
-    """Välj ordning för batch."""
-    work = df.copy()
-    work["Ticker"] = work["Ticker"].astype(str)
-
-    if mode == "Äldst först":
-        ts_cols = _detect_ts_cols(work, ts_basis)
-        if ts_cols:
-            work = add_oldest_ts_col(work, ts_cols=ts_cols, dest_col="__oldest_ts__")
-        else:
-            work = add_oldest_ts_col(work, dest_col="__oldest_ts__")  # autodetektera
-        work = work.sort_values(by="__oldest_ts__", ascending=True, na_position="first")
-    elif mode == "A–Ö":
-        work = work.sort_values(by="Ticker", ascending=True)
-    else:  # Z–A
-        work = work.sort_values(by="Ticker", ascending=False)
-    return work["Ticker"].tolist()
-
-
 def _runner_price(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> Tuple[pd.DataFrame, str]:
-    """Uppdatera ENDAST kurs för ticker (Yahoo fallback)."""
     if _yahoo_price is None:
         return df, "Yahoo-källa saknas"
     ridx = df.index[df["Ticker"].astype(str).str.upper() == str(tkr).upper()]
@@ -308,7 +320,6 @@ def _runner_price(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> T
 
 
 def _runner_full(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> Tuple[pd.DataFrame, str]:
-    """Uppdatera ALLT för ticker via orchestrator om den finns, annars fallback till pris."""
     if run_update_full is None:
         return _runner_price(df, tkr, user_rates)
     try:
@@ -324,7 +335,6 @@ def _runner_full(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> Tu
 
 
 def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[str, float]) -> pd.DataFrame:
-    """Kör batch mot kö – visar progress 1/X och sparar var 5:e. Uppdaterar 'recent_processed'."""
     if not queue:
         st.info("Ingen batchkö.")
         return df
@@ -334,9 +344,9 @@ def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[s
     done = 0
     log_lines = []
     work = df.copy()
-    recent: List[str] = st.session_state.get("recent_processed", []) or []
+    done_set = set(st.session_state.get("batch_processed_cycle", []) or [])
 
-    for tkr in list(queue):  # iterera över en kopia
+    for tkr in list(queue):
         if mode == "price":
             work, msg = _runner_price(work, tkr, user_rates)
         else:
@@ -344,21 +354,12 @@ def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[s
         done += 1
         bar.progress(done / total, text=f"{done}/{total}")
         log_lines.append(f"{tkr}: {msg}")
-
-        # plocka bort från kö
-        st.session_state["batch_queue"] = [x for x in st.session_state["batch_queue"] if x != tkr]
-
-        # spara “nyligen körda”
-        if tkr not in recent:
-            recent.append(tkr)
-        if len(recent) > 300:  # håll nere storlek
-            recent = recent[-300:]
-
-        if done % 5 == 0:
-            _save_df(work)
+        # markera som körd i cykeln
+        done_set.add(tkr)
 
     _save_df(work)
-    st.session_state["recent_processed"] = recent
+    st.session_state["batch_processed_cycle"] = list(done_set)
+    st.session_state["batch_queue"] = []  # töm
 
     st.sidebar.write("Logg:")
     for ln in log_lines:
@@ -372,10 +373,7 @@ def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[s
 def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
     st.header("📈 Investeringsförslag")
 
-    # robust sorteringskolumn
     sortcol = "Score" if "Score" in df.columns else ("P/S-snitt (Q1..Q4)" if "P/S-snitt (Q1..Q4)" in df.columns else None)
-
-    # beräkna fallback P/S-snitt om saknas
     if sortcol is None:
         for c in ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]:
             if c not in df.columns:
@@ -387,7 +385,6 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
     if "Risklabel" not in work.columns:
         work["Risklabel"] = work["Market Cap"].apply(risk_label_from_mcap) if "Market Cap" in work.columns else "Unknown"
 
-    # filtrering
     c1, c2, c3 = st.columns([1, 1, 1])
     sektorer = ["Alla"]
     if "Sektor" in work.columns:
@@ -395,20 +392,18 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
     val_sektor = c1.selectbox("Sektor", sektorer)
     risk_opts = ["Alla", "Mega", "Large", "Mid", "Small", "Micro", "Unknown"]
     val_risk = c2.selectbox("Risklabel", risk_opts)
-    st.session_state["page_size"] = c3.number_input("Poster per sida", min_value=1, max_value=20, value=int(st.session_state["page_size"]))
+    st.session_state["page_size"] = c3.number_input("Poster per sida", 1, 20, int(st.session_state["page_size"]))
 
     if val_sektor != "Alla" and "Sektor" in work.columns:
         work = work[work["Sektor"].astype(str) == val_sektor]
     if val_risk != "Alla":
         work = work[work["Risklabel"].astype(str) == val_risk]
 
-    # sortering (Score högst först, annars lägst P/S-snitt)
     if sortcol == "Score":
         work = work.sort_values(by=sortcol, ascending=False, na_position="last")
     else:
         work = work.sort_values(by=sortcol, ascending=True, na_position="last")
 
-    # bläddring 1/X
     total = len(work)
     if total == 0:
         st.info("Inga träffar.")
@@ -451,20 +446,6 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
                     else:
                         st.write(f"- **{k}:** –")
 
-            if "Score" in df.columns and not pd.isna(row.get("Score")):
-                sc = float(row.get("Score"))
-                if sc >= 85:
-                    tag = "✅ Mycket bra"
-                elif sc >= 70:
-                    tag = "👍 Bra"
-                elif sc >= 55:
-                    tag = "🙂 Okej"
-                elif sc >= 40:
-                    tag = "⚠️ Något övervärderad"
-                else:
-                    tag = "🛑 Övervärderad / Sälj"
-                st.markdown(f"**Betyg:** {sc:.1f} – {tag}")
-
 
 def vy_edit(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
     st.header("✏️ Lägg till / uppdatera bolag")
@@ -480,10 +461,7 @@ def vy_edit(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
     if c1.button("◀ Föregående", disabled=st.session_state["edit_index"] <= 0):
         st.session_state["edit_index"] -= 1
         st.rerun()
-    c2.markdown(
-        f"<div style='text-align:center'>**{st.session_state['edit_index']+1} / {len(tickers)}**</div>",
-        unsafe_allow_html=True,
-    )
+    c2.markdown(f"<div style='text-align:center'>**{st.session_state['edit_index']+1} / {len(tickers)}**</div>", unsafe_allow_html=True)
     if c3.button("Nästa ▶", disabled=st.session_state["edit_index"] >= len(tickers) - 1):
         st.session_state["edit_index"] += 1
         st.rerun()
@@ -505,7 +483,6 @@ def vy_edit(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
             _save_df(df2)
             st.session_state["_df_ref"] = df2
 
-    # “Manuell prognoslista” direkt här: äldst prognos först
     st.subheader("📝 Manuell prognoslista (äldst först)")
     need = _build_requires_manual_df(df, older_than_days=None)
     st.dataframe(need, use_container_width=True, hide_index=True)
@@ -520,7 +497,6 @@ def vy_portfolio(df: pd.DataFrame, user_rates: Dict[str, float]):
         st.info("Inga bolag i databasen ännu.")
         return
 
-    # värde i SEK
     def _to_sek(row):
         price = safe_float(row.get("Kurs"), np.nan)
         qty = safe_float(row.get("Antal aktier"), 0.0)
@@ -542,13 +518,9 @@ def vy_portfolio(df: pd.DataFrame, user_rates: Dict[str, float]):
 
 
 # ------------------------------------------------------------
-# Hjälptabeller / kontroll
+# Hjälptabeller
 # ------------------------------------------------------------
 def _build_requires_manual_df(df: pd.DataFrame, older_than_days: Optional[int]) -> pd.DataFrame:
-    """
-    Lista över tickers där **prognosfält** behöver manuell uppdatering.
-    Sorterar äldst datum först (eller bara på ålder om older_than_days anges).
-    """
     if df.empty:
         return pd.DataFrame(columns=["Ticker", "Bolagsnamn", "Fält", "Senast uppdaterad"])
 
@@ -558,12 +530,7 @@ def _build_requires_manual_df(df: pd.DataFrame, older_than_days: Optional[int]) 
             ts_col = f"{f} TS"
             ts_val = r.get(ts_col)
             rows.append(
-                {
-                    "Ticker": r.get("Ticker"),
-                    "Bolagsnamn": r.get("Bolagsnamn"),
-                    "Fält": f,
-                    "Senast uppdaterad": parse_date(ts_val),
-                }
+                {"Ticker": r.get("Ticker"), "Bolagsnamn": r.get("Bolagsnamn"), "Fält": f, "Senast uppdaterad": parse_date(ts_val)}
             )
     need = pd.DataFrame(rows)
     need = need.sort_values(by="Senast uppdaterad", ascending=True, na_position="first")
@@ -574,7 +541,7 @@ def _build_requires_manual_df(df: pd.DataFrame, older_than_days: Optional[int]) 
 
 
 # ------------------------------------------------------------
-# Huvudprogram
+# Main
 # ------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -582,20 +549,16 @@ def main():
 
     _init_state_defaults()
 
-    # Läs data
     df = _load_df()
     st.session_state["_df_ref"] = df
 
-    # Sidopanel – valutor & batch
     user_rates = _sidebar_rates()
     df2 = _sidebar_batch(st.session_state["_df_ref"], user_rates)
     if df2 is not st.session_state["_df_ref"]:
         st.session_state["_df_ref"] = df2
 
-    # Välj vy
     st.session_state["view"] = st.sidebar.radio(
-        "Välj vy",
-        ["Investeringsförslag", "Lägg till / uppdatera", "Portfölj"],
+        "Välj vy", ["Investeringsförslag", "Lägg till / uppdatera", "Portfölj"],
         index=["Investeringsförslag", "Lägg till / uppdatera", "Portfölj"].index(st.session_state["view"]),
     )
 

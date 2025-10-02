@@ -2,266 +2,309 @@
 """
 stockapp.utils
 --------------
-Hjälpfunktioner som används av hela appen. Denna modul ska vara
-låg-nivå och inte importera andra stockapp-moduler (för att undvika
-cirkulära importer).
+Robusta hjälp-funktioner som återanvänds av appen.
+
+OBS: Hanterar dubbletta kolumnnamn (t.ex. TS-fält) säkert.
 """
 
 from __future__ import annotations
-from typing import Callable, Iterable, List, Tuple, Dict, Any, Optional
-import time
+
 import math
-import re
+import random
+import time
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 
-# ------------------------------------------------------------
-# Tidsstämplar & datum
-# ------------------------------------------------------------
-def now_stamp() -> str:
-    """Returnerar en kort tidsstämpel 'YYYY-MM-DD HH:MM' i lokal tid."""
-    return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+# ---------------------------------------------------------------------
+# Konverteringar & datum
+# ---------------------------------------------------------------------
 
-
-def parse_date(x) -> Optional[pd.Timestamp]:
-    """
-    Försöker tolka x som datum/tid och returnera pd.Timestamp eller None.
-    Hanterar NaN/None/tom sträng robust.
-    """
-    if x is None:
-        return None
-    if isinstance(x, pd.Timestamp):
-        return x
-    try:
-        s = str(x).strip()
-        if not s or s.lower() in ("nan", "nat", "none"):
-            return None
-        return pd.to_datetime(s, errors="coerce")
-    except Exception:
-        return None
-
-
-# ------------------------------------------------------------
-# Numerik
-# ------------------------------------------------------------
-_NUM_RE = re.compile(r"[-+]?\d+(\.\d+)?([eE][-+]?\d+)?")
-
-def to_float(x, default: float = 0.0) -> float:
-    """
-    Robust konvertering till float:
-    - accepterar strängar med kommatecken
-    - plockar första talet ur en sträng om den innehåller text
-    - None/NaN -> default
-    """
+def safe_float(x, default=np.nan) -> float:
+    """Konvertera till float, eller default (NaN som standard)."""
     try:
         if x is None:
             return float(default)
-        if isinstance(x, (int, float, np.number)):
-            f = float(x)
-            if math.isnan(f) or math.isinf(f):
+        if isinstance(x, str):
+            s = x.strip().replace(" ", "").replace("\u00a0", "")
+            if s == "" or s.lower() in {"nan", "none"}:
                 return float(default)
-            return f
-        s = str(x).strip()
-        if not s:
-            return float(default)
-        s = s.replace(",", ".")
-        try:
+            # Byt ev. kommatecken
+            s = s.replace(",", ".")
             return float(s)
-        except Exception:
-            m = _NUM_RE.search(s)
-            if m:
-                return float(m.group(0))
-            return float(default)
+        return float(x)
     except Exception:
-        return float(default)
-
-
-def safe_float(x, default: float = np.nan) -> float:
-    """Som to_float men default = NaN (praktisk i beräkningar)."""
-    try:
-        v = to_float(x, default)
-        return v
-    except Exception:
-        return float(default)
-
-
-# ------------------------------------------------------------
-# Backoff-wrapper
-# ------------------------------------------------------------
-def with_backoff(fn: Callable, *args, retries: int = 3, base_sleep: float = 0.7, **kwargs):
-    """
-    Kör fn(*args, **kwargs) med enkel exponential backoff.
-    Vid sista miss kastas felet vidare.
-    """
-    last_err = None
-    for i in range(max(1, retries)):
         try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            last_err = e
-            if i == retries - 1:
-                raise
-            time.sleep(base_sleep * (2 ** i))
-    if last_err:
-        raise last_err
+            return float(default)
+        except Exception:
+            return np.nan  # sista fallback
 
 
-# ------------------------------------------------------------
-# DataFrame-schema & dubbletter
-# ------------------------------------------------------------
-def ensure_schema(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+def to_float(x, default=np.nan) -> float:
+    """Alias till safe_float (bakåtkompatibilitet)."""
+    return safe_float(x, default=default)
+
+
+def parse_date(x) -> Optional[pd.Timestamp]:
+    """Försök tolka datum; returnerar pandas Timestamp eller None."""
+    try:
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return None
+        ts = pd.to_datetime(x, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts
+    except Exception:
+        return None
+
+
+def now_stamp() -> str:
+    """Sträng med nuvarande tid i ISO-format (sek)."""
+    return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------
+# DataFrame schema & dubbletter
+# ---------------------------------------------------------------------
+
+def ensure_schema(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
     """
-    Säkerställ att df har minst kolumnerna i 'cols'. Saknade läggs till med NaN
-    och kolumnordningen justeras så att 'cols' kommer först (övriga kolumner behålls efter).
+    Säkerställ att alla kolumner i 'cols' finns i df (lägger till saknade som NaN)
+    och droppa dubbletter av kolumnnamn (behåll första).
+    Ordna sedan kolumner i samma ordning som 'cols' + resterande efteråt.
     """
-    if df is None or not isinstance(df, pd.DataFrame):
+    if df is None:
         df = pd.DataFrame()
-    out = df.copy()
+
+    # droppa dubbletter av kolumn-namn (behåll första förekomsten)
+    if not df.columns.is_unique:
+        df = df.loc[:, ~df.columns.duplicated()]
+
+    # lägg till saknade
     for c in cols:
-        if c not in out.columns:
-            out[c] = np.nan
-    ordered = [c for c in cols] + [c for c in out.columns if c not in cols]
-    return out[ordered]
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # ordna – först enligt cols, sedan ev. andra
+    ordered = [c for c in cols if c in df.columns]
+    tail = [c for c in df.columns if c not in ordered]
+    df = df[ordered + tail]
+    return df
 
 
 def dedupe_tickers(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Tar bort dubbletter på kolumnen 'Ticker' (case-insensitive), behåller första förekomsten.
-    Returnerar (df_utan_dubletter, lista_med_dubbletttickers).
+    Ta bort dubbletter baserat på 'Ticker' (behåll första).
+    Returnerar (df_ut, lista_med_dubbletttickers).
     """
-    if df is None or "Ticker" not in df.columns:
-        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(), []
+    if df is None or df.empty or "Ticker" not in df.columns:
+        return df, []
 
-    work = df.copy()
-    work["__tkr_up__"] = work["Ticker"].astype(str).str.upper().str.strip()
-    dups_mask = work["__tkr_up__"].duplicated(keep="first")
-    dups = work.loc[dups_mask, "__tkr_up__"].tolist()
-    out = work.loc[~dups_mask].drop(columns=["__tkr_up__"])
+    # normalisera för jämförelse
+    key = df["Ticker"].astype(str).str.upper().str.strip()
+    dup_mask = key.duplicated(keep="first")
+    dups = df.loc[dup_mask, "Ticker"].astype(str).tolist()
+    out = df.loc[~dup_mask].copy()
     return out, dups
 
 
-# ------------------------------------------------------------
-# TS-verktyg (timestamp-kolumner)
-# ------------------------------------------------------------
-def stamp_fields_ts(df: pd.DataFrame, fields: Iterable[str], ts_suffix: str = " TS") -> pd.DataFrame:
+# ---------------------------------------------------------------------
+# Formatering & etiketter
+# ---------------------------------------------------------------------
+
+def format_large_number(v: Union[float, int, None], currency: str = "SEK") -> str:
     """
-    Sätter tidsstämpel för varje fält i 'fields' (om fältet finns i df) i en kolumn
-    med namn f"{fält}{ts_suffix}" (default: 'Fält TS').
+    Formatera stort tal med K/M/G och valutasymbol (enkel).
     """
-    if df is None or not isinstance(df, pd.DataFrame):
-        return pd.DataFrame()
-    out = df.copy()
-    stamp = now_stamp()
-    for f in fields:
-        if f in out.columns:
-            ts_col = f"{f}{ts_suffix}"
-            out[ts_col] = stamp
-    return out
-
-
-def _collect_ts_cols(columns: Iterable[str]) -> List[str]:
-    """
-    Samlar alla kolumnnamn som sannolikt är TS-kolumner.
-    Stöd för:
-      - '... TS'   (suffx)
-      - 'TS ...'   (prefix med mellanslag)
-      - 'TS_...'   (prefix med underscore)
-      - 'TS-...'   (prefix med bindestreck)
-    """
-    ts_cols = []
-    for c in columns:
-        s = str(c)
-        if s.endswith(" TS"):
-            ts_cols.append(s)
-            continue
-        su = s.upper()
-        if su.startswith("TS ") or su.startswith("TS_") or su.startswith("TS-") or su == "TS":
-            ts_cols.append(s)
-    return ts_cols
-
-
-def add_oldest_ts_col(df: pd.DataFrame, dest_col: str = "__oldest_ts__") -> pd.DataFrame:
-    """
-    Letar upp alla TS-kolumner i df och lägger till 'dest_col' med den
-    ÄLDSTA (minsta) tidsstämpeln per rad.
-    Saknas TS-kolumner sätts NaT.
-    """
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        out = pd.DataFrame(columns=list(df.columns) + [dest_col]) if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=[dest_col])
-        out[dest_col] = pd.NaT
-        return out
-
-    out = df.copy()
-    ts_cols = _collect_ts_cols(out.columns)
-    if not ts_cols:
-        out[dest_col] = pd.NaT
-        return out
-
-    ts_frame = pd.DataFrame(index=out.index)
-    for c in ts_cols:
-        ts_frame[c] = pd.to_datetime(out[c], errors="coerce")
-
-    out[dest_col] = ts_frame.min(axis=1, skipna=True)
-    return out
-
-
-# ------------------------------------------------------------
-# Presentation
-# ------------------------------------------------------------
-def format_large_number(value: Any, currency_code: str = "") -> str:
-    """
-    Formaterar stora tal med suffix:
-      - T (triljoner), B (miljarder), M (miljoner), k (tusen)
-    Ex: 4 250 000 000 000 -> '4.25 T USD'
-    """
-    v = to_float(value, default=np.nan)
-    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "–"
+    try:
+        x = float(v)
+    except Exception:
         return "–"
 
-    abs_v = abs(v)
-    if abs_v >= 1e12:
-        num = v / 1e12
-        suf = "T"
-    elif abs_v >= 1e9:
-        num = v / 1e9
-        suf = "B"
-    elif abs_v >= 1e6:
-        num = v / 1e6
-        suf = "M"
-    elif abs_v >= 1e3:
-        num = v / 1e3
-        suf = "k"
-    else:
-        num = v
-        suf = ""
+    absx = abs(x)
+    suf = ""
+    div = 1.0
+    if absx >= 1_000_000_000:
+        suf, div = "B", 1_000_000_000.0
+    elif absx >= 1_000_000:
+        suf, div = "M", 1_000_000.0
+    elif absx >= 1_000:
+        suf, div = "K", 1_000.0
 
-    if currency_code:
-        return f"{num:.2f} {suf} {currency_code}".strip()
-    return f"{num:.2f} {suf}".strip()
+    sym = {"SEK": "kr", "USD": "$", "EUR": "€", "NOK": "kr", "CAD": "$"}.get(str(currency).upper(), "")
+    val = x / div
+    if suf:
+        return f"{val:,.2f}{suf} {sym}".replace(",", " ")
+    return f"{val:,.0f} {sym}".replace(",", " ")
 
 
-def risk_label_from_mcap(mcap_value: Any) -> str:
+def risk_label_from_mcap(mcap: Union[float, int, None]) -> str:
     """
-    Grov klassning av bolagsstorlek baserat på Market Cap (i bolagets valuta):
-      Mega:  >= 200 B
-      Large: >= 10 B
-      Mid:   >= 2 B
-      Small: >= 0.3 B
-      Micro: <  0.3 B
+    Grov indelning efter Market Cap (USD).
     """
-    mcap = to_float(mcap_value, default=np.nan)
-    if mcap is None or (isinstance(mcap, float) and math.isnan(mcap)):
+    v = safe_float(mcap, np.nan)
+    if math.isnan(v):
         return "Unknown"
-
-    b = mcap / 1e9  # miljarder
-    if b >= 200:
+    if v >= 200e9:
         return "Mega"
-    if b >= 10:
+    if v >= 10e9:
         return "Large"
-    if b >= 2:
+    if v >= 2e9:
         return "Mid"
-    if b >= 0.3:
+    if v >= 300e6:
         return "Small"
     return "Micro"
+
+
+# ---------------------------------------------------------------------
+# Backoff-wrapper för API/Sheets-anrop
+# ---------------------------------------------------------------------
+
+def with_backoff(fn: Callable, *args, retries: int = 3, base_delay: float = 0.6, jitter: float = 0.2, **kwargs):
+    """
+    Kör fn(*args, **kwargs) med exponentiell backoff.
+    Höjer sista felet om alla försök misslyckas.
+    """
+    last: Optional[Exception] = None
+    for i in range(int(retries)):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # pragma: no cover - robust i produktion
+            last = e
+            sleep = base_delay * (2 ** i) + random.random() * jitter
+            time.sleep(sleep)
+    if last:
+        raise last
+    raise RuntimeError("with_backoff: okänt fel")
+
+
+# ---------------------------------------------------------------------
+# TS-hantering
+# ---------------------------------------------------------------------
+
+def _is_ts_column_name(name: str) -> bool:
+    """
+    Upptäck TS-kolumner robust:
+    - slut med " TS"  (ex: "Kurs TS")
+    - börja med "TS " (ex: "TS Kurs")
+    - sluta/börja med "_TS" / "TS_"
+    - exakt "TS" i början/slutet (case-insensitive)
+    """
+    if not isinstance(name, str):
+        return False
+    n = name.strip()
+    u = n.upper()
+    return (
+        u.endswith(" TS")
+        or u.startswith("TS ")
+        or u.endswith("_TS")
+        or u.startswith("TS_")
+        or u == "TS"
+    )
+
+
+def _first_series_for_column(df: pd.DataFrame, colname: str) -> pd.Series:
+    """
+    Returnera Series för FÖRSTA förekomsten av 'colname' om df har dubbletter.
+    Om kolumn inte finns returneras en Na-serie.
+    """
+    idxs = [i for i, c in enumerate(df.columns) if c == colname]
+    if not idxs:
+        return pd.Series([np.nan] * len(df), index=df.index)
+    return df.iloc[:, idxs[0]]
+
+
+def stamp_fields_ts(df: pd.DataFrame, fields: Sequence[str], ts_suffix: str = " TS") -> pd.DataFrame:
+    """
+    Stämpla tidsstämpel i (fält + ts_suffix) för alla rader där fältet finns.
+    Skapar kolumnen om den saknas. Kolliderar inte om det redan finns dubbletter
+    – vi uppdaterar första förekomsten.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    now = now_stamp()
+
+    # säkerställ unika kolumnnamn i arbetskopian
+    if not out.columns.is_unique:
+        out = out.loc[:, ~out.columns.duplicated()]
+
+    for f in fields:
+        ts_col = f"{f}{ts_suffix}"
+        # se till att ts-kolumnen finns (första förekomsten används)
+        if ts_col not in out.columns:
+            out[ts_col] = np.nan
+        # uppdatera där fältet inte är NaN
+        mask = out.get(f, pd.Series([np.nan] * len(out), index=out.index))
+        mask = pd.notna(mask)
+        out.loc[mask, ts_col] = now
+
+    return out
+
+
+def add_oldest_ts_col(df: pd.DataFrame, ts_cols: Optional[Sequence[str]] = None, dest_col: str = "__oldest_ts__") -> pd.DataFrame:
+    """
+    Skapa en kolumn med det ÄLDSTA (min) datumet över givna TS-kolumner.
+    - Hanterar dubbletter av kolumnnamn (tar första förekomsten).
+    - Om ts_cols=None: autodetektera TS-kolumner med _is_ts_column_name().
+    - Returnerar en kopia av df med 'dest_col' som pandas.Timestamp (kan vara NaT).
+    """
+    if df is None or df.empty:
+        out = df.copy() if df is not None else pd.DataFrame()
+        out[dest_col] = pd.NaT
+        return out
+
+    work = df.copy()
+    # Droppa ev. dubbletter av kolumnnamn för att undvika pandas ValueError
+    # N.B. Vi behåller FÖRSTA förekomsten.
+    if not work.columns.is_unique:
+        work = work.loc[:, ~work.columns.duplicated()]
+
+    # Autodetektera TS-kolumner om inget explicit skickas in
+    if ts_cols is None:
+        ts_cols = [c for c in work.columns if _is_ts_column_name(str(c))]
+
+    if not ts_cols:
+        # inget att göra – skapa tom kolumn
+        work[dest_col] = pd.NaT
+        return work
+
+    # Bygg en tids-DataFrame med första förekomsten per TS-kolumn
+    parts: List[pd.Series] = []
+    for c in ts_cols:
+        s = _first_series_for_column(work, c)
+        s = pd.to_datetime(s, errors="coerce")
+        parts.append(s)
+
+    if not parts:
+        work[dest_col] = pd.NaT
+        return work
+
+    tsdf = pd.concat(parts, axis=1)
+    # Äldsta (min) över rader, ignorera NaT
+    oldest = tsdf.min(axis=1, skipna=True)
+    work[dest_col] = oldest
+    return work
+
+
+# ---------------------------------------------------------------------
+# Små hjälpare
+# ---------------------------------------------------------------------
+
+def with_nan_as_none(x):
+    """Returnera None om x är NaN, annars x."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, float) and math.isnan(x):
+            return None
+        if pd.isna(x):
+            return None
+        return x
+    except Exception:
+        return None

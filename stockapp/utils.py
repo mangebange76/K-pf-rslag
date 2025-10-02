@@ -67,7 +67,6 @@ def to_float(x, default: float = 0.0) -> float:
         if not s:
             return float(default)
         s = s.replace(",", ".")
-        # försök direkt
         try:
             return float(s)
         except Exception:
@@ -123,7 +122,6 @@ def ensure_schema(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     for c in cols:
         if c not in out.columns:
             out[c] = np.nan
-    # behåll extra kolumner också
     ordered = [c for c in cols] + [c for c in out.columns if c not in cols]
     return out[ordered]
 
@@ -165,22 +163,29 @@ def stamp_fields_ts(df: pd.DataFrame, fields: Iterable[str], ts_suffix: str = " 
 
 def _collect_ts_cols(columns: Iterable[str]) -> List[str]:
     """
-    Samlar alla kolumnnamn som sannolikt är TS-kolumner (både 'Fält TS' och 'TS Fält').
+    Samlar alla kolumnnamn som sannolikt är TS-kolumner.
+    Stöd för:
+      - '... TS'   (suffx)
+      - 'TS ...'   (prefix med mellanslag)
+      - 'TS_...'   (prefix med underscore)
+      - 'TS-...'   (prefix med bindestreck)
     """
     ts_cols = []
     for c in columns:
         s = str(c)
-        if s.endswith(" TS") or s.startswith("TS "):
+        if s.endswith(" TS"):
+            ts_cols.append(s)
+            continue
+        su = s.upper()
+        if su.startswith("TS ") or su.startswith("TS_") or su.startswith("TS-") or su == "TS":
             ts_cols.append(s)
     return ts_cols
 
 
 def add_oldest_ts_col(df: pd.DataFrame, dest_col: str = "__oldest_ts__") -> pd.DataFrame:
     """
-    Letar upp alla TS-kolumner i df och lägger till en kolumn 'dest_col' med den
-    ÄLDSTA (minsta) tidsstämpeln per rad. TS-kolumner upptäcks som:
-      - kolumner som slutar med ' TS' (t.ex. 'Kurs TS', 'P/S TS')
-      - eller kolumner som börjar med 'TS ' (t.ex. 'TS Kurs')
+    Letar upp alla TS-kolumner i df och lägger till 'dest_col' med den
+    ÄLDSTA (minsta) tidsstämpeln per rad.
     Saknas TS-kolumner sätts NaT.
     """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -194,12 +199,10 @@ def add_oldest_ts_col(df: pd.DataFrame, dest_col: str = "__oldest_ts__") -> pd.D
         out[dest_col] = pd.NaT
         return out
 
-    # Konvertera alla TS-kolumner till tidsstämplar
     ts_frame = pd.DataFrame(index=out.index)
     for c in ts_cols:
         ts_frame[c] = pd.to_datetime(out[c], errors="coerce")
 
-    # min per rad
     out[dest_col] = ts_frame.min(axis=1, skipna=True)
     return out
 

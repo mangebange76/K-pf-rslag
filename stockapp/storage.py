@@ -1,94 +1,84 @@
 # stockapp/storage.py
 # -*- coding: utf-8 -*-
-"""
-Läser/skriv­er portföljdatan mot Google Sheets.
-Frikopplad från övriga moduler (inga imports från utils) för att undvika cirkulära beroenden.
-
-Publikt API:
-- hamta_data() -> pd.DataFrame
-- spara_data(df: pd.DataFrame) -> None
-"""
-
 from __future__ import annotations
 
-import time
-from typing import List, Any
+from datetime import datetime
+from typing import Tuple
 
 import pandas as pd
 import streamlit as st
 
-from .sheets import get_ws
+from .config import SHEET_NAME, FINAL_COLS, SNAPSHOT_PREFIX
+from .utils import ensure_schema, dedupe_tickers
+from .sheets import get_ws, ws_read_df, ws_write_df, ensure_headers
 
 
-# ---------------------------------------------------------------------
-# Lokal backoff (ingen utils-dependency)
-# ---------------------------------------------------------------------
-def _with_backoff(fn, *args, **kwargs):
-    delay = 0.5
-    last_err: Exception | None = None
-    for _ in range(6):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:  # vi vill bubbla upp sista felet
-            last_err = e
-            time.sleep(delay)
-            delay = min(delay * 2, 8.0)
-    if last_err:
-        raise last_err
-    raise RuntimeError("Okänt fel i _with_backoff")
-
-
-# ---------------------------------------------------------------------
-# Läs/skriv
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------
+# Publika funktioner
+# ------------------------------------------------------------
 def hamta_data() -> pd.DataFrame:
     """
-    Läser alla rader från aktuellt worksheet.
-    Förväntar att första raden i arket är kolumnrubriker.
-    Returnerar alltid en DataFrame (kan vara tom).
+    Läs huvudbladet (SHEET_NAME) som DataFrame.
+    - Returnerar alltid en DataFrame med minst FINAL_COLS som kolumner
+    - Dubbletter (Ticker) tas inte bort här – det görs endast i minnet av appen
     """
-    ws = get_ws()  # använder default från sheets.py (SHEET_NAME i secrets)
-    # get_all_records läser med rubrikrad som header och resten som data
-    rows: List[dict[str, Any]] = _with_backoff(ws.get_all_records, empty_value="")
-    if not rows:
-        # Om helt tomt (eller bara header i arket), försök hämta header separat
-        try:
-            header = _with_backoff(ws.row_values, 1)
-        except Exception:
-            header = []
-        if header:
-            return pd.DataFrame(columns=header)
-        return pd.DataFrame()
+    ws = get_ws(SHEET_NAME)
+    try:
+        df = ws_read_df(ws)
+    except Exception as e:
+        # Vid läsfel: exponera varning och ge en tom DF
+        st.warning(f"⚠️ Kunde inte läsa Google Sheet: {e}")
+        df = pd.DataFrame(columns=FINAL_COLS)
 
-    df = pd.DataFrame(rows)
-
-    # Normalisera kolumnnamn (trimma whitespace)
-    df.columns = [str(c).strip() for c in df.columns]
+    # Säkerställ schema (lägg till saknade kolumner)
+    df = ensure_schema(df, FINAL_COLS)
     return df
 
 
-def spara_data(df: pd.DataFrame) -> None:
+def spara_data(df: pd.DataFrame, do_snapshot: bool = False) -> Tuple[pd.DataFrame, int]:
     """
-    Skriver hela DataFrame till bladet.
-    - Rensar arket
-    - Skriver header + värden
-    Bevarar kolumnordningen enligt df.columns.
+    Skriv DataFrame till huvudbladet (SHEET_NAME).
+    - Säkerställer schema (FINAL_COLS)
+    - Tar bort dubbletter (Ticker) innan skrivning (för att hålla bladet “rent”)
+    - Optionellt skapa snapshot-blad
+
+    Returnerar (df_som_skrev, antal_dubbletter_borttagna)
     """
     if df is None:
-        return
+        raise ValueError("df är None")
 
-    ws = get_ws()
-    # Säkerställ strängrubriker
-    headers = [str(c) for c in df.columns.tolist()]
+    # 1) Säkerställ schema och ordning
+    work = ensure_schema(df.copy(), FINAL_COLS)
+    work = work[FINAL_COLS]  # skriv i en konsekvent kolumnordning
 
-    # Konvertera DataFrame till listor
-    if len(df) > 0:
-        values = df.astype(object).where(pd.notna(df), "").values.tolist()
-    else:
-        values = []
+    # 2) Dubblettstädning (Ticker)
+    cleaned, dups = dedupe_tickers(work)
+    dup_count = len(dups)
 
-    body: List[List[Any]] = [headers] + values
+    # 3) Skriv till blad
+    ws = get_ws(SHEET_NAME)
+    ensure_headers(ws, FINAL_COLS)
+    ws_write_df(ws, cleaned)
 
-    # Skriv med backoff (clear + update)
-    _with_backoff(ws.clear)
-    _with_backoff(ws.update, body)
+    # 4) Snapshot om begärt
+    if do_snapshot:
+        try:
+            _spara_snapshot(cleaned)
+        except Exception as e:
+            st.warning(f"⚠️ Kunde inte skapa snapshot: {e}")
+
+    return cleaned, dup_count
+
+
+# ------------------------------------------------------------
+# Hjälpare
+# ------------------------------------------------------------
+def _spara_snapshot(df: pd.DataFrame) -> None:
+    """
+    Skapa ett nytt blad med en tidsstämplad kopia av df.
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    title = f"{SNAPSHOT_PREFIX}{ts}"
+    ws = get_ws(title, rows=max(1000, len(df) + 10), cols=max(60, len(df.columns) + 5))
+    ensure_headers(ws, list(df.columns))
+    ws_write_df(ws, df)

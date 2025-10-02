@@ -19,8 +19,7 @@ APP_TITLE: str = st.secrets.get("APP_TITLE", "K-pf-rslag")
 # URL till kalkylbladet (läggs normalt i st.secrets).
 SHEET_URL: str = st.secrets.get("SHEET_URL", "").strip()
 # Huvudfliken där portföljen/bolagslistan finns
-# Viktigt: default till "Blad1" (din befintliga flik), inte "Data".
-SHEET_NAME: str = st.secrets.get("SHEET_NAME", "Blad1")
+SHEET_NAME: str = st.secrets.get("SHEET_NAME", "Data")
 # Fliken för valutakurser
 RATES_SHEET_NAME: str = st.secrets.get("RATES_SHEET_NAME", "Valutakurser")
 
@@ -35,6 +34,7 @@ STANDARD_VALUTAKURSER: Dict[str, float] = {
     "NOK": float(st.secrets.get("DEFAULT_NOKSEK", 1.0)),
     "SEK": 1.0,
 }
+DISPLAY_CURRENCY: str = st.secrets.get("DISPLAY_CURRENCY", "SEK")
 
 # ---------------------------------------------------------------------
 # Kolumnschema
@@ -45,8 +45,8 @@ BASE_COLS: List[str] = [
     "Bolagsnamn",
     "Valuta",
     "Sektor",
-    "Risklabel",                 # härleder vi från Market Cap
-    "Antal aktier",
+    "Risklabel",                 # härleder vi ofta från Market Cap
+    "Antal aktier",             # <-- VIKTIGT: denna är kanonisk (inte "Antal du äger")
     "GAV (SEK)",
 ]
 
@@ -77,7 +77,7 @@ FACT_COLS: List[str] = [
     "Omsättning nästa år (M)",
 ]
 
-# Tidsstämplar
+# Tidsstämplar (vi accepterar både prefix/suffix i utils, men kanoniskt använder vi prefix)
 TS_COLS: List[str] = [
     "TS Kurs",
     "TS Full",
@@ -89,8 +89,8 @@ TS_COLS: List[str] = [
 CALC_COLS: List[str] = [
     "P/S-snitt (Q1..Q4)",
     "P/S (TTM, modell)",
-    "Riktkurs (valuta)",
-    "Uppsida (%)",
+    "Riktkurs (USD)",
+    "Upside (%)",
     "Värde (SEK)",
     "Andel (%)",
 ]
@@ -98,7 +98,7 @@ CALC_COLS: List[str] = [
 # Slutlig ordning (för säker sparning/visning)
 FINAL_COLS: List[str] = BASE_COLS + FACT_COLS + TS_COLS + CALC_COLS
 
-# För validering av tider – dessa två används när vi listar “manuell prognoslista”
+# För validering av tider – dessa används när vi listar “manuell prognoslista”
 TS_FIELDS: List[str] = ["TS Omsättning i år", "TS Omsättning nästa år"]
 
 # Maxrad-skydd vid skrivning (guard)
@@ -128,5 +128,5 @@ SCORABLE_KEYS: List[str] = [
     "P/B",
     "Dividend yield (%)",
     "Dividend payout (FCF) (%)",
-    "Uppsida (%)",
+    "Upside (%)",
 ]

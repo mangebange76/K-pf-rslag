@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -107,6 +107,8 @@ def _init_state_defaults():
     st.session_state.setdefault("batch_queue", [])
     st.session_state.setdefault("batch_order_mode", "Äldst först")
     st.session_state.setdefault("batch_size", 10)
+    st.session_state.setdefault("batch_ts_basis", "Kurs TS")  # NYTT
+    st.session_state.setdefault("recent_processed", [])       # NYTT
 
     # vyer
     st.session_state.setdefault("view", "Investeringsförslag")
@@ -201,15 +203,37 @@ def _sidebar_batch(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFra
     """Sidopanel – batchkö och körning."""
     with st.sidebar.expander("⚙️ Batch", expanded=True):
         st.session_state["batch_order_mode"] = st.selectbox(
-            "Sortering", ["Äldst först", "A–Ö", "Z–A"], index=["Äldst först", "A–Ö", "Z–A"].index(st.session_state["batch_order_mode"])
+            "Sortering",
+            ["Äldst först", "A–Ö", "Z–A"],
+            index=["Äldst först", "A–Ö", "Z–A"].index(st.session_state["batch_order_mode"]),
         )
-        st.session_state["batch_size"] = st.number_input("Antal i batch", min_value=1, max_value=200, value=int(st.session_state["batch_size"]))
+        st.session_state["batch_ts_basis"] = st.selectbox(  # NYTT
+            "TS-bas (för 'Äldst först')",
+            ["Kurs TS", "Full TS", "Alla TS (äldst av alla)"],
+            index=["Kurs TS", "Full TS", "Alla TS (äldst av alla)"].index(st.session_state["batch_ts_basis"]),
+            help="Välj vilken tidsstämpel som styr urvalet när du skapar kön.",
+        )
+        st.session_state["batch_size"] = st.number_input(
+            "Antal i batch", min_value=1, max_value=200, value=int(st.session_state["batch_size"])
+        )
 
-        if st.button("Skapa batchkö"):
-            order = _pick_order(df, st.session_state["batch_order_mode"])
-            queue = [t for t in order if t not in st.session_state["batch_queue"]]
-            st.session_state["batch_queue"] = queue[: st.session_state["batch_size"]]
-            st.toast(f"Skapade batch ({len(st.session_state['batch_queue'])} tickers).")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Skapa batchkö"):
+                order = _pick_order(df, st.session_state["batch_order_mode"], ts_basis=st.session_state["batch_ts_basis"])
+                # Exkludera nyligen körda tickers (för att inte få samma 10 direkt)
+                recent: List[str] = st.session_state.get("recent_processed", []) or []
+                order_filtered = [t for t in order if t not in recent]
+                # Fyll upp om för få kvar
+                if len(order_filtered) < st.session_state["batch_size"]:
+                    rest = [t for t in order if t not in order_filtered]
+                    order_filtered += rest
+                st.session_state["batch_queue"] = order_filtered[: st.session_state["batch_size"]]
+                st.toast(f"Skapade batch ({len(st.session_state['batch_queue'])} tickers).")
+        with c2:
+            if st.button("Nollställ historik"):
+                st.session_state["recent_processed"] = []
+                st.toast("Historik nollställd.")
 
         if st.session_state["batch_queue"]:
             st.write("Kö:", ", ".join(st.session_state["batch_queue"]))
@@ -226,12 +250,37 @@ def _sidebar_batch(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFra
     return df
 
 
-def _pick_order(df: pd.DataFrame, mode: str) -> List[str]:
+def _detect_ts_cols(df: pd.DataFrame, basis: str) -> Sequence[str]:
+    """Hjälp: returnera relevanta TS-kolumner utifrån vald basis."""
+    cols = [c for c in df.columns if isinstance(c, str)]
+    b = (basis or "").lower()
+    if "kurs" in b:
+        wanted = []
+        for key in ["Kurs TS", "TS Kurs", "Pris TS", "TS Pris"]:
+            if key in df.columns:
+                wanted.append(key)
+        return wanted or [c for c in cols if c.strip().upper().endswith(" KURS TS")]
+    if "full" in b:
+        wanted = []
+        for key in ["TS Full", "Full TS"]:
+            if key in df.columns:
+                wanted.append(key)
+        return wanted
+    # alla TS – lämna till utils autodetektering
+    return []
+
+
+def _pick_order(df: pd.DataFrame, mode: str, ts_basis: str = "Alla TS (äldst av alla)") -> List[str]:
     """Välj ordning för batch."""
     work = df.copy()
     work["Ticker"] = work["Ticker"].astype(str)
+
     if mode == "Äldst först":
-        work = add_oldest_ts_col(work, dest_col="__oldest_ts__")
+        ts_cols = _detect_ts_cols(work, ts_basis)
+        if ts_cols:
+            work = add_oldest_ts_col(work, ts_cols=ts_cols, dest_col="__oldest_ts__")
+        else:
+            work = add_oldest_ts_col(work, dest_col="__oldest_ts__")  # autodetektera
         work = work.sort_values(by="__oldest_ts__", ascending=True, na_position="first")
     elif mode == "A–Ö":
         work = work.sort_values(by="Ticker", ascending=True)
@@ -263,12 +312,10 @@ def _runner_full(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> Tu
     if run_update_full is None:
         return _runner_price(df, tkr, user_rates)
     try:
-        # förväntat API: (df, ticker, user_rates) -> (df_out, logmsg)
         out = run_update_full(df, tkr, user_rates)  # type: ignore
         if isinstance(out, tuple) and len(out) == 2:
             df2, msg = out
             return df2, str(msg)
-        # om orkestrator returnerar bara df
         if isinstance(out, pd.DataFrame):
             return out, "OK"
         return df, "Orchestrator: oväntat svar"
@@ -277,7 +324,7 @@ def _runner_full(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> Tu
 
 
 def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[str, float]) -> pd.DataFrame:
-    """Kör batch mot kö – visar progress 1/X och sparar var 5:e."""
+    """Kör batch mot kö – visar progress 1/X och sparar var 5:e. Uppdaterar 'recent_processed'."""
     if not queue:
         st.info("Ingen batchkö.")
         return df
@@ -287,6 +334,7 @@ def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[s
     done = 0
     log_lines = []
     work = df.copy()
+    recent: List[str] = st.session_state.get("recent_processed", []) or []
 
     for tkr in list(queue):  # iterera över en kopia
         if mode == "price":
@@ -300,10 +348,18 @@ def _run_batch(df: pd.DataFrame, queue: List[str], mode: str, user_rates: Dict[s
         # plocka bort från kö
         st.session_state["batch_queue"] = [x for x in st.session_state["batch_queue"] if x != tkr]
 
+        # spara “nyligen körda”
+        if tkr not in recent:
+            recent.append(tkr)
+        if len(recent) > 300:  # håll nere storlek
+            recent = recent[-300:]
+
         if done % 5 == 0:
             _save_df(work)
 
     _save_df(work)
+    st.session_state["recent_processed"] = recent
+
     st.sidebar.write("Logg:")
     for ln in log_lines:
         st.sidebar.write("• " + ln)
@@ -324,24 +380,12 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
         for c in ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]:
             if c not in df.columns:
                 df[c] = np.nan
-        df["P/S-snitt (Q1..Q4)"] = pd.to_numeric(
-            df[["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]].mean(axis=1),
-            errors="coerce"
-        )
+        df["P/S-snitt (Q1..Q4)"] = pd.to_numeric(df[["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]].mean(axis=1), errors="coerce")
         sortcol = "P/S-snitt (Q1..Q4)"
 
     work = df.copy()
-
-    # 🔧 NYTT: deduplicera kolumnnamn (annars kan pandas kasta ValueError vid sortering)
-    if not work.columns.is_unique:
-        work = work.loc[:, ~work.columns.duplicated()]
-
-    # lägg risklabel om saknas
     if "Risklabel" not in work.columns:
-        if "Market Cap" in work.columns:
-            work["Risklabel"] = work["Market Cap"].apply(risk_label_from_mcap)
-        else:
-            work["Risklabel"] = "Unknown"
+        work["Risklabel"] = work["Market Cap"].apply(risk_label_from_mcap) if "Market Cap" in work.columns else "Unknown"
 
     # filtrering
     c1, c2, c3 = st.columns([1, 1, 1])
@@ -359,15 +403,10 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
         work = work[work["Risklabel"].astype(str) == val_risk]
 
     # sortering (Score högst först, annars lägst P/S-snitt)
-    if sortcol in work.columns:
-        if sortcol == "Score":
-            work = work.sort_values(by=sortcol, ascending=False, na_position="last")
-        else:
-            work = work.sort_values(by=sortcol, ascending=True, na_position="last")
+    if sortcol == "Score":
+        work = work.sort_values(by=sortcol, ascending=False, na_position="last")
     else:
-        # sista fallback om kolumn saknas efter dedup – sortera på ticker
-        if "Ticker" in work.columns:
-            work = work.sort_values(by="Ticker", ascending=True)
+        work = work.sort_values(by=sortcol, ascending=True, na_position="last")
 
     # bläddring 1/X
     total = len(work)
@@ -394,10 +433,8 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
         with st.container(border=True):
             st.subheader(f"{row.get('Bolagsnamn', '')} ({row.get('Ticker', '')})")
             cols = st.columns(4)
-            ps_val = safe_float(row.get('P/S'), np.nan)
-            ps_avg = safe_float(row.get('P/S-snitt (Q1..Q4)'), np.nan)
-            cols[0].metric("P/S (TTM)", f"{ps_val:.2f}" if not math.isnan(ps_val) else "–")
-            cols[1].metric("P/S-snitt (4Q)", f"{ps_avg:.2f}" if not math.isnan(ps_avg) else "–")
+            cols[0].metric("P/S (TTM)", f"{safe_float(row.get('P/S'), np.nan):.2f}" if not math.isnan(safe_float(row.get("P/S"), np.nan)) else "–")
+            cols[1].metric("P/S-snitt (4Q)", f"{safe_float(row.get('P/S-snitt (Q1..Q4)'), np.nan):.2f}" if not math.isnan(safe_float(row.get("P/S-snitt (Q1..Q4)"), np.nan)) else "–")
             mcap_disp = format_large_number(row.get("Market Cap", np.nan), "USD")
             cols[2].metric("Market Cap (nu)", mcap_disp)
             cols[3].write(f"**Risklabel:** {row.get('Risklabel', 'Unknown')}")
@@ -407,7 +444,6 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
                 for c in ["Sektor", "Valuta", "Debt/Equity", "Bruttomarginal (%)", "Nettomarginal (%)", "Utestående aktier (milj.)", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]:
                     if c in df.columns:
                         info.append((c, row.get(c)))
-                # formattera market cap tydligt
                 info.insert(0, ("Market Cap (nu)", mcap_disp))
                 for k, v in info:
                     if isinstance(v, (int, float)) and not math.isnan(float(v)):
@@ -415,7 +451,6 @@ def vy_investeringsforslag(df: pd.DataFrame, user_rates: Dict[str, float]):
                     else:
                         st.write(f"- **{k}:** –")
 
-            # bedömning enklare etikett om Score finns
             if "Score" in df.columns and not pd.isna(row.get("Score")):
                 sc = float(row.get("Score"))
                 if sc >= 85:
@@ -550,13 +585,6 @@ def main():
     # Läs data
     df = _load_df()
     st.session_state["_df_ref"] = df
-
-    # Visa liten statusrad
-    try:
-        uniq_tickers = sorted(list(set([str(t) for t in df.get("Ticker", pd.Series([], dtype=str)).dropna().tolist()])))
-        st.caption(f"🗂️ Lästa rader: {len(df)} • Kolumner: {len(df.columns)} • Tickers ({len(uniq_tickers)}): {', '.join(uniq_tickers[:5])}")
-    except Exception:
-        pass
 
     # Sidopanel – valutor & batch
     user_rates = _sidebar_rates()

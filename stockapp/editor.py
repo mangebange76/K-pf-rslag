@@ -1,331 +1,302 @@
-# stockapp/editor.py
 # -*- coding: utf-8 -*-
 """
+stockapp.editor
+---------------
 Lägg till / uppdatera bolag:
-- Bläddring 1/X mellan tickers
-- Uppdatera kurs (Yahoo) / Full uppdatering (orchestrator)
-- Manuell uppdatering av 'Omsättning i år (est.)' och 'Omsättning nästa år (est.)' med TS-stämpling
-- Manuell prognoslista (äldst först)
-- Lägg till nytt bolag (dubblettskydd)
-
-Publikt API:
-    lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame
+- Bläddra mellan tickers (◀/▶).
+- Lägg till ny ticker (Ticker, Bolagsnamn, Valuta).
+- Redigera fält: Antal aktier, GAV (SEK), Bolagsnamn, Valuta.
+- Uppdatera kurs (Yahoo) / Full uppdatering (orchestrator).
+- Stämplar TS-kolumner (TS Kurs, TS Full, TS Omsättning i år / nästa år).
+- Visar manuell prognoslista (äldst uppdaterad först).
 """
 
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
-import math
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Konfiguration (valfri – vi skyddar med fallback)
+# ------------------------------------------------------------
+# Imports med fallback
+# ------------------------------------------------------------
 try:
     from .config import FINAL_COLS
 except Exception:
-    FINAL_COLS = [
-        "Ticker","Bolagsnamn","Valuta","Kurs","Antal aktier","Market Cap",
-        "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
-        "GAV (SEK)","Omsättning i år (est.)","Omsättning nästa år (est.)",
-        "Senast manuellt uppdaterad","Senast auto-uppdaterad","Senast uppdaterad källa"
-    ]
+    FINAL_COLS = []
 
-# Utils vi förlitar oss på
 from .utils import (
     ensure_schema,
-    stamp_fields_ts,
-    now_stamp,
+    to_float,
     parse_date,
-    safe_float,
-    dedupe_tickers,
+    now_stamp,
+    stamp_fields_ts,
 )
 
-# Orchestrator och Yahoo-fallback (valfria)
+# Orchestrator (full uppdatering) & Yahoo (pris)
 try:
-    from .fetchers.orchestrator import run_update_full as _run_update_full
-except Exception:
-    _run_update_full = None
+    from .fetchers.orchestrator import run_update_full  # type: ignore
+except Exception:  # pragma: no cover
+    run_update_full = None  # type: ignore
 
 try:
-    from .fetchers.yahoo import get_live_price as _yahoo_price
-except Exception:
-    _yahoo_price = None
+    from .fetchers.yahoo import get_live_price as _yahoo_price  # type: ignore
+except Exception:  # pragma: no cover
+    _yahoo_price = None  # type: ignore
 
 
-# -----------------------------
-# Kolumnalias / hjälp
-# -----------------------------
-ALIAS_PRICE = ["Kurs", "Aktuell kurs"]
+# ------------------------------------------------------------
+# Hjälpare
+# ------------------------------------------------------------
+_MAN_PROG_FIELDS = ["Omsättning i år (M)", "Omsättning nästa år (M)"]
+_TS_FOR_FIELD = {
+    "Omsättning i år (M)": "TS Omsättning i år",
+    "Omsättning nästa år (M)": "TS Omsättning nästa år",
+}
 
-MANUAL_PROGNOS_FIELDS = ["Omsättning i år (est.)", "Omsättning nästa år (est.)"]
+def _ensure_editor_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Se till att vi har de fält som behövs i editorn."""
+    work = ensure_schema(df.copy(), FINAL_COLS if FINAL_COLS else df.columns.tolist())
 
-TS_SUFFIX = " TS"  # ex: "Omsättning i år (est.) TS"
+    # Nyttiga basfält
+    for c in ["Ticker", "Bolagsnamn", "Valuta", "Kurs", "Antal aktier", "GAV (SEK)"]:
+        if c not in work.columns:
+            work[c] = np.nan if c in ("Kurs", "GAV (SEK)") else ""
 
+    # TS-fält vi använder
+    for ts in ["TS Kurs", "TS Full", "TS Omsättning i år", "TS Omsättning nästa år"]:
+        if ts not in work.columns:
+            work[ts] = ""
 
-def _first_existing_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+    # Manuell prognos-fält
+    for c in _MAN_PROG_FIELDS:
+        if c not in work.columns:
+            work[c] = np.nan
 
+    # Typer
+    work["Ticker"] = work["Ticker"].astype(str).str.upper()
+    # undvik "None" i UI
+    work["Bolagsnamn"] = work["Bolagsnamn"].fillna("")
+    work["Valuta"] = work["Valuta"].fillna("USD")
 
-def _ensure_min_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Skapa saknade nyckelkolumner som editor-vyn behöver."""
-    base_cols = set(FINAL_COLS) | set(ALIAS_PRICE) | set([f + TS_SUFFIX for f in MANUAL_PROGNOS_FIELDS])
-    for c in base_cols:
-        if c not in df.columns:
-            df[c] = np.nan
-    # Säkerställ datatyper på några centrala fält
-    for c in ["Antal aktier", "GAV (SEK)"] + ALIAS_PRICE:
-        if c in df.columns:
-            try:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            except Exception:
-                pass
-    return df
+    # numeriska
+    for c in ["Kurs", "Antal aktier", "GAV (SEK)"] + _MAN_PROG_FIELDS:
+        if c in work.columns:
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+
+    return work
 
 
 def _runner_price(df: pd.DataFrame, tkr: str) -> Tuple[pd.DataFrame, str]:
-    """Uppdatera ENDAST kurs (Yahoo-fallback). Stämplar TS för prisfältet."""
+    """Uppdatera ENDAST kurs (Yahoo) och stämpla TS Kurs."""
     if _yahoo_price is None:
-        return df, "Yahoo-priskälla saknas"
-    price_col = _first_existing_col(df, ALIAS_PRICE) or "Kurs"
+        return df, "Yahoo-källa saknas"
     ridx = df.index[df["Ticker"].astype(str).str.upper() == str(tkr).upper()]
     if len(ridx) == 0:
         return df, "Ticker finns ej i tabellen"
     try:
-        p = _yahoo_price(str(tkr))
-        if p and p > 0:
-            df.loc[ridx, price_col] = float(p)
-            df = stamp_fields_ts(df, [price_col], ts_suffix=TS_SUFFIX)
-            df.loc[ridx, "Senast auto-uppdaterad"] = now_stamp()
-            df.loc[ridx, "Senast uppdaterad källa"] = "Yahoo (pris)"
-            return df, f"OK – {price_col}={float(p):.4f}"
+        price = _yahoo_price(str(tkr))
+        if price and price > 0:
+            out = df.copy()
+            out.loc[ridx, "Kurs"] = float(price)
+            # Stämpla
+            out.loc[ridx, "TS Kurs"] = now_stamp()
+            return out, "OK"
         return df, "Pris saknas"
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         return df, f"Fel: {e}"
 
 
-def _runner_full(df: pd.DataFrame, tkr: str, user_rates: Dict[str, float]) -> Tuple[pd.DataFrame, str]:
-    """Full uppdatering via orchestrator (SEC/FMP/Yahoo)."""
-    if _run_update_full is None:
-        # fallback till endast pris om orchestrator saknas
+def _runner_full(df: pd.DataFrame, tkr: str) -> Tuple[pd.DataFrame, str]:
+    """Full uppdatering (orchestrator) och TS Full."""
+    if run_update_full is None:
         return _runner_price(df, tkr)
 
     ridx = df.index[df["Ticker"].astype(str).str.upper() == str(tkr).upper()]
     if len(ridx) == 0:
         return df, "Ticker finns ej i tabellen"
-
     try:
-        out = _run_update_full(df.copy(), str(tkr), user_rates)  # API: (df, ticker, rates) -> (df_out, log) eller df_out
+        out = run_update_full(df.copy(), tkr, {})  # user_rates skickas normalt inte behövas här
         if isinstance(out, tuple) and len(out) == 2:
-            df2, log = out
+            out_df, msg = out
         elif isinstance(out, pd.DataFrame):
-            df2, log = out, "OK"
+            out_df, msg = out, "OK"
         else:
             return df, "Orchestrator: oväntat svar"
 
-        # säkerställ att minst “Senast auto-uppdaterad” & källa sätts om orkestratorn inte gjorde det
-        if "Senast auto-uppdaterad" in df2.columns:
-            df2.loc[ridx, "Senast auto-uppdaterad"] = now_stamp()
-        if "Senast uppdaterad källa" in df2.columns and (df2.loc[ridx, "Senast uppdaterad källa"].isna().any()):
-            df2.loc[ridx, "Senast uppdaterad källa"] = "Orchestrator"
-
-        # stämpla alla tekniska fält som uppdaterades? Låt orchestrator göra det primärt.
-        return df2, str(log)
-    except Exception as e:
+        out_df.loc[ridx, "TS Full"] = now_stamp()
+        return out_df, msg
+    except Exception as e:  # pragma: no cover
         return df, f"Fel: {e}"
 
 
-def _build_requires_manual_df(df: pd.DataFrame, older_than_days: Optional[int] = None) -> pd.DataFrame:
-    """
-    Lista för de fält som kräver manuell prognos (två fält).
-    Sortering på äldst TS, NAs först. older_than_days = None -> alltid sorterad äldst först.
-    """
+def _manual_queue(df: pd.DataFrame, older_than_days: Optional[int] = None) -> pd.DataFrame:
+    """Bygg lista över rader där manuell prognos bör ses över (äldst först)."""
     if df.empty:
-        return pd.DataFrame(columns=["Ticker","Bolagsnamn","Fält","Senast uppdaterad"])
+        return pd.DataFrame(columns=["Ticker", "Bolagsnamn", "Fält", "Senast uppdaterad"])
 
     rows = []
     for _, r in df.iterrows():
-        for f in MANUAL_PROGNOS_FIELDS:
-            ts_col = f + TS_SUFFIX
-            rows.append({
-                "Ticker": r.get("Ticker"),
-                "Bolagsnamn": r.get("Bolagsnamn"),
-                "Fält": f,
-                "Senast uppdaterad": parse_date(r.get(ts_col))
-            })
-    out = pd.DataFrame(rows)
-    out = out.sort_values(by="Senast uppdaterad", ascending=True, na_position="first")
+        for f in _MAN_PROG_FIELDS:
+            ts = _TS_FOR_FIELD.get(f, "")
+            rows.append(
+                {
+                    "Ticker": r.get("Ticker"),
+                    "Bolagsnamn": r.get("Bolagsnamn"),
+                    "Fält": f,
+                    "Senast uppdaterad": parse_date(r.get(ts)),
+                }
+            )
+    need = pd.DataFrame(rows)
+    need = need.sort_values(by="Senast uppdaterad", ascending=True, na_position="first")
     if older_than_days is not None:
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=int(older_than_days))
-        out = out[(out["Senast uppdaterad"].isna()) | (out["Senast uppdaterad"] < cutoff)]
-    return out.reset_index(drop=True)
+        need = need[(need["Senast uppdaterad"].isna()) | (need["Senast uppdaterad"] < cutoff)]
+    return need.reset_index(drop=True)
 
 
-def _edit_current_card(df: pd.DataFrame, idx: int) -> Tuple[pd.DataFrame, bool]:
+# ------------------------------------------------------------
+# Publik vy
+# ------------------------------------------------------------
+def visa_editor(df: pd.DataFrame, user_rates: Dict[str, float], on_save=None) -> pd.DataFrame:
     """
-    Renderar kortet för nuvarande rad/ticker och låter uppdatera:
-      - Kurs (pris) – knapp
-      - Full uppdatering – knapp
-      - Manuell: Omsättning i år / nästa år + TS-stämpling
-    Returnerar (df, changed)
-    """
-    changed = False
-    row = df.iloc[idx]
-    tkr = str(row.get("Ticker", ""))
-    namn = str(row.get("Bolagsnamn", ""))
-    st.subheader(f"{namn} ({tkr})")
-
-    col1, col2 = st.columns(2)
-    if col1.button("Uppdatera kurs", key=f"btn_price_{idx}"):
-        ndf, msg = _runner_price(df.copy(), tkr)
-        st.toast(f"{tkr}: {msg}")
-        if not ndf.equals(df):
-            df = ndf
-            changed = True
-            st.experimental_set_query_params()  # no-op reflow
-            st.rerun()
-    if col2.button("Full uppdatering", key=f"btn_full_{idx}"):
-        ndf, msg = _runner_full(df.copy(), tkr, user_rates={})
-        st.toast(f"{tkr}: {msg}")
-        if not ndf.equals(df):
-            df = ndf
-            changed = True
-            st.experimental_set_query_params()
-            st.rerun()
-
-    # Visa och uppdatera manuella prognoser
-    st.markdown("**Manuella prognoser**")
-    c3, c4 = st.columns(2)
-    val_iy = c3.number_input(
-        "Omsättning i år (est.)",
-        value=float(safe_float(row.get("Omsättning i år (est.)"), np.nan)) if not math.isnan(safe_float(row.get("Omsättning i år (est.)"), np.nan)) else 0.0,
-        step=1.0,
-        key=f"iy_{idx}"
-    )
-    val_ny = c4.number_input(
-        "Omsättning nästa år (est.)",
-        value=float(safe_float(row.get("Omsättning nästa år (est.)"), np.nan)) if not math.isnan(safe_float(row.get("Omsättning nästa år (est.)"), np.nan)) else 0.0,
-        step=1.0,
-        key=f"ny_{idx}"
-    )
-    if st.button("Spara manuella prognoser", key=f"save_manu_{idx}"):
-        df.at[df.index[idx], "Omsättning i år (est.)"] = float(val_iy) if val_iy else np.nan
-        df.at[df.index[idx], "Omsättning nästa år (est.)"] = float(val_ny) if val_ny else np.nan
-        df = stamp_fields_ts(df, MANUAL_PROGNOS_FIELDS, ts_suffix=TS_SUFFIX, row_index=df.index[idx])
-        # uppdatera “Senast manuellt uppdaterad”
-        df.at[df.index[idx], "Senast manuellt uppdaterad"] = now_stamp()
-        st.success("Sparat manuella prognoser.")
-        changed = True
-
-    return df, changed
-
-
-def _add_new_company(df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
-    """Form för att lägga till nytt bolag, med dubblettskydd."""
-    st.subheader("➕ Lägg till nytt bolag")
-    c1, c2, c3 = st.columns([1,1,1])
-    tkr = c1.text_input("Ticker", value="")
-    namn = c2.text_input("Bolagsnamn", value="")
-    valuta = c3.selectbox("Valuta", ["USD","SEK","EUR","NOK","CAD"], index=0)
-
-    c4, c5 = st.columns(2)
-    qty = c4.number_input("Antal aktier", min_value=0.0, step=1.0, value=0.0)
-    gav = c5.number_input("GAV (SEK)", min_value=0.0, step=0.01, value=0.0)
-
-    if st.button("Lägg till"):
-        if not tkr.strip():
-            st.warning("Ange en ticker.")
-            return df, False
-
-        # dubblettskydd (case-insensitive)
-        if (df["Ticker"].astype(str).str.upper() == tkr.strip().upper()).any():
-            st.error("Ticker finns redan – dubbletter ej tillåtna.")
-            return df, False
-
-        # Lägg till rad
-        new_row = {c: np.nan for c in df.columns}
-        new_row["Ticker"] = tkr.strip().upper()
-        new_row["Bolagsnamn"] = namn.strip() if namn else tkr.strip().upper()
-        new_row["Valuta"] = valuta
-        # skapa pris-fält om saknas
-        price_col = _first_existing_col(df, ALIAS_PRICE) or "Kurs"
-        new_row[price_col] = np.nan
-        new_row["Antal aktier"] = float(qty) if qty else np.nan
-        new_row["GAV (SEK)"] = float(gav) if gav else np.nan
-        # stämpla “Senast manuellt uppdaterad”
-        new_row["Senast manuellt uppdaterad"] = now_stamp()
-
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        st.success(f"La till {new_row['Ticker']}.")
-        return df, True
-
-    return df, False
-
-
-# -------------------------------------------------
-# Publikt gränssnitt
-# -------------------------------------------------
-def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
-    """
-    Renderar vyn och returnerar ev. uppdaterat df (ingen automatisk sparning här).
+    Interaktiv vy för att lägga till / uppdatera bolag.
+    Returnerar *alltid* df (kan vara samma objekt om inget ändrats).
+    Om `on_save` ges (callable), anropas den med df när något sparas.
     """
     st.header("✏️ Lägg till / uppdatera bolag")
 
-    if df is None or df.empty:
+    work = _ensure_editor_schema(df)
+
+    # --- Lägg till ny ticker -------------------------------------------------
+    with st.expander("➕ Lägg till ny ticker", expanded=False):
+        c1, c2, c3 = st.columns([1, 2, 1])
+        new_tkr = c1.text_input("Ticker", value="", placeholder="t.ex. NVDA").strip().upper()
+        new_name = c2.text_input("Bolagsnamn", value="", placeholder="valfritt")
+        new_ccy = c3.text_input("Valuta", value="USD").strip().upper() or "USD"
+
+        if st.button("Lägg till"):
+            if not new_tkr:
+                st.warning("Ange ticker.")
+            elif new_tkr in work["Ticker"].astype(str).str.upper().tolist():
+                st.warning("Tickern finns redan.")
+            else:
+                add_row = {
+                    "Ticker": new_tkr,
+                    "Bolagsnamn": new_name or new_tkr,
+                    "Valuta": new_ccy,
+                    "Antal aktier": 0.0,
+                    "GAV (SEK)": np.nan,
+                }
+                work = pd.concat([work, pd.DataFrame([add_row])], ignore_index=True)
+                st.success(f"La till {new_tkr}.")
+                if callable(on_save):
+                    on_save(work)
+
+    if work.empty:
         st.info("Inga bolag i databasen ännu.")
-        # Ge möjlighet att lägga till första bolaget ändå
-        df = pd.DataFrame(columns=FINAL_COLS)
-        df = _ensure_min_schema(df)
-        df, _ = _add_new_company(df)
-        return df
+        return work
 
-    # Säkerställ schema
-    df = ensure_schema(df, FINAL_COLS)
-    df = _ensure_min_schema(df)
+    # --- Bläddra mellan befintliga ------------------------------------------
+    tickers: List[str] = work["Ticker"].astype(str).tolist()
+    if "_edit_idx" not in st.session_state:
+        st.session_state["_edit_idx"] = 0
+    st.session_state["_edit_idx"] = int(
+        max(0, min(st.session_state["_edit_idx"], len(tickers) - 1))
+    )
 
-    # Dubbletter bort i minnet (informativt)
-    df, dups = dedupe_tickers(df)
-    if dups:
-        st.info("Dubbletter ignoreras i minnet: " + ", ".join(dups))
-
-    # Bläddringsindex
-    st.session_state.setdefault("edit_index", 0)
-    N = len(df)
-    st.session_state["edit_index"] = max(0, min(st.session_state["edit_index"], N - 1))
-
-    # Ticker-lista och hoppa till
-    tickers = df["Ticker"].astype(str).tolist()
-    cjump1, cjump2 = st.columns([2,1])
-    sel = cjump1.selectbox("Välj bolag", options=tickers, index=st.session_state["edit_index"])
-    if sel != tickers[st.session_state["edit_index"]]:
-        st.session_state["edit_index"] = tickers.index(sel)
-    cjump2.write(f"**{st.session_state['edit_index']+1} / {N}**")
-
-    # Navigation
-    colp1, colp2, colp3 = st.columns([1,2,1])
-    if colp1.button("◀ Föregående", disabled=st.session_state["edit_index"] <= 0):
-        st.session_state["edit_index"] -= 1
+    c1, c2, c3 = st.columns([1, 2, 1])
+    if c1.button("◀ Föregående", disabled=st.session_state["_edit_idx"] <= 0):
+        st.session_state["_edit_idx"] -= 1
         st.rerun()
-    colp2.markdown("<div style='text-align:center'><b>Bläddra</b></div>", unsafe_allow_html=True)
-    if colp3.button("Nästa ▶", disabled=st.session_state["edit_index"] >= N - 1):
-        st.session_state["edit_index"] += 1
+    c2.markdown(
+        f"<div style='text-align:center'>**{st.session_state['_edit_idx']+1} / {len(tickers)}**</div>",
+        unsafe_allow_html=True,
+    )
+    if c3.button("Nästa ▶", disabled=st.session_state["_edit_idx"] >= len(tickers) - 1):
+        st.session_state["_edit_idx"] += 1
         st.rerun()
 
-    # Rendera kortet
-    df, changed = _edit_current_card(df, st.session_state["edit_index"])
+    current_tkr = tickers[st.session_state["_edit_idx"]]
+    ridx = work.index[work["Ticker"].astype(str) == current_tkr][0]
+    row = work.loc[ridx]
 
-    st.divider()
-    # Manuell prognoslista – äldst först (oavsett ålder)
+    st.subheader(f"{row.get('Bolagsnamn','')} ({current_tkr})")
+
+    # --- Snabbredigering av fält --------------------------------------------
+    ec1, ec2, ec3, ec4 = st.columns([2, 1, 1, 1])
+    name_new = ec1.text_input("Bolagsnamn", value=str(row.get("Bolagsnamn") or ""))
+    val_new = ec2.text_input("Valuta", value=str(row.get("Valuta") or "USD")).upper()
+    qty_new = ec3.number_input("Antal aktier", value=float(to_float(row.get("Antal aktier"), 0.0)), min_value=0.0, step=1.0)
+    gav_new = ec4.number_input("GAV (SEK)", value=float(to_float(row.get("GAV (SEK)"), 0.0)), min_value=0.0, step=0.01, format="%.2f")
+
+    if st.button("💾 Spara rad"):
+        work.loc[ridx, "Bolagsnamn"] = name_new
+        work.loc[ridx, "Valuta"] = val_new or "USD"
+        work.loc[ridx, "Antal aktier"] = qty_new
+        work.loc[ridx, "GAV (SEK)"] = gav_new
+        st.success("Sparat.")
+        if callable(on_save):
+            on_save(work)
+
+    # --- Uppdateringar ------------------------------------------------------
+    uc1, uc2 = st.columns(2)
+    if uc1.button("⚡ Uppdatera kurs (Yahoo)"):
+        work2, msg = _runner_price(work, current_tkr)
+        st.toast(f"{current_tkr}: {msg}")
+        if work2 is not work:
+            work = work2
+            if callable(on_save):
+                on_save(work)
+
+    if uc2.button("🧩 Full uppdatering (orchestrator)"):
+        work2, msg = _runner_full(work, current_tkr)
+        st.toast(f"{current_tkr}: {msg}")
+        if work2 is not work:
+            work = work2
+            if callable(on_save):
+                on_save(work)
+
+    # --- Manuell prognoslista ----------------------------------------------
     st.subheader("📝 Manuell prognoslista (äldst först)")
-    need = _build_requires_manual_df(df, older_than_days=None)
+    need = _manual_queue(work, older_than_days=None)
     st.dataframe(need, use_container_width=True, hide_index=True)
 
-    st.divider()
-    # Lägg till nytt bolag
-    df, added = _add_new_company(df)
+    # --- Snabbuppdatering av manuella prognoser för aktuell ticker ----------
+    st.markdown("**Uppdatera prognoser för valt bolag**")
+    mp1, mp2, mp3 = st.columns([1, 1, 1])
+    y_now = mp1.number_input(
+        "Omsättning i år (M)",
+        value=float(to_float(row.get("Omsättning i år (M)"), np.nan)) if not pd.isna(row.get("Omsättning i år (M)")) else 0.0,
+        min_value=0.0,
+        step=1.0,
+    )
+    y_next = mp2.number_input(
+        "Omsättning nästa år (M)",
+        value=float(to_float(row.get("Omsättning nästa år (M)"), np.nan)) if not pd.isna(row.get("Omsättning nästa år (M)")) else 0.0,
+        min_value=0.0,
+        step=1.0,
+    )
+    if mp3.button("💾 Spara prognoser"):
+        work.loc[ridx, "Omsättning i år (M)"] = float(y_now) if y_now > 0 else np.nan
+        work.loc[ridx, "Omsättning nästa år (M)"] = float(y_next) if y_next > 0 else np.nan
+        # TS-stämpla respektive fält
+        fields = []
+        if y_now > 0:
+            fields.append("Omsättning i år (M)")
+        if y_next > 0:
+            fields.append("Omsättning nästa år (M)")
+        if fields:
+            # bygg dynamiska TS-kolumner: "TS Omsättning i år" etc
+            ts_cols = [_TS_FOR_FIELD[f] for f in fields if f in _TS_FOR_FIELD]
+            work = stamp_fields_ts(work, fields=ts_cols, ts_suffix="")  # TS-kolumnerna är redan fulla namn
+        st.success("Prognoser sparade.")
+        if callable(on_save):
+            on_save(work)
 
-    # Avslut
-    return df
+    return work
+
+
+# Bakåtkompatibelt alias (tidigare namn i appen)
+lagg_till_eller_uppdatera = visa_editor

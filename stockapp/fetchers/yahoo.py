@@ -1,367 +1,305 @@
+# stockapp/fetchers/yahoo.py
 # -*- coding: utf-8 -*-
 """
-stockapp/fetchers/yahoo.py
+Yahoo Finance-hämtare (via yfinance om möjligt).
 
-Yahoo-hämtare:
-- Pris/valuta/namn/sektor/bransch/market cap/shares via yfinance
-- Kvartalsintäkter (income statement) -> TTM-summor (upp till 4 fönster)
-- Valutakonvertering (Frankfurter -> exchangerate.host) till prisvalutan
-- P/S nu + P/S Q1..Q4 med historiska priser
-- Extra nyckeltal (EV/EBITDA, Debt/Equity, bruttomarginal, nettomarginal) om tillgängligt
+Publikt API:
+    get_live_price(ticker) -> Optional[float]
+    fetch_ticker(ticker)   -> Dict[str, Any]  (fält mappade för orchestratorn)
 
-Returnerar: (vals, debug)
+Returnerade nycklar (om tillgängliga):
+    currency                -> "USD" / "SEK" / ...
+    price                   -> float
+    shares_outstanding      -> float (antal aktier)
+    market_cap              -> float (i bolagets valuta)
+    ps_ttm                  -> float (TTM P/S)
+    sector                  -> str
+    industry                -> str
+    gross_margin            -> float (%)  [0..100]
+    net_margin              -> float (%)  [0..100]
+    debt_to_equity          -> float (kvot)
+    ev_ebitda               -> float
+    fcf_m                   -> float (miljoner, valuta = company currency)
+    cash_m                  -> float (miljoner)
+    runway_quarters         -> float (≈ hur många kvartal kassan räcker vid negativ FCF)
+    dividend_yield_pct      -> float (%)
+    payout_ratio_cf_pct     -> float (%)  [oftast ej tillgänglig via Yahoo -> lämnas tomt]
 """
 
 from __future__ import annotations
-from typing import Dict, Tuple, Any, List, Optional
-import datetime as dt
-import requests
-import streamlit as st
-import yfinance as yf
+from typing import Any, Dict, Optional
 
-# ----------------------------- Hjälpare --------------------------------------
+import math
+import numpy as np
+
+# yfinance är frivilligt – modul kör utan om det saknas
+try:
+    import yfinance as yf
+except Exception:  # pragma: no cover
+    yf = None  # type: ignore
 
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+# -----------------------------
+# Hjälp
+# -----------------------------
+def _to_float(x) -> Optional[float]:
     try:
-        v = float(x)
-        if v != v:  # NaN
-            return default
+        if x is None:
+            return None
+        s = str(x).replace(",", ".")
+        v = float(s)
+        if math.isnan(v) or math.isinf(v):
+            return None
         return v
     except Exception:
-        return default
+        return None
 
 
-def _fx_rate(base: str, quote: str) -> float:
+def _safe_info_get(info: Dict[str, Any], *keys, factor: float = 1.0) -> Optional[float]:
+    for k in keys:
+        if k in info and info[k] is not None:
+            v = _to_float(info[k])
+            if v is not None:
+                return v * factor
+    return None
+
+
+def _get_cashflow_free_cf(t: "yf.Ticker") -> Optional[float]:
     """
-    Dagens FX via Frankfurter -> exchangerate.host fallback.
+    Försök plocka 'Free Cash Flow' (senaste års-värde) ur cashflow-tabellen.
+    Returnerar belopp (i samma valuta som bolaget) – inte i miljoner.
     """
-    base = (base or "").upper()
-    quote = (quote or "").upper()
-    if not base or not quote or base == quote:
-        return 1.0
-    # Frankfurter
     try:
-        r = requests.get("https://api.frankfurter.app/latest", params={"from": base, "to": quote}, timeout=12)
-        if r.status_code == 200:
-            v = (r.json() or {}).get("rates", {}).get(quote)
-            if v:
-                return float(v)
+        # yfinance har lite olika attribut beroende på version:
+        # Pröva annual_cashflow först (nyare API):
+        cf = getattr(t, "cashflow", None)
+        if cf is None or cf.empty:
+            cf = getattr(t, "annual_cashflow", None)
+        if cf is None or cf.empty:
+            return None
+
+        # Rader kan heta olika, normalisera:
+        # Vanliga nycklar: "Free Cash Flow" / "FreeCashFlow" / "freeCashFlow"
+        candidates = [
+            "Free Cash Flow",
+            "FreeCashFlow",
+            "freeCashFlow",
+        ]
+        # Ibland är index inte strängar – konvertera:
+        idx = [str(i) for i in cf.index]
+        cf.index = idx
+
+        row_key = None
+        for c in candidates:
+            if c in cf.index:
+                row_key = c
+                break
+        if row_key is None:
+            # ibland ligger värden i 'Operating Cash Flow' minus 'Capital Expenditures'
+            if "Operating Cash Flow" in cf.index and "Capital Expenditure" in cf.index:
+                ocf = _to_float(cf.loc["Operating Cash Flow"].iloc[0])
+                capex = _to_float(cf.loc["Capital Expenditure"].iloc[0])
+                if ocf is not None and capex is not None:
+                    return ocf - capex
+            return None
+
+        val = _to_float(cf.loc[row_key].iloc[0])
+        return val
     except Exception:
-        pass
-    # exchangerate.host
+        return None
+
+
+def _get_total_cash(t: "yf.Ticker") -> Optional[float]:
+    """
+    Hämtar totalCash från balansräkning (annual balance sheet).
+    Returnerar belopp (inte i miljoner).
+    """
     try:
-        r = requests.get("https://api.exchangerate.host/latest", params={"base": base, "symbols": quote}, timeout=12)
-        if r.status_code == 200:
-            v = (r.json() or {}).get("rates", {}).get(quote)
-            if v:
-                return float(v)
+        bs = getattr(t, "balance_sheet", None)
+        if bs is None or bs.empty:
+            bs = getattr(t, "annual_balance_sheet", None)
+        if bs is None or bs.empty:
+            return None
+        idx = [str(i) for i in bs.index]
+        bs.index = idx
+        # Vanliga nycklar: "Cash And Cash Equivalents", "CashAndCashEquivalents"
+        for key in ["Cash And Cash Equivalents", "CashAndCashEquivalents", "cashAndCashEquivalents"]:
+            if key in bs.index:
+                return _to_float(bs.loc[key].iloc[0])
+        # fallback: "Total Cash" förekommer ibland
+        for key in ["Total Cash", "totalCash"]:
+            if key in bs.index:
+                return _to_float(bs.loc[key].iloc[0])
+        return None
     except Exception:
-        pass
-    return 0.0
+        return None
 
 
-def _yahoo_prices_for_dates(ticker: str, dates: List[dt.date]) -> Dict[dt.date, float]:
+# -----------------------------
+# Publika funktioner
+# -----------------------------
+def get_live_price(ticker: str) -> Optional[float]:
     """
-    Hämtar 'Close' för var och en av 'dates' (eller närmast föregående handelsdag).
+    Snabbkurs med yfinance. Fallback via history() om fast_info saknas.
     """
-    if not dates:
-        return {}
-    dmin = min(dates) - dt.timedelta(days=14)
-    dmax = max(dates) + dt.timedelta(days=2)
+    if yf is None:
+        return None
     try:
         t = yf.Ticker(ticker)
-        hist = t.history(start=dmin, end=dmax, interval="1d")
-        if hist is None or hist.empty:
-            return {}
-        hist = hist.sort_index()
-        out = {}
-        idx = list(hist.index.date)
-        closes = list(hist["Close"].values)
-        for d in dates:
-            px = None
-            for j in range(len(idx) - 1, -1, -1):
-                if idx[j] <= d:
-                    try:
-                        px = float(closes[j])
-                    except Exception:
-                        px = None
-                    break
-            if px is not None:
-                out[d] = px
-        return out
+        # fast_info är snabbast
+        fi = getattr(t, "fast_info", {}) or {}
+        for k in ("last_price", "lastPrice", "regularMarketPrice", "last"):
+            v = fi.get(k)
+            v = _to_float(v)
+            if v is not None:
+                return v
+
+        # fallback: hämta senaste close
+        hist = t.history(period="1d", interval="1m")
+        if hist is not None and not hist.empty:
+            price = hist["Close"].dropna()
+            if not price.empty:
+                return _to_float(price.iloc[-1])
+        # ytterligare fallback: 1d daglig close
+        hist = t.history(period="1d")
+        if hist is not None and not hist.empty:
+            return _to_float(hist["Close"].dropna().iloc[-1])
+        return None
     except Exception:
-        return {}
+        return None
 
 
-def _ttm_windows(values: List[Tuple[dt.date, float]], need: int = 4) -> List[Tuple[dt.date, float]]:
+def fetch_ticker(ticker: str) -> Dict[str, Any]:
     """
-    Tar [(end_date, kvartalsintäkt), ...] (nyast→äldst) och bygger upp till 'need' TTM-summor:
-    [(end_date0, ttm0), (end_date1, ttm1), ...] där ttm0=sum(q0..q3), ttm1=sum(q1..q4), osv.
+    Hämtar ett robust paket nyckeltal för en ticker via yfinance.
+    Returnerar ett dict med fält som orchestratorn förväntar sig (se modul-docstring).
+    Fält som inte går att få fram utelämnas hellre än att sättas till 0.
     """
-    out: List[Tuple[dt.date, float]] = []
-    if len(values) < 4:
+    out: Dict[str, Any] = {}
+
+    if yf is None:
         return out
-    for i in range(0, min(need, len(values) - 3)):
-        end_i = values[i][0]
-        ttm_i = sum(v for (_, v) in values[i:i+4])
-        out.append((end_i, float(ttm_i)))
-    return out
 
-
-# ----------------------------- Yahoo-parsing ---------------------------------
-
-
-def _yahoo_basics(ticker: str) -> Dict[str, Any]:
-    """
-    Pris, valuta, namn, sektor, bransch, market cap, sharesOutstanding via yfinance.
-    """
-    out: Dict[str, Any] = {"Valuta": "USD"}
     try:
         t = yf.Ticker(ticker)
-        info = {}
+
+        # -- pris & valuta
+        price = get_live_price(ticker)
+        if price is not None:
+            out["price"] = float(price)
+
+        # fast_info först (snabbt), info som fallback
+        fi = getattr(t, "fast_info", {}) or {}
         try:
-            info = t.info or {}
+            info = t.get_info() or {}
         except Exception:
+            # vissa endpoints kan kasta – ignorera och kör med tom dict
             info = {}
 
-        # Pris
-        px = info.get("regularMarketPrice")
-        if px is None:
-            try:
-                h = t.history(period="1d")
-                if not h.empty and "Close" in h:
-                    px = float(h["Close"].iloc[-1])
-            except Exception:
-                px = None
-        if px is not None:
-            out["Aktuell kurs"] = float(px)
-
-        # Valuta (prisets valuta)
-        cur = info.get("currency")
-        if cur:
-            out["Valuta"] = str(cur).upper()
-
-        # Namn / sektor / bransch
-        nm = info.get("shortName") or info.get("longName") or ""
-        if nm:
-            out["Bolagsnamn"] = str(nm)
-        sec = info.get("sector")
-        if sec:
-            out["Sektor"] = sec
-        ind = info.get("industry")
-        if ind:
-            out["Bransch"] = ind
-
-        # Market cap
-        mc = info.get("marketCap")
-        if mc is not None:
-            try:
-                out["Market Cap"] = float(mc)
-            except Exception:
-                pass
-
-        # Shares outstanding (kan vara fallback)
-        so = info.get("sharesOutstanding")
-        if so is not None:
-            try:
-                out["_yf_shares_out"] = float(so)  # styck
-            except Exception:
-                pass
-
-        # EV/EBITDA (direkt från Yahoo om tillgängligt)
-        ev_to_ebitda = info.get("enterpriseToEbitda")
-        if ev_to_ebitda is not None:
-            out["EV/EBITDA"] = _safe_float(ev_to_ebitda, 0.0)
-
-        # Marginaler (andelar -> %)
-        gp = info.get("grossMargins")  # ex. 0.58
-        if gp is not None:
-            out["Bruttomarginal (%)"] = float(gp) * 100.0
-        pm = info.get("profitMargins")
-        if pm is not None:
-            out["Nettomarginal (%)"] = float(pm) * 100.0
-
-        # För Debt/Equity tittar vi i balance sheet om möjligt
-        try:
-            bs = t.quarterly_balance_sheet
-            if bs is not None and not bs.empty:
-                cols = list(bs.columns)
-                if cols:
-                    last = cols[0]
-                    total_debt = bs.get("TotalDebt")
-                    equity = bs.get("TotalStockholderEquity") or bs.get("StockholdersEquity")
-                    td = _safe_float(total_debt.loc[last], 0.0) if total_debt is not None and last in total_debt.index else 0.0
-                    eq = _safe_float(equity.loc[last], 0.0) if equity is not None and last in equity.index else 0.0
-                    if td > 0 and eq > 0:
-                        out["Debt/Equity"] = td / eq
-        except Exception:
-            pass
-
-        # Finansiell valuta (för intäkter)
-        fin_cur = info.get("financialCurrency")
-        if fin_cur:
-            out["_financial_currency"] = str(fin_cur).upper()
-
-    except Exception:
-        pass
-    return out
-
-
-def _yahoo_quarterly_revenues(ticker: str) -> Tuple[List[Tuple[dt.date, float]], Optional[str]]:
-    """
-    Hämtar kvartalsintäkter (Yahoo income statement). Returnerar (rows, unit).
-    rows: [(end_date, revenue_value), ...] nyast→äldst
-    unit: finansiell valuta (financialCurrency) om tillgänglig, annars None
-    """
-    try:
-        t = yf.Ticker(ticker)
-        # income statement – försök båda egenskaper
-        qis = None
-        try:
-            qis = t.quarterly_income_stmt
-        except Exception:
-            qis = None
-
-        if qis is None or qis.empty:
-            # fallback till quarterly_financials (vissa versioner)
-            try:
-                qf = t.quarterly_financials
-                qis = qf
-            except Exception:
-                qis = None
-
-        if qis is None or qis.empty:
-            return [], None
-
-        # Hitta rätt rad för intäkter
-        # Vanliga namn: 'TotalRevenue', 'Total Revenue', 'Revenue'
-        cand_names = ["TotalRevenue", "Total Revenue", "Revenue"]
-        rev_series = None
-        for nm in cand_names:
-            if nm in qis.index:
-                rev_series = qis.loc[nm]
+        # valuta
+        curr = None
+        for key in ("currency", "financialCurrency"):
+            if key in fi and fi[key]:
+                curr = fi[key]
                 break
-        if rev_series is None:
-            # prova case-insensitive
-            for idx in qis.index:
-                if str(idx).replace(" ", "").lower() in ("totalrevenue", "revenue"):
-                    rev_series = qis.loc[idx]
-                    break
+            if key in info and info[key]:
+                curr = info[key]
+                break
+        if curr:
+            out["currency"] = str(curr).upper()
 
-        if rev_series is None:
-            return [], None
+        # market cap
+        mcap = None
+        # fast_info kan ha "market_cap" i nyare yfinance
+        for key in ("market_cap", "marketCap"):
+            v = fi.get(key)
+            if v is None and key in info:
+                v = info.get(key)
+            mcap = _to_float(v)
+            if mcap is not None:
+                break
+        if mcap is not None:
+            out["market_cap"] = float(mcap)
 
-        # rev_series är en Series där index=kolumner (datum), values=revenue
-        rows: List[Tuple[dt.date, float]] = []
-        for col, val in rev_series.items():
-            # col kan vara Timestamp/DatetimeIndex
-            try:
-                d = col.date() if hasattr(col, "date") else dt.datetime.fromisoformat(str(col)).date()
-            except Exception:
-                # bästa gissning
-                try:
-                    d = dt.datetime.strptime(str(col)[:10], "%Y-%m-%d").date()
-                except Exception:
-                    d = None
-            if d is None:
-                continue
-            v = _safe_float(val, 0.0)
-            if v > 0:
-                rows.append((d, v))
+        # antal aktier
+        shares = None
+        for key in ("shares", "sharesOutstanding"):
+            v = fi.get(key)
+            if v is None:
+                v = info.get(key)
+            shares = _to_float(v)
+            if shares is not None:
+                break
+        if shares is not None and shares > 0:
+            out["shares_outstanding"] = float(shares)
 
-        # sortera nyast -> äldst
-        rows.sort(key=lambda t2: t2[0], reverse=True)
+        # P/S TTM
+        ps_ttm = None
+        for key in ("priceToSalesTrailing12Months", "priceToSalesTTM", "p2s"):
+            v = info.get(key)
+            ps_ttm = _to_float(v)
+            if ps_ttm is not None:
+                break
+        if ps_ttm is not None and ps_ttm > 0:
+            out["ps_ttm"] = float(ps_ttm)
 
-        # Försök läsa finansiell valuta
-        fin_cur = None
-        try:
-            info = t.info or {}
-            if info.get("financialCurrency"):
-                fin_cur = str(info["financialCurrency"]).upper()
-        except Exception:
-            fin_cur = None
+        # sektor / industri
+        sector = info.get("sector") or info.get("sectorDisp")
+        industry = info.get("industry") or info.get("industryDisp")
+        if sector:
+            out["sector"] = str(sector)
+        if industry:
+            out["industry"] = str(industry)
 
-        return rows, fin_cur
+        # marginaler (procent)
+        gm = _safe_info_get(info, "grossMargins", factor=100.0)
+        if gm is not None:
+            out["gross_margin"] = float(gm)
+        nm = _safe_info_get(info, "profitMargins", factor=100.0)
+        if nm is not None:
+            out["net_margin"] = float(nm)
+
+        # Debt/Equity (Yahoo: debtToEquity ibland i procent – ofta redan kvot * 100 eller ren kvot)
+        de = _safe_info_get(info, "debtToEquity")
+        if de is not None:
+            out["debt_to_equity"] = float(de)
+
+        # EV/EBITDA
+        ev_ebitda = _safe_info_get(info, "enterpriseToEbitda")
+        if ev_ebitda is not None:
+            out["ev_ebitda"] = float(ev_ebitda)
+
+        # Utdelning & yield
+        # dividendYield är oftast kvot (0.02 → 2%)
+        dy = _safe_info_get(info, "dividendYield", factor=100.0)
+        if dy is None:
+            # försök räkna själv via trailingAnnualDividendRate / price
+            div_rate = _safe_info_get(info, "trailingAnnualDividendRate")
+            if div_rate is not None and price and price > 0:
+                dy = (div_rate / price) * 100.0
+        if dy is not None:
+            out["dividend_yield_pct"] = float(dy)
+
+        # Payout ratio via kassaflöde finns sällan hos Yahoo – lämnas tomt.
+        # Vill vi fylla på senare från andra källor (FMP), låt orchestratorn göra det.
+        # out["payout_ratio_cf_pct"] = ...
+
+        # Kassaflöde & kassa
+        fcf = _get_cashflow_free_cf(t)
+        if fcf is not None:
+            out["fcf_m"] = float(fcf) / 1e6  # miljoner
+        total_cash = _get_total_cash(t)
+        if total_cash is not None:
+            out["cash_m"] = float(total_cash) / 1e6  # miljoner
+
+        # Runway (kvartal) – grovt antagande: om FCF < 0 → bränns årligen, dela till kvartal.
+        if total_cash is not None and fcf is not None and fcf < 0:
+            cash_m = float(total_cash) / 1e6
+            burn_m_per_year = abs(float(fcf)) / 1e6
+            if burn_m_per_year > 0:
+                out["runway_quarters"] = float(4.0 * (cash_m / burn_m_per_year))
+
+        return out
     except Exception:
-        return [], None
-
-
-# ----------------------------- Publikt API -----------------------------------
-
-
-def fetch_yahoo_combo(ticker: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Hämtar Yahoo-data och bygger ut P/S nu + P/S Q1..Q4 från TTM-intäkter.
-    Returnerar (vals, debug).
-    """
-    vals: Dict[str, Any] = {}
-    dbg: Dict[str, Any] = {"ticker": ticker, "source": "Yahoo"}
-
-    # 1) Basics
-    yb = _yahoo_basics(ticker)
-    for k in ("Bolagsnamn", "Valuta", "Aktuell kurs", "Market Cap", "Sektor", "Bransch",
-              "EV/EBITDA", "Bruttomarginal (%)", "Nettomarginal (%)", "Debt/Equity"):
-        v = yb.get(k)
-        if v not in (None, "", 0, 0.0):
-            vals[k] = v
-
-    px_ccy = (yb.get("Valuta") or "USD").upper()
-    px_now = _safe_float(yb.get("Aktuell kurs"), 0.0)
-    mcap_now = _safe_float(yb.get("Market Cap"), 0.0)
-
-    # 2) Utestående aktier
-    shares_used = 0.0
-    if mcap_now > 0 and px_now > 0:
-        shares_used = mcap_now / max(px_now, 1e-9)
-        dbg["_shares_source"] = "Yahoo implied (mcap/price)"
-    else:
-        so = _safe_float(yb.get("_yf_shares_out"), 0.0)
-        if so > 0:
-            shares_used = so
-            dbg["_shares_source"] = "Yahoo sharesOutstanding"
-        else:
-            dbg["_shares_source"] = "unknown"
-
-    if shares_used > 0:
-        vals["Utestående aktier"] = shares_used / 1e6  # i miljoner
-
-    # 3) Kvartalsintäkter
-    q_rows, fin_cur = _yahoo_quarterly_revenues(ticker)
-    dbg["q_rows_count"] = len(q_rows)
-    dbg["financialCurrency"] = fin_cur
-
-    if not q_rows:
-        return vals, dbg
-
-    # 4) Bygg TTM-fönster
-    ttm_list = _ttm_windows(q_rows, need=4)
-    if not ttm_list:
-        return vals, dbg
-
-    # 5) Konvertera TTM till prisvaluta (om fin_cur avviker)
-    conv = 1.0
-    if fin_cur and fin_cur.upper() != px_ccy:
-        conv = _fx_rate(fin_cur.upper(), px_ccy)
-        if conv <= 0:
-            conv = 1.0
-    ttm_px = [(d, v * conv) for (d, v) in ttm_list]
-
-    # 6) P/S (nu)
-    if mcap_now > 0 and ttm_px:
-        ltm_now = _safe_float(ttm_px[0][1], 0.0)
-        if ltm_now > 0:
-            vals["P/S"] = mcap_now / ltm_now
-
-    # 7) P/S Q1..Q4 historiskt (kräver shares & historiska priser)
-    if shares_used > 0 and ttm_px:
-        q_dates = [d for (d, _) in ttm_px[:4]]
-        px_map = _yahoo_prices_for_dates(ticker, q_dates)
-        for idx, (d_end, ttm_rev) in enumerate(ttm_px[:4], start=1):
-            if ttm_rev and ttm_rev > 0:
-                px_at = _safe_float(px_map.get(d_end), 0.0)
-                if px_at > 0:
-                    mcap_hist = shares_used * px_at
-                    vals[f"P/S Q{idx}"] = mcap_hist / ttm_rev
-
-    return vals, dbg
+        # Misslyckas vi helt – returnera det vi har (kan vara tomt dict)
+        return out

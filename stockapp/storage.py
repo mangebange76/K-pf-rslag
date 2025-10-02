@@ -1,84 +1,48 @@
-# stockapp/storage.py
 # -*- coding: utf-8 -*-
-from __future__ import annotations
+"""
+Högre nivå ovanpå sheets.py:
+- hamta_data()  -> DataFrame (med fallback till rätt flik)
+- spara_data(df)
+"""
 
-from datetime import datetime
-from typing import Tuple
+from __future__ import annotations
+from typing import List
 
 import pandas as pd
 import streamlit as st
 
-from .config import SHEET_NAME, FINAL_COLS, SNAPSHOT_PREFIX
-from .utils import ensure_schema, dedupe_tickers
+from .config import SHEET_NAME, FINAL_COLS, MAX_ROWS_WRITE
 from .sheets import get_ws, ws_read_df, ws_write_df, ensure_headers
+from .utils import ensure_schema
 
 
-# ------------------------------------------------------------
-# Publika funktioner
-# ------------------------------------------------------------
 def hamta_data() -> pd.DataFrame:
     """
-    Läs huvudbladet (SHEET_NAME) som DataFrame.
-    - Returnerar alltid en DataFrame med minst FINAL_COLS som kolumner
-    - Dubbletter (Ticker) tas inte bort här – det görs endast i minnet av appen
+    Läser DataFrame från Google Sheet.
+    - Försöker först SHEET_NAME; annars fallback (flik med rubrik som innehåller 'Ticker').
+    - Ingen filtrering – hela tabellen returneras.
     """
+    # get_ws gör redan fallback och skriver caption om det sker
     ws = get_ws(SHEET_NAME)
-    try:
-        df = ws_read_df(ws)
-    except Exception as e:
-        # Vid läsfel: exponera varning och ge en tom DF
-        st.warning(f"⚠️ Kunde inte läsa Google Sheet: {e}")
-        df = pd.DataFrame(columns=FINAL_COLS)
+    df = ws_read_df(ws)
 
-    # Säkerställ schema (lägg till saknade kolumner)
+    # Se till att vi åtminstone har vårt minimischema (ordning fixas i appen igen)
     df = ensure_schema(df, FINAL_COLS)
     return df
 
 
-def spara_data(df: pd.DataFrame, do_snapshot: bool = False) -> Tuple[pd.DataFrame, int]:
+def spara_data(df: pd.DataFrame) -> None:
     """
-    Skriv DataFrame till huvudbladet (SHEET_NAME).
-    - Säkerställer schema (FINAL_COLS)
-    - Tar bort dubbletter (Ticker) innan skrivning (för att hålla bladet “rent”)
-    - Optionellt skapa snapshot-blad
-
-    Returnerar (df_som_skrev, antal_dubbletter_borttagna)
+    Skriver DataFrame till SHEET_NAME (eller samma fallback-flik som vid läsning).
+    - Trimmar ner till MAX_ROWS_WRITE rader för säkerhet.
     """
     if df is None:
-        raise ValueError("df är None")
+        return
+    df2 = ensure_schema(df, FINAL_COLS)
+    if len(df2) > MAX_ROWS_WRITE:
+        st.warning(f"Antalet rader ({len(df2)}) överstiger MAX_ROWS_WRITE ({MAX_ROWS_WRITE}). Klipper vid gränsen.")
+        df2 = df2.iloc[:MAX_ROWS_WRITE].copy()
 
-    # 1) Säkerställ schema och ordning
-    work = ensure_schema(df.copy(), FINAL_COLS)
-    work = work[FINAL_COLS]  # skriv i en konsekvent kolumnordning
-
-    # 2) Dubblettstädning (Ticker)
-    cleaned, dups = dedupe_tickers(work)
-    dup_count = len(dups)
-
-    # 3) Skriv till blad
     ws = get_ws(SHEET_NAME)
-    ensure_headers(ws, FINAL_COLS)
-    ws_write_df(ws, cleaned)
-
-    # 4) Snapshot om begärt
-    if do_snapshot:
-        try:
-            _spara_snapshot(cleaned)
-        except Exception as e:
-            st.warning(f"⚠️ Kunde inte skapa snapshot: {e}")
-
-    return cleaned, dup_count
-
-
-# ------------------------------------------------------------
-# Hjälpare
-# ------------------------------------------------------------
-def _spara_snapshot(df: pd.DataFrame) -> None:
-    """
-    Skapa ett nytt blad med en tidsstämplad kopia av df.
-    """
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    title = f"{SNAPSHOT_PREFIX}{ts}"
-    ws = get_ws(title, rows=max(1000, len(df) + 10), cols=max(60, len(df.columns) + 5))
-    ensure_headers(ws, list(df.columns))
-    ws_write_df(ws, df)
+    ensure_headers(ws, list(df2.columns))
+    ws_write_df(ws, df2)

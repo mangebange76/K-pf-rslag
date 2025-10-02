@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Robusta Google Sheets-hjälpare (fristående):
-- get_ws(name: str|None) -> gspread.Worksheet    (smart fallback till första fliken)
-- ws_read_df(ws) -> pd.DataFrame                 (läser flexibelt & bygger DataFrame)
-- ws_write_df(ws, df) -> None                    (skriver rubrik + data)
-- ensure_headers(ws, headers) -> None            (säkrar rubrikrad)
+stockapp.sheets
+---------------
+Tunn wrapper runt gspread för att läsa/skriva DataFrame med robusta
+fallbacks: öppnar kalkylblad från URL i secrets, försöker hitta flik
+på namn (annars första fliken). Bygger DataFrame från första raden
+som headers och resten som rader.
 """
 
 from __future__ import annotations
@@ -18,103 +19,79 @@ from google.oauth2.service_account import Credentials
 from .config import SHEET_URL, SHEET_NAME
 
 
-def _client() -> gspread.Client:
-    creds = Credentials.from_service_account_info(
-        st.secrets["GOOGLE_CREDENTIALS"],
-        scopes=[
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
+# ---------------------------------------------------------------------
+# gspread-klient
+# ---------------------------------------------------------------------
+def _gspread_client():
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
     return gspread.authorize(creds)
 
 
 def _open_spreadsheet():
     if not SHEET_URL:
-        raise RuntimeError("SHEET_URL saknas i secrets/config.")
-    cli = _client()
-    return cli.open_by_url(SHEET_URL)
+        raise RuntimeError("SHEET_URL saknas i secrets.")
+    client = _gspread_client()
+    return client.open_by_url(SHEET_URL)
 
 
-def get_ws(name: Optional[str] = None) -> gspread.Worksheet:
+# ---------------------------------------------------------------------
+# Worksheet helpers
+# ---------------------------------------------------------------------
+def get_ws(name: Optional[str] = None):
     """
-    Hämta worksheet. Försök i ordning:
-      1) Namnet som skickas in (om angivet)
-      2) config.SHEET_NAME
-      3) Första fliken i dokumentet
+    Hämta worksheet med namn 'name'. Om det inte finns, fall back till första fliken.
     """
     ss = _open_spreadsheet()
-
-    # 1) explicit name
-    if name:
-        try:
-            return ss.worksheet(name)
-        except Exception:
-            st.warning(f"⚠️ Hittade inte fliken '{name}', försöker med '{SHEET_NAME}'.")
-
-    # 2) config.SHEET_NAME
+    if not name:
+        return ss.sheet1
     try:
-        return ss.worksheet(SHEET_NAME)
+        return ss.worksheet(name)
     except Exception:
-        st.warning(f"⚠️ Hittade inte fliken '{SHEET_NAME}', använder första fliken i arket.")
-
-    # 3) första bladet
-    ws = ss.get_worksheet(0)
-    if ws is None:
-        raise RuntimeError("Ingen flik kunde öppnas i Google Sheet.")
-    return ws
+        # fallback: första fliken
+        return ss.sheet1
 
 
-def ws_read_df(ws: gspread.Worksheet) -> pd.DataFrame:
+def ws_read_df(ws) -> pd.DataFrame:
     """
-    Läser hela bladet. Tar första raden som rubriker och bygger DataFrame, även
-    om raderna har olika längd (pad:ar med tomma strängar).
-    Tomma rader (alla celler tomma) filtreras bort.
+    Läs alla celler, första raden = headers, resten = data.
+    Rader som är HELT tomma tas bort, annars behålls de.
     """
     values = ws.get_all_values() or []
     if not values:
         return pd.DataFrame()
 
-    # rubriker
-    headers = [h.strip() for h in (values[0] or [])]
-    max_len = max(len(r) for r in values)
-    rows = []
-    for r in values[1:]:
-        rr = list(r)
-        if len(rr) < max_len:
-            rr += [""] * (max_len - len(rr))
-        rows.append(rr)
+    headers = [str(h).strip() for h in values[0]]
+    rows = values[1:]
 
-    df = pd.DataFrame(rows, columns=headers)
+    # behåll alla rader som inte är helt tomma
+    kept = [r for r in rows if any((str(c).strip() != "" for c in r))]
 
-    # släng helt tomma rader
-    mask_nonempty = (df.astype(str).apply(lambda s: s.str.strip()) != "").any(axis=1)
-    df = df[mask_nonempty].copy()
+    # pad korta rader till samma längd som headers
+    width = len(headers)
+    norm_rows = [ (r + [""] * (width - len(r)))[:width] for r in kept ]
 
+    df = pd.DataFrame(norm_rows, columns=headers)
     return df
 
 
-def ensure_headers(ws: gspread.Worksheet, headers: List[str]) -> None:
+def ws_write_df(ws, df: pd.DataFrame) -> None:
     """
-    Säkerställ att rubrikraden exakt matchar headers. Om inte, skriv om rad 1.
+    Skriv DataFrame till arket: headers på rad 1, sedan värden.
     """
-    try:
-        row1 = ws.row_values(1) or []
-    except Exception:
-        row1 = []
-    want = [str(h) for h in headers]
-    if [c.strip() for c in row1] != want:
-        ws.clear()
-        ws.update([want])
+    if df is None:
+        return
 
+    # konvertera till str för att undvika typfel i gspread
+    out = df.copy()
+    out = out.fillna("")
 
-def ws_write_df(ws: gspread.Worksheet, df: pd.DataFrame) -> None:
-    """
-    Skriver DataFrame (rubrik + data). Tom df -> bara rubriker.
-    """
-    df = df.copy()
-    df = df.fillna("")
-    body = [list(df.columns)]
-    body += df.astype(str).values.tolist()
+    # bygg 2D-array: headers + rows
+    headers = list(out.columns)
+    rows = out.astype(str).values.tolist()
+
     ws.clear()
-    ws.update(body)
+    ws.update([headers] + rows)

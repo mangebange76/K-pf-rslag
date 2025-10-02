@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Konstanter & namnsättning som används av hela appen.
+stockapp.config
+----------------
+Konstanter & kolumnschema som hela appen använder.
 Håll denna modul fri från beroenden till andra stockapp-moduler.
 """
 
@@ -11,12 +13,15 @@ import streamlit as st
 # ---------------------------------------------------------------------
 # Google Sheets
 # ---------------------------------------------------------------------
-# URL till kalkylbladet (läggs normalt i st.secrets).
+# URL till kalkylbladet (läggs normalt i st.secrets)
 SHEET_URL: str = st.secrets.get("SHEET_URL", "").strip()
 # Huvudfliken där portföljen/bolagslistan finns
 SHEET_NAME: str = st.secrets.get("SHEET_NAME", "Data")
 # Fliken för valutakurser
 RATES_SHEET_NAME: str = st.secrets.get("RATES_SHEET_NAME", "Valutakurser")
+
+# App-titel
+APP_TITLE: str = st.secrets.get("APP_TITLE", "K-pf-rslag")
 
 # ---------------------------------------------------------------------
 # Valutor
@@ -30,97 +35,122 @@ STANDARD_VALUTAKURSER: Dict[str, float] = {
     "SEK": 1.0,
 }
 
+DISPLAY_CURRENCY: str = "SEK"
+
 # ---------------------------------------------------------------------
-# Kolumnschema
+# Kolumnschema (harmoniserat med app.py & vyer)
 # ---------------------------------------------------------------------
-# Basfält som beskriver ett bolag
 BASE_COLS: List[str] = [
     "Ticker",
     "Bolagsnamn",
     "Valuta",
     "Sektor",
-    "Risklabel",                 # härleder vi från Market Cap
-    "Antal du äger",
+    "Industri",
+    "Risklabel",
+    "Antal aktier",
     "GAV (SEK)",
 ]
 
-# Nyckeltal / fakta vi hämtar
 FACT_COLS: List[str] = [
-    "Kurs",
+    # pris & värde
+    "Kurs",                    # primärt fält i appen
+    "Aktuell kurs",            # accepterad fallback som vi kan läsa/visa
     "Market Cap",
+    "Market Cap (SEK)",
     "Utestående aktier (milj.)",
-    "Debt/Equity",
-    "Net debt / EBITDA",
-    "P/B",
-    "Gross margin (%)",
-    "Operating margin (%)",
-    "Net margin (%)",
-    "ROE (%)",
-    "FCF Yield (%)",
-    "Dividend yield (%)",
-    "Dividend payout (FCF) (%)",
-    "Kassa (M)",
-    # P/S-spår
+
+    # P/S-historik
     "P/S",
     "P/S Q1",
     "P/S Q2",
     "P/S Q3",
     "P/S Q4",
-    # Prognoser (manuella)
-    "Omsättning i år (M)",
-    "Omsättning nästa år (M)",
+
+    # Marginaler och lönsamhet
+    "Bruttomarginal (%)",
+    "Rörelsemarginal (%)",
+    "Nettomarginal (%)",
+    "ROE (%)",
+
+    # Kapitalstruktur & värdering
+    "Debt/Equity",
+    "Net debt / EBITDA",
+    "EV/EBITDA",
+    "P/B",
+
+    # Kassaflöde & utdelning
+    "FCF (M)",
+    "FCF Yield (%)",
+    "Dividend Yield (%)",
+    "Payout Ratio CF (%)",
+
+    # Likviditet
+    "Kassa (M)",
+    "Runway (kvartal)",
+
+    # Prognoser (alltid manuella i din process)
+    "Omsättning i år (est.)",
+    "Omsättning nästa år (est.)",
 ]
 
-# Tidsstämplar
+# Tidsstämplar – OBS: appen använder suffix " TS"
 TS_COLS: List[str] = [
-    "TS Kurs",
-    "TS Full",
-    "TS Omsättning i år",
-    "TS Omsättning nästa år",
+    "Kurs TS",
+    "Full TS",
+    "Omsättning i år (est.) TS",
+    "Omsättning nästa år (est.) TS",
+    "P/S TS",
+    "P/S Q1 TS",
+    "P/S Q2 TS",
+    "P/S Q3 TS",
+    "P/S Q4 TS",
 ]
 
-# Beräknade fält (visning)
+# Beräknade fält (visning/analys)
 CALC_COLS: List[str] = [
     "P/S-snitt (Q1..Q4)",
-    "P/S (TTM, modell)",
-    "Riktkurs (USD)",
-    "Upside (%)",
+    "Uppsida (%)",
+    "Riktkurs (valuta)",
+    "TotalScore",
+    "Coverage",
+    "Recommendation",
     "Värde (SEK)",
     "Andel (%)",
 ]
 
-# Slutlig ordning (för säker sparning/visning)
+# Slutlig ordning
 FINAL_COLS: List[str] = BASE_COLS + FACT_COLS + TS_COLS + CALC_COLS
 
-# För validering av tider – dessa två används när vi listar “manuell prognoslista”
-TS_FIELDS: List[str] = ["TS Omsättning i år", "TS Omsättning nästa år"]
+# Dessa används när vi listar “Manuell prognoslista”
+MANUAL_PROGNOS_FIELDS: List[str] = ["Omsättning i år (est.)", "Omsättning nästa år (est.)"]
 
 # Maxrad-skydd vid skrivning (guard)
 MAX_ROWS_WRITE: int = int(st.secrets.get("MAX_ROWS_WRITE", 4000))
 
-# Hur många förslag vi visar i investeringsvyn (per sida)
-PROPOSALS_PAGE_SIZE: int = int(st.secrets.get("PROPOSALS_PAGE_SIZE", 10))
+# Hur många förslag per sida i investeringsvyn (kan ändras i UI)
+PROPOSALS_PAGE_SIZE: int = int(st.secrets.get("PROPOSALS_PAGE_SIZE", 5))
 
 # Batch – standardstorlek
-BATCH_DEFAULT_SIZE: int = int(st.secrets.get("BATCH_DEFAULT_SIZE", 20))
+BATCH_DEFAULT_SIZE: int = int(st.secrets.get("BATCH_DEFAULT_SIZE", 10))
 
-# FMP/SEC/Yahoo – toggles (kan överstyras via secrets)
+# Togglar för källor (kan styras via secrets)
 USE_YAHOO: bool = bool(st.secrets.get("USE_YAHOO", True))
 USE_FMP: bool = bool(st.secrets.get("USE_FMP", True))
 USE_SEC: bool = bool(st.secrets.get("USE_SEC", True))
 
-# Scoring – vilka nyckeltal som vägs (vikt per sektor sätts i scoring-modulen)
+# Nyckeltal som ofta vägs i scoring (info – själva vikterna ligger i scoring-modulen)
 SCORABLE_KEYS: List[str] = [
-    "P/S (TTM, modell)",
-    "Net margin (%)",
-    "Gross margin (%)",
-    "Operating margin (%)",
+    "Uppsida (%)",
+    "EV/EBITDA",
+    "Net debt / EBITDA",
+    "Bruttomarginal (%)",
+    "Rörelsemarginal (%)",
+    "Nettomarginal (%)",
     "ROE (%)",
+    "P/B",
     "FCF Yield (%)",
     "Debt/Equity",
-    "Net debt / EBITDA",
-    "P/B",
-    "Dividend yield (%)",
-    "Dividend payout (FCF) (%)",
-    "Upside (%)",
+    "Dividend Yield (%)",
+    "Payout Ratio CF (%)",
+    "P/S",
 ]

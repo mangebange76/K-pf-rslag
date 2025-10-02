@@ -1,368 +1,340 @@
-# stockapp/fetchers/sec.py
 # -*- coding: utf-8 -*-
 """
-SEC/EDGAR-hämtare för amerikanska bolag.
+stockapp.fetchers.sec
+---------------------
+Hämtar kvartals-/årsdata från SEC (data.sec.gov) och härleder nyckeltal.
 
-Kräver *ingen* API-nyckel, men det är *viktigt* med en User-Agent.
-Sätt gärna i st.secrets:
-  SEC_USER_AGENT="kpf-app/1.0 (mailto:din@email)"
+Returnerar ett dict med KÄLLNYCKLAR som vår orkestrator förstår:
+- sharesOutstanding            (CommonStockSharesOutstanding, instant)
+- cash                         (CashAndCashEquivalents*, instant)
+- grossMargin (%)             = GrossProfitTTM / RevenueTTM * 100
+- operatingMargin (%)         = OperatingIncomeTTM / RevenueTTM * 100
+- netMargin (%)               = NetIncomeTTM / RevenueTTM * 100
+- roe (%)                     = NetIncomeTTM / Avg(Equity Instants) * 100  (fallback: senaste equity)
+- debtToEquity                = (ShortTermDebt + CurrentPortionLTD + LongTermDebt) / StockholdersEquity
+- netDebtToEbitda             = (TotalDebt - Cash) / EBITDA_TTM
 
-Publikt API:
-    get_live_price(ticker) -> None (SEC saknar pris – vi lämnar None)
-    fetch_ticker(ticker)   -> Dict[str, Any]
-
-Returnerade nycklar (om tillgängliga):
-    currency                -> "USD"
-    shares_outstanding      -> float
-    revenue_quarters        -> List[{"end": "YYYY-MM-DD", "value": float}]  # senaste 4 kvartal (M USD)
-    cash_m                  -> float (miljoner USD)
-    fcf_m                   -> float (miljoner USD, approx CFO - CapEx)
-    dividends_paid_m        -> float (miljoner USD, >0 betyder utbetalningar)
-    payout_ratio_cf_pct     -> float (%), approx (utdelningar / FCF) om FCF>0
-    runway_quarters         -> float (hur många kvartal kassan räcker om FCF<0)
+Dessutom returneras underlag (om tillgängligt):
+- revenueTTM, grossProfitTTM, operatingIncomeTTM, netIncomeTTM
+- ebitdaTTM, equity (instant), totalDebt (instant)
 
 OBS:
- - SEC-data finns bara för US-rapporterande bolag.
- - Vi räknar om större belopp till miljoner USD (M).
- - P/S per kvartal beräknas *inte här*, eftersom SEC inte ger pris.
-   Orchestratorn kan kombinera revenue_quarters med pris/market cap från Yahoo/FMP.
+- SEC tillhandahåller inte pris/marketCap → lämnas tomt här (fylls av Yahoo/FMP).
+- Valuta antas USD (SEC-filings). 'currency' sätts till "USD" om något returneras.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Dict, Any, Optional, List, Tuple
 import math
 import time
+import json
+
 import requests
 import streamlit as st
-from datetime import datetime
+
+
+# ------------------------------------------------------------
+# Konfiguration
+# ------------------------------------------------------------
+_SEC_UA = st.secrets.get("SEC_USER_AGENT", "contact@example.com")
+_SEC_BASE = "https://data.sec.gov"
+_TICKERS_INDEX = "https://www.sec.gov/files/company_tickers.json"
+
+_HEADERS = {
+    "User-Agent": _SEC_UA,
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "data.sec.gov",
+}
 
 
 # ------------------------------------------------------------
 # Hjälpare
 # ------------------------------------------------------------
-_SEC_HEADERS = lambda: {
-    "User-Agent": st.secrets.get("SEC_USER_AGENT", "kpf-app/1.0 (mailto:example@example.com)"),
-    "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov",
-}
-
-def _to_float(x) -> Optional[float]:
+def _to_float(x, default: Optional[float] = None) -> Optional[float]:
     try:
-        if x is None:
-            return None
+        if x is None or (isinstance(x, str) and not x.strip()):
+            return default
         v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return None
+        if math.isnan(v):
+            return default
         return v
     except Exception:
-        # pröva str->float
-        try:
-            v = float(str(x).replace(",", "."))
-            if math.isnan(v) or math.isinf(v):
-                return None
-            return v
-        except Exception:
-            return None
+        return default
 
-def _parse_date(s: str) -> Optional[datetime]:
-    for fmt in ("%Y-%m-%d", "%Y%m%d"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            pass
+def _pick_unit(units: Dict[str, list], prefer: str = "USD") -> Optional[List[dict]]:
+    """
+    Välj en lista av datapunkter för given valuta ('USD' eller liknande).
+    Faller tillbaka på första nyckeln om USD saknas.
+    """
+    if not isinstance(units, dict):
+        return None
+    if prefer in units:
+        return units.get(prefer) or None
+    # fallback: ta första nyckeln
+    for k, v in units.items():
+        if isinstance(v, list):
+            return v
     return None
 
-def _take_last_n_quarters(facts: List[Dict[str, Any]], n: int = 4) -> List[Dict[str, Any]]:
+def _sort_by_end_desc(points: List[dict]) -> List[dict]:
     """
-    Tar de senaste n kvartalsvärdena (duration ~ kvartal) sorterat på 'end' (slutdatum).
-    Filtrerar bort dubletter på slutdatum och icke-positiva värden.
-    Returnerar lista med dict {"end": "YYYY-MM-DD", "value": float}
+    Sortera datapunkter på 'end' (YYYY-MM-DD) fallande, med fallback på 'fy'/'fp'.
     """
-    # sortera på end
-    recs = []
-    for f in facts:
-        end = f.get("end")
-        val = _to_float(f.get("val"))
-        if not end or val is None:
-            continue
-        # SEC kan ha olika skalor – antar USD baserat på enheten senare
-        recs.append({"end": end, "value": float(val)})
+    def _key(p: dict):
+        end = p.get("end") or ""
+        # sorts by end; None sist
+        return (0 if end else 1, end)
+    return sorted(points, key=_key, reverse=True)
 
-    # sortera nyast först på slutdatum
-    recs = [r for r in recs if _parse_date(r["end"]) is not None]
-    recs.sort(key=lambda r: _parse_date(r["end"]) or datetime.min, reverse=True)
-
-    # dedupe på end-datum
-    seen = set()
-    uniq = []
-    for r in recs:
-        if r["end"] in seen:
-            continue
-        seen.add(r["end"])
-        # bara vettiga värden
-        if r["value"] is not None:
-            uniq.append(r)
-
-    return uniq[:n]
-
-
-# ------------------------------------------------------------
-# CIK-lookup (cache i session)
-# ------------------------------------------------------------
-def _sec_lookup_cik(ticker: str) -> Optional[str]:
+def _latest_instant(points: List[dict]) -> Optional[dict]:
     """
-    Hämta CIK för ett US-ticker via SEC filen company_tickers.json.
-    Cache:ar i sessionen för denna körning.
+    Plocka senaste "instant" (qtrs == 0) – helst från 10-Q/10-K.
     """
-    if "_sec_ticker2cik" not in st.session_state:
-        st.session_state["_sec_ticker2cik"] = {}
+    if not points:
+        return None
+    # sortera
+    pts = _sort_by_end_desc(points)
+    for p in pts:
+        if p.get("qtrs", 0) == 0:
+            return p
+    # fallback: ta första
+    return pts[0]
 
-    t = str(ticker).upper().strip()
+def _latest_quarters(points: List[dict], n: int = 4) -> List[dict]:
+    """
+    Hämta senaste N kvartalsvärden (qtrs == 1). Om färre finns – returnera färre.
+    """
+    out: List[dict] = []
+    if not points:
+        return out
+    pts = _sort_by_end_desc(points)
+    for p in pts:
+        if int(p.get("qtrs", 0)) == 1:
+            out.append(p)
+            if len(out) >= n:
+                break
+    return out
 
-    if t in st.session_state["_sec_ticker2cik"]:
-        return st.session_state["_sec_ticker2cik"][t]
-
-    url = "https://www.sec.gov/files/company_tickers.json"
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_ticker_index() -> Dict[str, str]:
+    """
+    Hämtar SEC:s ticker-index → {TICKER: CIK-10-digits-str}.
+    Cache i 24h.
+    """
     try:
-        r = requests.get(url, headers=_SEC_HEADERS(), timeout=30)
+        r = requests.get(_TICKERS_INDEX, headers={"User-Agent": _SEC_UA}, timeout=20)
         if r.status_code != 200:
-            return None
-        js = r.json()  # dict med nycklar "0","1",...
-        # Bygg upp karta
-        for _, row in js.items():
-            tk = str(row.get("ticker", "")).upper().strip()
-            cik = str(row.get("cik_str", "")).strip()
-            if tk:
-                st.session_state["_sec_ticker2cik"][tk] = cik.zfill(10) if cik else None
+            return {}
+        j = r.json()
+        # Strukturen: { "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ... }
+        out: Dict[str, str] = {}
+        for _, row in j.items():
+            t = str(row.get("ticker") or "").upper()
+            cik_num = int(row.get("cik_str") or 0)
+            if t and cik_num:
+                out[t] = f"{cik_num:010d}"
+        return out
     except Exception:
+        return {}
+
+def _cik_for_ticker(ticker: str) -> Optional[str]:
+    t = str(ticker or "").upper().strip()
+    if not t:
         return None
+    idx = _load_ticker_index()
+    return idx.get(t)
 
-    return st.session_state["_sec_ticker2cik"].get(t)
-
-
-# ------------------------------------------------------------
-# CompanyFacts
-# ------------------------------------------------------------
-def _sec_companyfacts(cik: str) -> Optional[Dict[str, Any]]:
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_company_facts(cik10: str) -> Optional[dict]:
     """
-    Hämta companyfacts som JSON.
+    Läser companyfacts JSON från SEC.
+    Cache i 1h för att inte slå i rate limits.
     """
-    if not cik:
-        return None
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{str(cik).zfill(10)}.json"
     try:
-        # vänligt tempo
-        time.sleep(0.25)
-        r = requests.get(url, headers=_SEC_HEADERS(), timeout=45)
+        url = f"{_SEC_BASE}/api/xbrl/companyfacts/CIK{cik10}.json"
+        r = requests.get(url, headers=_HEADERS, timeout=25)
         if r.status_code != 200:
             return None
         return r.json()
     except Exception:
         return None
 
+def _find_fact_units(cf: dict, taxonomy: str) -> Optional[Dict[str, list]]:
+    """Navigerar cf['facts']['us-gaap'][taxonomy]['units'] säkert."""
+    try:
+        return cf.get("facts", {}).get("us-gaap", {}).get(taxonomy, {}).get("units", None)
+    except Exception:
+        return None
 
-def _pick_units(facts: Dict[str, Any], tag: str, units_order: List[str]) -> List[Dict[str, Any]]:
-    """
-    Plocka ut listelementen för en viss 'tag' (ex. 'us-gaap:Revenues'), i första förekommande enhet från units_order.
-    """
-    if not facts:
-        return []
-    parts = tag.split(":")
-    if len(parts) == 2:
-        ns, nm = parts
-    else:
-        ns, nm = "us-gaap", tag
-    root = facts.get("facts", {}).get(ns, {}).get(nm, {})
-    units = root.get("units", {})
-    for u in units_order:
-        arr = units.get(u)
-        if isinstance(arr, list) and arr:
-            return arr
-    return []
+def _sum_last4(points: List[dict]) -> Optional[float]:
+    if not points:
+        return None
+    vals = [_to_float(p.get("val")) for p in points if p.get("val") is not None]
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    return float(sum(vals))
 
+def _avg_last2_inst(points: List[dict]) -> Optional[float]:
+    if not points:
+        return None
+    # ta 2 senaste instanter
+    inst = [p for p in _sort_by_end_desc(points) if int(p.get("qtrs", 0)) == 0]
+    vals = [_to_float(p.get("val")) for p in inst[:2]]
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
 
 # ------------------------------------------------------------
-# Publika API
+# Huvud: hämta & härled nyckeltal
 # ------------------------------------------------------------
-def get_live_price(ticker: str) -> None:
+def get_all_fields(ticker: str) -> Dict[str, Any]:
     """
-    SEC har ingen prisfeed. Håll signaturen kompatibel med andra fetchers.
-    """
-    return None
-
-
-def fetch_ticker(ticker: str) -> Dict[str, Any]:
-    """
-    Hämtar normaliserade nycklar från SEC:
-      - currency="USD"
-      - shares_outstanding
-      - revenue_quarters (senaste 4 kvartalen, M USD)
-      - cash_m
-      - fcf_m (≈ CFO - CapEx, M USD)
-      - dividends_paid_m (M USD, positivt tal)
-      - payout_ratio_cf_pct (om FCF>0 och utdelningar>0)
-      - runway_quarters (om FCF<0)
+    Returnerar ett dict med SEC-härledda fält:
+      sharesOutstanding, cash, grossMargin, operatingMargin, netMargin,
+      roe, debtToEquity, netDebtToEbitda
+    + underlag: revenueTTM, grossProfitTTM, operatingIncomeTTM, netIncomeTTM, ebitdaTTM,
+                equity, totalDebt
     """
     out: Dict[str, Any] = {}
-    tkr = str(ticker).upper().strip()
-    cik = _sec_lookup_cik(tkr)
-    if not cik:
-        return out  # ingen CIK => kan inte hämta
-
-    facts = _sec_companyfacts(cik)
-    if not facts:
+    tkr = str(ticker or "").upper().strip()
+    if not tkr:
         return out
 
-    out["currency"] = "USD"  # SEC rapporterar i USD i dessa endpoints
+    cik = _cik_for_ticker(tkr)
+    if not cik:
+        return out
 
-    # ---------------------------
-    # Shares Outstanding (aktier)
-    # ---------------------------
-    # Vanliga taggar: "EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"
-    shares_units = _pick_units(facts, "us-gaap:EntityCommonStockSharesOutstanding", ["shares"])
-    if not shares_units:
-        shares_units = _pick_units(facts, "us-gaap:CommonStockSharesOutstanding", ["shares"])
+    cf = _fetch_company_facts(cik)
+    if not cf:
+        return out
 
-    shares_val = None
-    if shares_units:
-        # ta senaste "instant" (de har 'fy'/'fp' etc — vi väljer nyaste end)
-        shares_units = sorted(
-            [u for u in shares_units if "end" in u and _to_float(u.get("val"))],
-            key=lambda x: _parse_date(x["end"]) or datetime.min,
-            reverse=True,
-        )
-        if shares_units:
-            shares_val = _to_float(shares_units[0].get("val"))
-            if shares_val and shares_val > 0:
-                out["shares_outstanding"] = float(shares_val)
+    # 0) Grundantagande: USD
+    out["currency"] = "USD"
 
-    # ---------------------------
-    # Revenue (kvartal)
-    # ---------------------------
-    # Vanliga taggar: SalesRevenueNet, Revenues, RevenueFromContractWithCustomerExcludingAssessedTax
-    rev_units = []
-    for tag in ("us-gaap:SalesRevenueNet",
-                "us-gaap:Revenues",
-                "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"):
-        rev_units = _pick_units(facts, tag, ["USD"])
-        if rev_units:
-            break
+    # 1) Shares outstanding (instant)
+    units = _find_fact_units(cf, "CommonStockSharesOutstanding")
+    if units:
+        pts = _pick_unit(units, "USD") or _pick_unit(units)  # värdet är "shares" men indexeras ibland ändå
+        p = _latest_instant(pts or [])
+        v = _to_float(p.get("val")) if p else None
+        if v and v > 0:
+            out["sharesOutstanding"] = v  # styck
 
-    rev_q = []
-    if rev_units:
-        # filtrera till duration runt kvartal (SEC har ibland 'frame' typ "CY2024Q4")
-        q_candidates = []
-        for u in rev_units:
-            frame = u.get("frame", "")
-            # acceptera Qn-frame eller duration ~ < 100 dagar / ~90-95
-            dur = None
-            if "start" in u and "end" in u:
-                try:
-                    s = _parse_date(u["start"])
-                    e = _parse_date(u["end"])
-                    if s and e:
-                        dur = (e - s).days
-                except Exception:
-                    pass
-
-            if (isinstance(frame, str) and "Q" in frame) or (dur is not None and 60 <= dur <= 110):
-                # ta med
-                q_candidates.append(u)
-
-        last4 = _take_last_n_quarters(q_candidates, n=4)
-        # konvertera till miljoner
-        for r in last4:
-            rev_q.append({"end": r["end"], "value": float(r["value"]) / 1e6})
-
-        if rev_q:
-            out["revenue_quarters"] = rev_q
-
-    # ---------------------------
-    # Cash (år)
-    # ---------------------------
-    # CashAndCashEquivalentsAtCarryingValue eller CashAndShortTermInvestments
-    cash_units = _pick_units(facts, "us-gaap:CashAndCashEquivalentsAtCarryingValue", ["USD"])
+    # 2) Cash (instant) – CashAndCashEquivalents* eller inkl. restricted
+    cash_units = _find_fact_units(cf, "CashAndCashEquivalentsAtCarryingValue")
     if not cash_units:
-        cash_units = _pick_units(facts, "us-gaap:CashAndShortTermInvestments", ["USD"])
+        cash_units = _find_fact_units(cf, "CashAndCashEquivalentsIncludingRestrictedCash")
     if cash_units:
-        cash_units = sorted(
-            [u for u in cash_units if "end" in u and _to_float(u.get("val"))],
-            key=lambda x: _parse_date(x["end"]) or datetime.min,
-            reverse=True,
-        )
-        if cash_units:
-            cash_val = _to_float(cash_units[0].get("val"))
-            if cash_val is not None:
-                out["cash_m"] = float(cash_val) / 1e6
+        pts = _pick_unit(cash_units, "USD") or _pick_unit(cash_units)
+        p = _latest_instant(pts or [])
+        cv = _to_float(p.get("val")) if p else None
+        if cv is not None:
+            out["cash"] = cv
 
-    # ---------------------------
-    # FCF (≈ CFO - CapEx) + Dividends (år)
-    # ---------------------------
-    cfo_units = _pick_units(facts, "us-gaap:NetCashProvidedByUsedInOperatingActivities", ["USD"])
-    capex_units = _pick_units(facts, "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment", ["USD"])
-    div_units = _pick_units(facts, "us-gaap:PaymentsOfDividends", ["USD"])
-
-    def _last_annual(units: List[Dict[str, Any]]) -> Optional[float]:
-        if not units:
+    # 3) Total debt (instant) = LTD + ShortTermBorrowings + CurrentPortionLTD (så gott det går)
+    def _inst_val(tax: str) -> Optional[float]:
+        u = _find_fact_units(cf, tax)
+        if not u:
             return None
-        # välj senaste som *inte* är quarterly frame (saknar "Q" i frame & duration ~ 300-400 dagar)
-        candidates = []
-        for u in units:
-            end = u.get("end")
-            s = u.get("start")
-            val = _to_float(u.get("val"))
-            if not end or val is None:
-                continue
-            # rensa bort Q-frames
-            frame = u.get("frame", "")
-            if isinstance(frame, str) and ("Q" in frame or "H" in frame):
-                continue
-            # kontrollera duration ~ årsperiod
-            dur_ok = False
-            if s:
-                sd = _parse_date(s)
-                ed = _parse_date(end)
-                if sd and ed:
-                    days = (ed - sd).days
-                    # 300..400 dagar
-                    if 300 <= days <= 400:
-                        dur_ok = True
-            # om vi inte har duration, låt ändå candidate passera (bättre något än inget)
-            if dur_ok or not s:
-                candidates.append(u)
+        pts = _pick_unit(u, "USD") or _pick_unit(u)
+        p = _latest_instant(pts or [])
+        return _to_float(p.get("val")) if p else None
 
-        if not candidates:
-            candidates = units
+    ltd = _inst_val("LongTermDebtNoncurrent") or _inst_val("LongTermDebt")
+    std = _inst_val("ShortTermBorrowings")
+    cur_ltd = _inst_val("LongTermDebtCurrent")
+    total_debt = 0.0
+    has_any_debt = False
+    for part in (ltd, std, cur_ltd):
+        if part is not None:
+            total_debt += float(part)
+            has_any_debt = True
+    if has_any_debt:
+        out["totalDebt"] = total_debt
 
-        candidates = sorted(
-            [u for u in candidates if "end" in u and _to_float(u.get("val")) is not None],
-            key=lambda x: _parse_date(x["end"]) or datetime.min,
-            reverse=True,
-        )
-        if not candidates:
+    # 4) Equity (instant)
+    eq = _inst_val("StockholdersEquity") or _inst_val("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
+    if eq is not None:
+        out["equity"] = eq
+
+    # 5) Kvartalsserier (4 st): revenue, grossProfit, operatingIncome, netIncome, depreciationAmortization
+    def _q4_sum(tax: str) -> Optional[float]:
+        u = _find_fact_units(cf, tax)
+        if not u:
             return None
-        return _to_float(candidates[0].get("val"))
+        pts = _pick_unit(u, "USD") or _pick_unit(u)
+        q = _latest_quarters(pts or [], n=4)
+        return _sum_last4(q)
 
-    cfo = _last_annual(cfo_units)
-    capex = _last_annual(capex_units)
-    if cfo is not None and capex is not None:
-        fcf = float(cfo) - float(capex)  # CFO - CapEx
-        out["fcf_m"] = float(fcf) / 1e6
+    # Revenue (försök flera kandidat-taggar)
+    rev = _q4_sum("Revenues") or _q4_sum("SalesRevenueNet") or _q4_sum("RevenueFromContractWithCustomerExcludingAssessedTax")
+    if rev is not None:
+        out["revenueTTM"] = rev
 
-    if div_units:
-        dv = _last_annual(div_units)
-        if dv is not None:
-            out["dividends_paid_m"] = abs(float(dv)) / 1e6  # positivt tal
+    gp = _q4_sum("GrossProfit")
+    if gp is not None:
+        out["grossProfitTTM"] = gp
 
-    # payout-ratio på CF-basis (om FCF>0)
-    if out.get("fcf_m") and out["fcf_m"] > 0 and out.get("dividends_paid_m") and out["dividends_paid_m"] > 0:
-        out["payout_ratio_cf_pct"] = float(out["dividends_paid_m"] / out["fcf_m"] * 100.0)
+    op = _q4_sum("OperatingIncomeLoss")
+    if op is not None:
+        out["operatingIncomeTTM"] = op
 
-    # runway om negativt FCF och kassa finns
-    if out.get("fcf_m") is not None and out["fcf_m"] < 0 and out.get("cash_m") is not None and out["cash_m"] > 0:
-        burn_per_year = abs(float(out["fcf_m"]))  # miljoner/år
-        if burn_per_year > 0:
-            out["runway_quarters"] = float(4.0 * (out["cash_m"] / burn_per_year))
+    ni = _q4_sum("NetIncomeLoss")
+    if ni is not None:
+        out["netIncomeTTM"] = ni
 
-    return out
+    da = _q4_sum("DepreciationAndAmortization")
+    # EBITDA_TTM ≈ OperatingIncomeTTM + DepreciationAndAmortization_TTM
+    ebitda_ttm = None
+    if op is not None and da is not None:
+        ebitda_ttm = op + da
+        out["ebitdaTTM"] = ebitda_ttm
+
+    # 6) Margins (TTM)
+    if rev and rev > 0:
+        if gp is not None:
+            out["grossMargin"] = float(gp / rev * 100.0)
+        if op is not None:
+            out["operatingMargin"] = float(op / rev * 100.0)
+        if ni is not None:
+            out["netMargin"] = float(ni / rev * 100.0)
+
+    # 7) ROE (TTM NetIncome / avg equity instants)
+    # försök: ta equity-instant-serie och medelvärde av 2 senaste
+    eq_units = _find_fact_units(cf, "StockholdersEquity") or _find_fact_units(cf, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
+    if ni is not None and eq_units:
+        pts = _pick_unit(eq_units, "USD") or _pick_unit(eq_units)
+        avg2 = _avg_last2_inst(pts or [])
+        base_eq = avg2 if avg2 and avg2 > 0 else _to_float((_latest_instant(pts or []) or {}).get("val"))
+        if base_eq and base_eq > 0:
+            out["roe"] = float(ni / base_eq * 100.0)
+
+    # 8) Debt/Equity
+    if "equity" in out and out["equity"] and out["equity"] > 0 and has_any_debt:
+        out["debtToEquity"] = float(total_debt / out["equity"])
+
+    # 9) NetDebt/EBITDA
+    if has_any_debt and "cash" in out and out["cash"] is not None and ebitda_ttm and ebitda_ttm > 0:
+        net_debt = float(total_debt - float(out["cash"] or 0.0))
+        out["netDebtToEbitda"] = float(net_debt / ebitda_ttm)
+
+    # Rensa orimliga procent (ibland enorma värden vid små nämnare)
+    for pk in ("grossMargin", "operatingMargin", "netMargin", "roe"):
+        if pk in out:
+            v = _to_float(out[pk])
+            if v is None:
+                del out[pk]
+            else:
+                # klipp extrema värden till rimligt spann (-200..200)
+                out[pk] = max(-200.0, min(200.0, float(v)))
+
+    # Returnera endast fält med värde
+    clean: Dict[str, Any] = {}
+    for k, v in out.items():
+        if v is None:
+            continue
+        clean[k] = v
+
+    return clean

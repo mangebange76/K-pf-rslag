@@ -1,298 +1,346 @@
 # stockapp/fetchers/orchestrator.py
 # -*- coding: utf-8 -*-
 """
-Orchestrator för full uppdatering av en enskild ticker.
+Orchestrator – samlar SEC + FMP + Yahoo och uppdaterar en rad i DataFrame.
 
 Publikt API:
-    run_update_full(df, ticker, user_rates) -> (df_out, log_str)
+    run_update_full(df, ticker, user_rates) -> (df_out, logmsg)
 
-Källordning & strategi:
-    1) Yahoo: pris + snabbprofil
-    2) FMP:   fundamenta (marginaler, EV/EBITDA, FCF, utdelning, m.m.)
-    3) SEC:   P/S-kvartal (robust sorterad på datum för att få med Dec/Jan)
-Luckor fylls successivt. TS stämplas för varje uppdaterat fält.
+- SEC: hämtar kvartalsintäkter (för TTM och P/S Q1..Q4)
+- FMP: fallback för nyckeltal (marginaler, EV/EBITDA, shares, utdelning) där Yahoo saknar
+- Yahoo: pris, market cap, valuta, sektor/industri, utdelning, marginaler, EV/EBITDA, D/E
+
+OBS:
+- Inga Streamlit-anrop här; ren datafunktion.
+- Robust kolumnsättning: om kolumn saknas skapas den.
+- Stämplar tidsstämplar för uppdaterade fält om "* TS" eller "TS_*" finns.
 """
 
 from __future__ import annotations
-from typing import Dict, List, Tuple, Optional
-
+from typing import Any, Dict, List, Optional, Tuple
 import math
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
-from ..utils import (
-    safe_float,
-    stamp_fields_ts,
-    risk_label_from_mcap,
-    now_stamp,
-)
-from ..rates import hamta_valutakurs
-
-# -----------------------------
-# Käll-importer (tolerant)
-# -----------------------------
+# Källor
+from .yahoo import fetch_ticker as yh_fetch, get_live_price as yh_price
+# Dessa moduler ska redan finnas i projektet (vi anropar defensivt)
 try:
-    from .yahoo import get_live_price as _yahoo_price
+    from .fmp import fetch_ticker as fmp_fetch  # type: ignore
 except Exception:
-    _yahoo_price = None  # type: ignore
+    fmp_fetch = None  # type: ignore
 
 try:
-    # bör returnera dict med nycklar när det går: se _apply_update() nedan
-    from .yahoo import fetch_ticker as _yahoo_fetch
+    # förväntat: fetch_quarterly_revenue(ticker) -> List[{"date": "YYYY-MM-DD", "revenue": float}]
+    from .sec import fetch_quarterly_revenue as sec_fetch_quarters  # type: ignore
 except Exception:
-    _yahoo_fetch = None  # type: ignore
-
-try:
-    from .fmp import fetch_ticker as _fmp_fetch
-except Exception:
-    _fmp_fetch = None  # type: ignore
-
-try:
-    # bör returnera lista av dicts: [{"date": "YYYY-MM-DD", "ps": float}, ...]
-    from .sec import fetch_ps_quarters as _sec_ps
-except Exception:
-    _sec_ps = None  # type: ignore
+    sec_fetch_quarters = None  # type: ignore
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Hjälpare
-# -----------------------------
-PRICE_COLS = ["Kurs", "Aktuell kurs"]
-MCAP_COLS  = ["Market Cap (valuta)", "Market Cap", "Market Cap (SEK)"]
-PSQ_COLS   = ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]
+# ------------------------------------------------------------
+def _now_stamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
-# map inkommande nycklar → (kolumnnamn i df, ev. transform)
-_FIELD_MAP: Dict[str, str] = {
-    "currency": "Valuta",
-    "price": "Kurs",                      # alternativa skrivningar hanteras i _apply_update
-    "shares_outstanding": "Utestående aktier",
-    "market_cap": "Market Cap (valuta)",
-    "ps_ttm": "P/S",
-    "ps_q1": "P/S Q1",
-    "ps_q2": "P/S Q2",
-    "ps_q3": "P/S Q3",
-    "ps_q4": "P/S Q4",
-    "sector": "Sektor",
-    "industry": "Industri",
-    "gross_margin": "Bruttomarginal (%)",
-    "net_margin": "Nettomarginal (%)",
-    "debt_to_equity": "Debt/Equity",
-    "ev_ebitda": "EV/EBITDA",
-    "fcf_m": "FCF (M)",
-    "cash_m": "Kassa (M)",
-    "runway_quarters": "Runway (kvartal)",
-    "dividend_yield_pct": "Dividend Yield (%)",
-    "payout_ratio_cf_pct": "Payout Ratio CF (%)",
-}
-
-def _apply_update(df: pd.DataFrame, ridx, data: Dict[str, object], updated: List[str]) -> None:
-    """
-    Applicera inkommande 'data' mot df[ridx] och registrera uppdaterade fältnamn i 'updated'.
-    Hanterar dubbla prisfält (Kurs/Aktuell kurs) och olika MCAP-kolumner.
-    """
-    if not isinstance(data, dict):
-        return
-
-    for k, v in data.items():
-        col = _FIELD_MAP.get(k)
-        if not col:
-            continue
-
-        # värde → float om numeriskt
-        val = v
-        if isinstance(v, (int, float, np.integer, np.floating, str)):
-            try:
-                val = float(str(v).replace(",", "."))
-            except Exception:
-                val = v
-
-        if col in df.columns:
-            df.loc[ridx, col] = val
-            updated.append(col)
-        else:
-            # pris special: skriv även "Aktuell kurs" om den kolumnen finns
-            if col == "Kurs":
-                if "Kurs" in df.columns:
-                    df.loc[ridx, "Kurs"] = val
-                    updated.append("Kurs")
-                if "Aktuell kurs" in df.columns:
-                    df.loc[ridx, "Aktuell kurs"] = val
-                    updated.append("Aktuell kurs")
-            # Market Cap special: försök flera
-            elif col.startswith("Market Cap"):
-                for mc in MCAP_COLS:
-                    if mc in df.columns:
-                        df.loc[ridx, mc] = val
-                        updated.append(mc)
-                        break
-            # PS Q1..Q4 special är redan mappad via _FIELD_MAP
-            else:
-                # Om kolumn saknas totalt ignorerar vi (schema-skydd sker i ensure_schema på annat ställe)
-                pass
-
-
-def _calc_ps_avg(df: pd.DataFrame, ridx) -> Optional[float]:
-    vals = []
-    for c in PSQ_COLS:
-        if c in df.columns:
-            vals.append(safe_float(df.at[ridx, c], np.nan))
-        else:
-            vals.append(np.nan)
-    arr = [x for x in vals if not math.isnan(x)]
-    if not arr:
-        return None
-    avg = float(np.mean(arr))
-    if "P/S-snitt" in df.columns:
-        df.loc[ridx, "P/S-snitt"] = avg
-    else:
-        # skapa kolumn on-the-fly om saknas
-        df["P/S-snitt"] = df.get("P/S-snitt", np.nan)
-        df.loc[ridx, "P/S-snitt"] = avg
-    return avg
-
-
-def _ensure_mcap_sek(df: pd.DataFrame, ridx, user_rates: Dict[str, float]) -> None:
-    cur = str(df.at[ridx, "Valuta"]) if "Valuta" in df.columns else "USD"
-    rate = hamta_valutakurs(cur, user_rates)
-    # välj basmcap
-    mcap = None
-    for c in MCAP_COLS:
-        if c in df.columns:
-            mcap = safe_float(df.at[ridx, c], np.nan)
-            if not math.isnan(mcap):
-                break
-    if mcap is None or math.isnan(mcap):
-        return
-    if "Market Cap (SEK)" in df.columns:
-        df.loc[ridx, "Market Cap (SEK)"] = float(mcap) * float(rate)
-
-
-def _apply_ps_from_quarters(df: pd.DataFrame, ridx, ps_rows: List[Dict[str, object]]) -> List[str]:
-    """
-    ps_rows: list of {"date": "YYYY-MM-DD", "ps": float}
-    Tar de 4 senaste *kronologiskt* och mappar till P/S Q1..Q4 (Q1=nyast).
-    """
-    upd: List[str] = []
-    if not ps_rows:
-        return upd
-    # sortera på datum
-    def _parse(d):
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
         try:
-            return pd.to_datetime(str(d))
+            v = float(str(x).replace(",", "."))
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
         except Exception:
-            return pd.NaT
+            return None
 
-    rows = sorted(ps_rows, key=lambda r: _parse(r.get("date")), reverse=True)
-    latest4 = rows[:4]
-    # lägg in Q1..Q4 (Q1 = nyast)
-    for i, rec in enumerate(latest4, start=1):
-        ps = safe_float(rec.get("ps"), np.nan)
-        if math.isnan(ps):
-            continue
-        col = f"P/S Q{i}"
-        if col in df.columns:
-            df.loc[ridx, col] = float(ps)
-            upd.append(col)
-    return upd
+def _ensure_col(df: pd.DataFrame, col: str):
+    if col not in df.columns:
+        df[col] = np.nan
+    return df
 
+def _set(df: pd.DataFrame, idx, col: str, val: Any):
+    if col not in df.columns:
+        df[col] = np.nan
+    df.loc[idx, col] = val
 
-# -----------------------------
-# Publik funktion
-# -----------------------------
-def run_update_full(df: pd.DataFrame, ticker: str, user_rates: Dict[str, float]) -> Tuple[pd.DataFrame, str]:
+def _stamp_ts(df: pd.DataFrame, idx, field: str):
     """
-    Uppdaterar en enskild ticker. Returnerar (df_out, log_text).
+    Stämpla tidsstämpel. Stöd både 'FIELD TS' och 'TS_FIELD' om de finns i df.
     """
-    if df is None or df.empty:
-        return df, "Tomt dataframe"
+    ts_val = _now_stamp()
+    # suffix-variant
+    suf = f"{field} TS"
+    if suf in df.columns:
+        df.loc[idx, suf] = ts_val
+    # prefix-variant
+    pre = f"TS_{field}"
+    if pre in df.columns:
+        df.loc[idx, pre] = ts_val
 
-    tkr = str(ticker).upper().strip()
-    idxs = df.index[df["Ticker"].astype(str).str.upper() == tkr]
-    if len(idxs) == 0:
-        return df, f"{tkr}: Ticker hittades inte i tabellen."
-    ridx = idxs[0]
+def _risk_label_from_mcap(mc: Optional[float]) -> str:
+    if mc is None:
+        return "Unknown"
+    # USD gränser (kan mappas i UI till basvaluta)
+    if mc >= 2e11:   # >= 200B
+        return "Mega"
+    if mc >= 1e10:   # 10B–200B
+        return "Large"
+    if mc >= 2e9:    # 2B–10B
+        return "Mid"
+    if mc >= 3e8:    # 300M–2B
+        return "Small"
+    return "Micro"
 
-    updated_fields: List[str] = []
-    sources: List[str] = []
+def _ttm_series_from_quarters(qrows: List[Dict[str, Any]]) -> List[Tuple[str, float]]:
+    """
+    Tar en lista med kvartal (nyast först) [{"date": "...", "revenue": float}, ...]
+    och beräknar TTM vid varje kvartalsslut: (date, ttm)
+    Kräver minst 4 kvartal.
+    """
+    out: List[Tuple[str, float]] = []
+    if not qrows or len(qrows) < 4:
+        return out
+    # Se till att nyast först:
+    rows = list(qrows)
+    # säkerställ numerik
+    rev = [_to_float(r.get("revenue")) or 0.0 for r in rows]
+    for i in range(0, min(4, len(rows))):  # TTM för q0..q3 om möjligt
+        if i + 4 <= len(rows):
+            ttm = sum(rev[i:i+4])
+            out.append((rows[i].get("date") or f"Q{i}", ttm))
+    return out  # [(date_newest, ttm_newest), (date-1, ttm-1), ...]
 
-    # 1) Yahoo: live price + profil/stats
-    yahoo_data: Dict[str, object] = {}
-    try:
-        if _yahoo_price:
-            p = _yahoo_price(tkr)
-            if p and p > 0:
-                yahoo_data["price"] = p
-        if _yahoo_fetch:
-            extra = _yahoo_fetch(tkr) or {}
-            if isinstance(extra, dict):
-                yahoo_data.update(extra)
-        if yahoo_data:
-            _apply_update(df, ridx, yahoo_data, updated_fields)
-            sources.append("Yahoo")
-    except Exception as e:
-        sources.append(f"Yahoo(! {e})")
+def _ps_from_mcap_ttm(mcap: Optional[float], ttm: Optional[float]) -> Optional[float]:
+    if mcap is None or ttm is None:
+        return None
+    if ttm <= 0:
+        return None
+    return float(mcap) / float(ttm)
 
-    # 2) FMP: fundamenta
-    fmp_data: Dict[str, object] = {}
-    try:
-        if _fmp_fetch:
-            f = _fmp_fetch(tkr) or {}
-            if isinstance(f, dict):
-                fmp_data.update(f)
-        if fmp_data:
-            _apply_update(df, ridx, fmp_data, updated_fields)
-            sources.append("FMP")
-    except Exception as e:
-        sources.append(f"FMP(! {e})")
 
-    # 3) SEC: P/S kvartal – ta de 4 senaste kronologiskt (hanterar Dec/Jan)
-    try:
-        if _sec_ps:
-            ps_rows = _sec_ps(tkr) or []
-            ps_upd = _apply_ps_from_quarters(df, ridx, ps_rows)
-            updated_fields.extend(ps_upd)
-            if ps_rows:
-                sources.append("SEC")
-    except Exception as e:
-        sources.append(f"SEC(! {e})")
+# ------------------------------------------------------------
+# Huvud: run_update_full
+# ------------------------------------------------------------
+def run_update_full(df: pd.DataFrame, ticker: str, user_rates: Dict[str, float] | None = None) -> Tuple[pd.DataFrame, str]:
+    """
+    Uppdaterar en ticker i df med SEC + FMP + Yahoo.
+    Returnerar (df_out, logmsg).
+    """
+    if "Ticker" not in df.columns:
+        df["Ticker"] = ""
+    tkr = str(ticker).strip().upper()
 
-    # Efter-sammanställning
-    # – P/S-snitt
-    psavg = _calc_ps_avg(df, ridx)
-    if psavg is not None:
-        updated_fields.append("P/S-snitt")
+    # Hitta rad eller skapa ny
+    mask = df["Ticker"].astype(str).str.upper() == tkr
+    if not mask.any():
+        # skapa ny rad
+        new_row = {c: np.nan for c in df.columns}
+        new_row["Ticker"] = tkr
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        mask = df["Ticker"].astype(str).str.upper() == tkr
+    ridx = df.index[mask]
 
-    # – Market Cap (SEK) från (valuta) × kurs
-    _ensure_mcap_sek(df, ridx, user_rates)
-    if "Market Cap (SEK)" in updated_fields or "Market Cap (valuta)" in updated_fields or "Market Cap" in updated_fields:
-        updated_fields.append("Market Cap (SEK)")
+    # Säkerställ vanliga kolumner
+    for col in [
+        "Bolagsnamn", "Valuta", "Kurs", "Aktuell kurs", "Utestående aktier",
+        "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
+        "Market Cap", "Market Cap (valuta)", "Market Cap (SEK)",
+        "Årlig utdelning", "Dividend Yield (%)",
+        "EV/EBITDA", "Bruttomarginal (%)", "Nettomarginal (%)", "Debt/Equity",
+        "Sektor", "Industri",
+        "Senast auto-uppdaterad", "Senast uppdaterad källa"
+    ]:
+        _ensure_col(df, col)
 
-    # – Risklabel
-    #   välj mcap (valuta) i första hand, annars SEK
-    mcap_val = np.nan
-    for c in ["Market Cap (valuta)", "Market Cap", "Market Cap (SEK)"]:
-        if c in df.columns:
-            mcap_val = safe_float(df.at[ridx, c], np.nan)
-            if not math.isnan(mcap_val):
-                break
-    if not math.isnan(mcap_val):
-        if "Risklabel" in df.columns:
-            df.loc[ridx, "Risklabel"] = risk_label_from_mcap(mcap_val)
-            updated_fields.append("Risklabel")
+    # -----------------------------
+    # Yahoo först (snabb och ofta komplett)
+    # -----------------------------
+    y = yh_fetch(tkr) or {}
+    price = _to_float(y.get("price"))
+    currency = y.get("currency")
+    mcap = _to_float(y.get("market_cap"))
+    shares = _to_float(y.get("shares_outstanding"))
+    name = y.get("name")
 
-    # – TS-stämpla alla uppdaterade fält
-    if updated_fields:
-        # unika & filtrera bort ev. icke-existerande
-        unique_fields = [c for c in sorted(set(updated_fields)) if c in df.columns]
-        df = stamp_fields_ts(df, unique_fields, ts_suffix=" TS")
+    annual_div = _to_float(y.get("annual_dividend"))
+    div_y = _to_float(y.get("dividend_yield_pct"))
+    ev_ebitda = _to_float(y.get("ev_ebitda"))
+    gm_pct = _to_float(y.get("gross_margin_pct"))
+    nm_pct = _to_float(y.get("net_margin_pct"))
+    dte = _to_float(y.get("debt_to_equity"))
+    sector = y.get("sector")
+    industry = y.get("industry")
 
-    # – meta
-    if "Senast auto-uppdaterad" in df.columns:
-        df.loc[ridx, "Senast auto-uppdaterad"] = now_stamp()
-    if "Senast uppdaterad källa" in df.columns:
-        df.loc[ridx, "Senast uppdaterad källa"] = ", ".join([s for s in sources if s])
+    # -----------------------------
+    # FMP – fyll luckor
+    # -----------------------------
+    f = {}
+    if fmp_fetch is not None:
+        try:
+            f = fmp_fetch(tkr) or {}
+        except Exception:
+            f = {}
 
-    # Loggtext
-    if not sources and not updated_fields:
-        return df, f"{tkr}: Inga ändringar hittades."
-    return df, f"{tkr}: Uppdaterad ({', '.join(sorted(set(updated_fields)))}) via {', '.join(sources)}"
+    if price is None:
+        price = _to_float(f.get("price"))
+    if currency is None:
+        currency = f.get("currency") or "USD"
+    if mcap is None:
+        mcap = _to_float(f.get("market_cap"))
+    if shares is None:
+        shares = _to_float(f.get("shares_outstanding"))
+    if name is None:
+        name = f.get("name")
+    if annual_div is None:
+        annual_div = _to_float(f.get("annual_dividend"))
+    if div_y is None:
+        div_y = _to_float(f.get("dividend_yield_pct"))
+    if ev_ebitda is None:
+        ev_ebitda = _to_float(f.get("ev_ebitda"))
+    if gm_pct is None:
+        gm_pct = _to_float(f.get("gross_margin_pct"))
+    if nm_pct is None:
+        nm_pct = _to_float(f.get("net_margin_pct"))
+    if dte is None:
+        dte = _to_float(f.get("debt_to_equity"))
+    if sector is None:
+        sector = f.get("sector")
+    if industry is None:
+        industry = f.get("industry")
+
+    # Beräkna mcap om saknas men vi har price*shares
+    if mcap is None and (price is not None and shares is not None):
+        mcap = float(price) * float(shares)
+
+    # -----------------------------
+    # SEC – kvartalsintäkter -> TTM & P/S Q1..Q4
+    # -----------------------------
+    ps_q = [None, None, None, None]  # Q1..Q4
+    p_s_current = None
+    p_s_avg = None
+
+    quarters: List[Dict[str, Any]] = []
+    if sec_fetch_quarters is not None:
+        try:
+            quarters = sec_fetch_quarters(tkr) or []
+        except Exception:
+            quarters = []
+
+    # Om SEC saknas kan FMP ibland ha quarterly revenue – vi försöker läsa kompatibelt fält
+    if not quarters and f:
+        qf = f.get("quarters") or []
+        # Försök mappa till [{"date": ..., "revenue": ...}, ...]
+        mapped = []
+        for it in qf:
+            rev = it.get("revenue") or it.get("sales") or it.get("revenueQuarter")
+            dt = it.get("date") or it.get("period") or it.get("fiscalDateEnding")
+            rv = _to_float(rev)
+            if rv is not None and dt:
+                mapped.append({"date": str(dt), "revenue": float(rv)})
+        if mapped:
+            quarters = mapped
+
+    # Nu har vi (förhoppningsvis) quarters (nyast först). Räkna TTM-serie.
+    ttm_series = _ttm_series_from_quarters(quarters)  # [(date0, ttm0), (date1, ttm1), ...]
+    if mcap is not None and ttm_series:
+        # Q1..Q4 = de 4 senaste TTM
+        for i in range(min(4, len(ttm_series))):
+            ps_q[i] = _ps_from_mcap_ttm(mcap, ttm_series[i][1])
+        # nuvarande P/S = TTM senaste
+        p_s_current = ps_q[0]
+        # medel
+        vals = [v for v in ps_q if v is not None]
+        if vals:
+            p_s_avg = float(np.mean(vals))
+
+    # -----------------------------
+    # Skriv in i DataFrame
+    # -----------------------------
+    # Namn/valuta
+    if name:
+        _set(df, ridx, "Bolagsnamn", name)
+    if currency:
+        _set(df, ridx, "Valuta", currency)
+
+    # Pris -> stöd både "Kurs" och "Aktuell kurs"
+    if price is not None:
+        _set(df, ridx, "Kurs", price)
+        _set(df, ridx, "Aktuell kurs", price)
+        _stamp_ts(df, ridx, "Kurs")
+        _stamp_ts(df, ridx, "Aktuell kurs")
+
+    # Utestående aktier
+    if shares is not None:
+        _set(df, ridx, "Utestående aktier", float(shares))
+        _stamp_ts(df, ridx, "Utestående aktier")
+
+    # Market cap
+    if mcap is not None:
+        _set(df, ridx, "Market Cap", float(mcap))
+        _set(df, ridx, "Market Cap (valuta)", float(mcap))  # i basvalutan (t.ex. USD)
+        # SEK-kolumn om finns: kräver växelkurs; sätts i UI-beräkningar normalt
+        _stamp_ts(df, ridx, "Market Cap")
+        _stamp_ts(df, ridx, "Market Cap (valuta)")
+
+    # P/S nu + Q1..Q4 + snitt
+    if p_s_current is not None:
+        _set(df, ridx, "P/S", float(p_s_current))
+        _stamp_ts(df, ridx, "P/S")
+    labels = ["P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"]
+    for i, lab in enumerate(labels):
+        if ps_q[i] is not None:
+            _set(df, ridx, lab, float(ps_q[i]))
+            _stamp_ts(df, ridx, lab)
+    if p_s_avg is not None:
+        _set(df, ridx, "P/S-snitt", float(p_s_avg))
+
+    # Utdelning
+    if annual_div is not None:
+        _set(df, ridx, "Årlig utdelning", float(annual_div))
+    if div_y is not None:
+        _set(df, ridx, "Dividend Yield (%)", float(div_y))
+
+    # Övriga nyckeltal
+    if ev_ebitda is not None:
+        _set(df, ridx, "EV/EBITDA", float(ev_ebitda))
+    if gm_pct is not None:
+        _set(df, ridx, "Bruttomarginal (%)", float(gm_pct))
+    if nm_pct is not None:
+        _set(df, ridx, "Nettomarginal (%)", float(nm_pct))
+    if dte is not None:
+        _set(df, ridx, "Debt/Equity", float(dte))
+    if sector:
+        _set(df, ridx, "Sektor", str(sector))
+    if industry:
+        _set(df, ridx, "Industri", str(industry))
+
+    # Risklabel (enkel mcap-baserad)
+    _ensure_col(df, "Risklabel")
+    if mcap is not None:
+        df.loc[ridx, "Risklabel"] = _risk_label_from_mcap(mcap)
+
+    # Metadata
+    _set(df, ridx, "Senast auto-uppdaterad", _now_stamp())
+    _set(df, ridx, "Senast uppdaterad källa",
+         "SEC+FMP+Yahoo" if quarters else ("FMP+Yahoo" if f else "Yahoo"))
+
+    # Klar
+    # loggmeddelande (kort)
+    parts = []
+    if price is not None:
+        parts.append(f"pris={price:.2f}")
+    if mcap is not None:
+        parts.append(f"mcap≈{mcap:.0f}")
+    if p_s_current is not None:
+        parts.append(f"P/S={p_s_current:.2f}")
+    msg = f"{ticker}: " + ", ".join(parts) if parts else f"{ticker}: uppdaterad"
+
+    return df, msg

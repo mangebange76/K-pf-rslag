@@ -104,14 +104,24 @@ def _init_state_defaults():
 def _normalize_aliases(df: pd.DataFrame) -> pd.DataFrame:
     """
     Mappa vanliga alias → kanoniska kolumnnamn INNAN ensure_schema stramar upp.
+    (Påverkar inte befintliga kolumner om kanoniskt namn redan finns.)
     """
     alias_map = {
+        # Namn
+        "Namn": "Bolagsnamn",
+        # Kurs
         "Aktuell kurs": "Kurs",
         "Pris": "Kurs",
-        "Antal du äger": "Antal aktier",
+        # Antal
         "Antal": "Antal aktier",
+        "Antal du äger": "Antal aktier",
+        # Utestående aktier
+        "Utestående aktier": "Utestående aktier (milj.)",
+        "Shares Outstanding (M)": "Utestående aktier (milj.)",
+        # P/S-snitt
         "P/S-snitt": "P/S-snitt (Q1..Q4)",
         "P/S snitt": "P/S-snitt (Q1..Q4)",
+        "PS-snitt": "P/S-snitt (Q1..Q4)",
     }
     have = set(df.columns.astype(str))
     ren = {}
@@ -452,7 +462,17 @@ def vy_edit(df: pd.DataFrame, user_rates: Dict[str, float]) -> pd.DataFrame:
 def vy_portfolio(df: pd.DataFrame, user_rates: Dict[str, float]):
     st.header("💼 Portfölj")
 
-    if df.empty:
+    # Om tomt – gör ett försök att läsa om direkt från arket
+    if df is None or df.empty:
+        df_reload = _load_df()
+        if df_reload is not None and not df_reload.empty:
+            df = df_reload
+            st.session_state["_df_ref"] = df_reload
+
+    # Statusrad alltid
+    st.caption(f"Rader: {len(df)} • Kolumner: {len(df.columns)}")
+
+    if df is None or df.empty:
         st.info("Inga bolag i databasen ännu.")
         return
 

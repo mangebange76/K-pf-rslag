@@ -2,7 +2,7 @@
 """
 stockapp.config
 ----------------
-Konstanter & kolumnschema som hela appen använder.
+Konstanter & namnsättning för hela appen.
 Håll denna modul fri från beroenden till andra stockapp-moduler.
 """
 
@@ -11,17 +11,22 @@ from typing import Dict, List
 import streamlit as st
 
 # ---------------------------------------------------------------------
+# App-metadata
+# ---------------------------------------------------------------------
+APP_TITLE: str = st.secrets.get("APP_TITLE", "K-pf-rslag")
+DISPLAY_CURRENCY: str = st.secrets.get("DISPLAY_CURRENCY", "SEK")
+
+# ---------------------------------------------------------------------
 # Google Sheets
 # ---------------------------------------------------------------------
-# URL till kalkylbladet (läggs normalt i st.secrets)
+# URL till kalkylbladet (läggs normalt i st.secrets).
 SHEET_URL: str = st.secrets.get("SHEET_URL", "").strip()
-# Huvudfliken där portföljen/bolagslistan finns
+# Huvudfliken där portfölj/bolagslista finns
 SHEET_NAME: str = st.secrets.get("SHEET_NAME", "Data")
 # Fliken för valutakurser
 RATES_SHEET_NAME: str = st.secrets.get("RATES_SHEET_NAME", "Valutakurser")
-
-# App-titel
-APP_TITLE: str = st.secrets.get("APP_TITLE", "K-pf-rslag")
+# Prefix för snapshots/backup-blad (används av storage)
+SNAPSHOT_PREFIX: str = st.secrets.get("SNAPSHOT_PREFIX", "SNAP_")
 
 # ---------------------------------------------------------------------
 # Valutor
@@ -35,82 +40,63 @@ STANDARD_VALUTAKURSER: Dict[str, float] = {
     "SEK": 1.0,
 }
 
-DISPLAY_CURRENCY: str = "SEK"
-
 # ---------------------------------------------------------------------
-# Kolumnschema (harmoniserat med app.py & vyer)
+# Kolumnschema (namn som resten av appen förväntar sig)
 # ---------------------------------------------------------------------
+# Basfält som beskriver ett bolag
 BASE_COLS: List[str] = [
     "Ticker",
     "Bolagsnamn",
     "Valuta",
     "Sektor",
-    "Industri",
-    "Risklabel",
+    "Risklabel",                 # härleder vi från Market Cap när vi kan
     "Antal aktier",
     "GAV (SEK)",
 ]
 
+# Nyckeltal / fakta som hämtas
 FACT_COLS: List[str] = [
-    # pris & värde
-    "Kurs",                    # primärt fält i appen
-    "Aktuell kurs",            # accepterad fallback som vi kan läsa/visa
-    "Market Cap",
-    "Market Cap (SEK)",
-    "Utestående aktier (milj.)",
-
-    # P/S-historik
+    "Kurs",
+    "Market Cap",                         # i bolagets valuta
+    "Utestående aktier",                  # miljoner (om vi vet), annars antal
+    "Utestående aktier (milj.)",          # explicit miljoner om vi kan räkna fram
+    "Debt/Equity",
+    "Net debt / EBITDA",
+    "P/B",
+    "Gross margin (%)",
+    "Operating margin (%)",
+    "Net margin (%)",
+    "ROE (%)",
+    "FCF Yield (%)",
+    "Dividend yield (%)",
+    "Dividend payout (FCF) (%)",
+    "Kassa (M)",
+    "EV/EBITDA (ttm)",
+    # P/S-spår
     "P/S",
     "P/S Q1",
     "P/S Q2",
     "P/S Q3",
     "P/S Q4",
-
-    # Marginaler och lönsamhet
-    "Bruttomarginal (%)",
-    "Rörelsemarginal (%)",
-    "Nettomarginal (%)",
-    "ROE (%)",
-
-    # Kapitalstruktur & värdering
-    "Debt/Equity",
-    "Net debt / EBITDA",
-    "EV/EBITDA",
-    "P/B",
-
-    # Kassaflöde & utdelning
-    "FCF (M)",
-    "FCF Yield (%)",
-    "Dividend Yield (%)",
-    "Payout Ratio CF (%)",
-
-    # Likviditet
-    "Kassa (M)",
-    "Runway (kvartal)",
-
-    # Prognoser (alltid manuella i din process)
-    "Omsättning i år (est.)",
-    "Omsättning nästa år (est.)",
+    # Prognoser (manuella, i miljoner i bolagets valuta)
+    "Omsättning i år (förv.)",
+    "Omsättning nästa år (förv.)",
 ]
 
-# Tidsstämplar – OBS: appen använder suffix " TS"
+# Tidsstämplar – OBS: appen sätter TS-kolumner som "<Fält> TS"
 TS_COLS: List[str] = [
     "Kurs TS",
     "Full TS",
-    "Omsättning i år (est.) TS",
-    "Omsättning nästa år (est.) TS",
-    "P/S TS",
-    "P/S Q1 TS",
-    "P/S Q2 TS",
-    "P/S Q3 TS",
-    "P/S Q4 TS",
+    "Omsättning i år (förv.) TS",
+    "Omsättning nästa år (förv.) TS",
 ]
 
 # Beräknade fält (visning/analys)
 CALC_COLS: List[str] = [
     "P/S-snitt (Q1..Q4)",
-    "Uppsida (%)",
+    "P/S (TTM, modell)",
     "Riktkurs (valuta)",
+    "Uppsida (%)",
     "TotalScore",
     "Coverage",
     "Recommendation",
@@ -118,39 +104,51 @@ CALC_COLS: List[str] = [
     "Andel (%)",
 ]
 
-# Slutlig ordning
+# Slutlig ordning (för säker sparning/visning)
 FINAL_COLS: List[str] = BASE_COLS + FACT_COLS + TS_COLS + CALC_COLS
 
-# Dessa används när vi listar “Manuell prognoslista”
-MANUAL_PROGNOS_FIELDS: List[str] = ["Omsättning i år (est.)", "Omsättning nästa år (est.)"]
+# För “Manuell prognoslista” (vilka fält som anses manuella)
+MANUAL_PROGNOS_FIELDS: List[str] = [
+    "Omsättning i år (förv.)",
+    "Omsättning nästa år (förv.)",
+]
 
+# För validering av tider – dessa används när vi listar “manuell prognoslista”
+TS_FIELDS: List[str] = [f"{f} TS" for f in MANUAL_PROGNOS_FIELDS]
+
+# ---------------------------------------------------------------------
+# Limits och defaults
+# ---------------------------------------------------------------------
 # Maxrad-skydd vid skrivning (guard)
 MAX_ROWS_WRITE: int = int(st.secrets.get("MAX_ROWS_WRITE", 4000))
 
-# Hur många förslag per sida i investeringsvyn (kan ändras i UI)
-PROPOSALS_PAGE_SIZE: int = int(st.secrets.get("PROPOSALS_PAGE_SIZE", 5))
+# Hur många förslag vi visar i investeringsvyn (per sida)
+PROPOSALS_PAGE_SIZE: int = int(st.secrets.get("PROPOSALS_PAGE_SIZE", 10))
 
 # Batch – standardstorlek
-BATCH_DEFAULT_SIZE: int = int(st.secrets.get("BATCH_DEFAULT_SIZE", 10))
+BATCH_DEFAULT_SIZE: int = int(st.secrets.get("BATCH_DEFAULT_SIZE", 20))
 
-# Togglar för källor (kan styras via secrets)
+# ---------------------------------------------------------------------
+# Käll-toggles
+# ---------------------------------------------------------------------
 USE_YAHOO: bool = bool(st.secrets.get("USE_YAHOO", True))
 USE_FMP: bool = bool(st.secrets.get("USE_FMP", True))
 USE_SEC: bool = bool(st.secrets.get("USE_SEC", True))
 
-# Nyckeltal som ofta vägs i scoring (info – själva vikterna ligger i scoring-modulen)
+# ---------------------------------------------------------------------
+# Scoring – vilka nyckeltal som vägs (vikt per sektor sätts i scoring-modulen)
+# ---------------------------------------------------------------------
 SCORABLE_KEYS: List[str] = [
-    "Uppsida (%)",
-    "EV/EBITDA",
-    "Net debt / EBITDA",
-    "Bruttomarginal (%)",
-    "Rörelsemarginal (%)",
-    "Nettomarginal (%)",
+    "P/S (TTM, modell)",
+    "Net margin (%)",
+    "Gross margin (%)",
+    "Operating margin (%)",
     "ROE (%)",
-    "P/B",
     "FCF Yield (%)",
     "Debt/Equity",
-    "Dividend Yield (%)",
-    "Payout Ratio CF (%)",
-    "P/S",
+    "Net debt / EBITDA",
+    "P/B",
+    "Dividend yield (%)",
+    "Dividend payout (FCF) (%)",
+    "Uppsida (%)",
 ]

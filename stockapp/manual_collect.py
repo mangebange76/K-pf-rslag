@@ -1,17 +1,19 @@
-# stockapp/manual_collect.py
 from __future__ import annotations
-
-import math
-import typing as t
-
+import math, typing as t
 import pandas as pd
 import streamlit as st
 
 # ── Fetchers ───────────────────────────────────────────────────────────────
 try:
-    from .fetchers.yahoo import get_all as yahoo_get_all
+    from .fetchers.yahoo import (
+        get_all as yahoo_get_all,
+        get_all_verbose as yahoo_get_all_verbose,
+        format_fetch_summary as yahoo_format_summary,
+    )
 except Exception:
     yahoo_get_all = None  # type: ignore
+    yahoo_get_all_verbose = None  # type: ignore
+    yahoo_format_summary = lambda s, f, w: "Yahoo: (ingen formatterare)"
 
 try:
     from .fetchers.fmp import (
@@ -29,7 +31,6 @@ try:
 except Exception:
     sec_get_all = None  # type: ignore
 
-
 # ── (Valfri) Sheets-integration ────────────────────────────────────────────
 _sheets_ok = False
 _sheets_save_df = None  # type: ignore
@@ -46,8 +47,7 @@ except Exception:
         _sheets_ok = False
         _sheets_save_df = None  # type: ignore
 
-
-# ── Fält-prioritet (matchar dina rubriker) ────────────────────────────────
+# ── Fält-prioritet ─────────────────────────────────────────────────────────
 FIELD_PRIORITY: dict[str, list[str]] = {
     "Kurs": ["yahoo", "fmp", "sec"],
     "P/S": ["fmp", "yahoo", "sec"],
@@ -63,12 +63,10 @@ FIELD_PRIORITY: dict[str, list[str]] = {
     "Industri": ["fmp", "yahoo", "sec"],
     "Bransch": ["fmp", "yahoo", "sec"],
 }
-
 ALIASES: dict[str, str] = {
     "P/S TTM": "P/S",
     "P/S (TTM, modell)": "P/S",
 }
-
 
 # ── Hjälpare ───────────────────────────────────────────────────────────────
 def _canon(field: str) -> str:
@@ -86,7 +84,6 @@ def _count_nonempty(d: dict | None) -> int:
     return sum(1 for _, v in d.items() if _safe(v))
 
 def _clean_keys(d: dict | None) -> dict:
-    """Ta bort interna/okända nycklar (t.ex. __yahoo_fields__) och None/NaN."""
     if not isinstance(d, dict):
         return {}
     out: dict[str, t.Any] = {}
@@ -98,25 +95,19 @@ def _clean_keys(d: dict | None) -> dict:
     return out
 
 def _compute_ps_from(yv: dict, fv: dict, sv: dict) -> t.Optional[float]:
-    """Beräkna P/S = Market Cap / Omsättning i år, med rimlig källa-prio."""
     def pick(field: str) -> t.Optional[float]:
         for src_dict in (fv, yv, sv):  # FMP -> Yahoo -> SEC
             v = src_dict.get(field)
             if isinstance(v, (int, float)) and not math.isnan(float(v)):
                 return float(v)
         return None
-
-    # Market Cap i kronor (ev. från (M))
     mc = pick("Market Cap")
     if mc is None:
         m_m = pick("Market Cap (M)")
         if m_m is not None:
             mc = m_m * 1_000_000.0
-
-    # Omsättning i år i kronor via (M)
     rev_m = pick("Omsättning i år (M)")
     rev = rev_m * 1_000_000.0 if rev_m is not None else None
-
     if mc and rev and rev > 0:
         return round(mc / rev, 4)
     return None
@@ -125,89 +116,65 @@ def _pick_value(field: str, yv: dict, fv: dict, sv: dict) -> tuple[t.Any, str | 
     f = _canon(field)
     order = FIELD_PRIORITY.get(f, ["yahoo", "fmp", "sec"])
     for src in order:
-        if src == "yahoo" and _safe(yv.get(f)):
-            return yv[f], "Yahoo"
-        if src == "fmp" and _safe(fv.get(f)):
-            return fv[f], "FMP"
-        if src == "sec" and _safe(sv.get(f)):
-            return sv[f], "SEC"
+        if src == "yahoo" and _safe(yv.get(f)): return yv[f], "Yahoo"
+        if src == "fmp"   and _safe(fv.get(f)): return fv[f], "FMP"
+        if src == "sec"   and _safe(sv.get(f)): return sv[f], "SEC"
     return None, None
 
 def _merge_preview(cur_row: dict, yv: dict, fv: dict, sv: dict) -> pd.DataFrame:
-    """
-    Skapar tabell 'Fält' / 'Före' / 'Efter' / 'Källa' för meningsfulla ändringar.
-    Har extra fallback för 'P/S' genom lokal beräkning.
-    """
     fields: set[str] = set(FIELD_PRIORITY.keys()) | set(yv.keys()) | set(fv.keys()) | set(sv.keys())
     rows: list[dict[str, t.Any]] = []
-
     for field in sorted(fields):
         f = _canon(field)
         before = cur_row.get(f)
         after, src = _pick_value(f, yv, fv, sv)
-
-        # Fallback: beräkna P/S
         if f == "P/S" and not _safe(after):
             ps_calc = _compute_ps_from(yv, fv, sv)
             if _safe(ps_calc):
                 after, src = ps_calc, "Beräknad"
-
-        if _safe(after):
-            if not _safe(before) or before != after:
-                rows.append({"Fält": f, "Före": before, "Efter": after, "Källa": src})
-
+        if _safe(after) and (not _safe(before) or before != after):
+            rows.append({"Fält": f, "Före": before, "Efter": after, "Källa": src})
     if not rows:
         return pd.DataFrame(columns=["Fält", "Före", "Efter", "Källa"])
     return pd.DataFrame(rows)[["Fält", "Före", "Efter", "Källa"]]
 
 def _apply_merge_to_df(df: pd.DataFrame, row_idx: int, merged_df: pd.DataFrame) -> pd.DataFrame:
-    if merged_df.empty:
-        return df
+    if merged_df.empty: return df
     df2 = df.copy()
     for _, r in merged_df.iterrows():
-        col = str(r["Fält"])
-        val = r["Efter"]
-        if col not in df2.columns:
-            df2[col] = None
+        col = str(r["Fält"]); val = r["Efter"]
+        if col not in df2.columns: df2[col] = None
         df2.iat[row_idx, df2.columns.get_loc(col)] = val
     return df2
-
 
 # ── Huvudvy ────────────────────────────────────────────────────────────────
 def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        st.warning("Ingen data att visa.")
-        return df
+        st.warning("Ingen data att visa."); return df
 
-    # init draft + diagnostik
     st.session_state.setdefault("draft_yahoo", {})
     st.session_state.setdefault("draft_fmp", {})
     st.session_state.setdefault("draft_sec", {})
+    st.session_state.setdefault("yahoo_diag", {"fields": [], "warnings": [], "summary": ""})
     st.session_state.setdefault("fmp_diag", {"fields": [], "warnings": [], "summary": ""})
     st.session_state.setdefault("fmp_disabled", False)
 
     # hitta ticker-kolumn
-    tickers = []
-    colname_ticker = None
+    tickers = []; colname_ticker = None
     for cand in ["Ticker", "ticker", "Symbol", "symbol"]:
         if cand in df.columns:
             colname_ticker = cand
-            tickers = list(pd.unique(df[cand].dropna().astype(str)))
-            break
+            tickers = list(pd.unique(df[cand].dropna().astype(str))); break
     if not tickers:
-        st.error("Kunde inte hitta kolumnen 'Ticker' (eller 'Symbol') i Data-fliken.")
-        return df
+        st.error("Kunde inte hitta kolumnen 'Ticker' (eller 'Symbol') i Data-fliken."); return df
 
     st.caption("Välj ticker")
     selected_ticker = st.selectbox("", sorted(tickers), key="manual_collect_ticker")  # noqa: B008
-    if not selected_ticker:
-        return df
+    if not selected_ticker: return df
 
-    # aktuell rad
     mask = df[colname_ticker] == selected_ticker
     if not mask.any():
-        st.error(f"Hittade ingen rad med {colname_ticker}='{selected_ticker}'.")
-        return df
+        st.error(f"Hittade ingen rad med {colname_ticker}='{selected_ticker}'."); return df
     row_idx = df.index[mask][0]
     cur_row = df.loc[row_idx].to_dict()
 
@@ -215,21 +182,28 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("Hämta från Yahoo", use_container_width=True):
-            if yahoo_get_all is None:
+            if yahoo_get_all_verbose is None:
                 st.error("Yahoo-fetchern saknas.")
             else:
                 try:
-                    st.session_state["draft_yahoo"] = _clean_keys(yahoo_get_all(selected_ticker) or {})
-                    st.success(f"Yahoo hämtade {len(st.session_state['draft_yahoo'])} fält.")
+                    mapped, fields, warns = yahoo_get_all_verbose(selected_ticker)
+                    st.session_state["draft_yahoo"] = _clean_keys(mapped or {})
+                    st.session_state["yahoo_diag"] = {
+                        "fields": fields or [],
+                        "warnings": warns or [],
+                        "summary": yahoo_format_summary("Yahoo", fields or [], warns or []),
+                    }
+                    if fields:
+                        st.success(f"Yahoo hämtade {len(fields)} fält.")
+                    else:
+                        wtxt = " | ".join(warns or [])
+                        st.warning("Yahoo hämtade 0 fält." + (f" {wtxt}" if wtxt else ""))
                 except Exception as e:
                     st.error(f"Fel vid Yahoo-hämtning: {e}")
 
     with col2:
-        if st.button(
-            "Hämta från FMP",
-            use_container_width=True,
-            disabled=st.session_state.get("fmp_disabled", False),
-        ):
+        if st.button("Hämta från FMP", use_container_width=True,
+                     disabled=st.session_state.get("fmp_disabled", False)):
             if fmp_get_all_verbose is None:
                 st.error("FMP-fetchern saknas.")
             else:
@@ -244,7 +218,6 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
                     if fields:
                         st.success(f"FMP hämtade {len(fields)} fält.")
                     else:
-                        # Om 403 dök upp: inaktivera knappen denna session
                         if any("403" in w for w in (warns or [])):
                             st.session_state["fmp_disabled"] = True
                             st.error("FMP-nyckeln avvisas (403). Har inaktiverat FMP-knappen denna session.")
@@ -264,34 +237,33 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
                 except Exception as e:
                     st.error(f"Fel vid SEC-hämtning: {e}")
 
-    # möjlighet att låsa upp FMP igen när ny nyckel är inlagd
     if st.session_state.get("fmp_disabled", False):
         st.info("FMP är tillfälligt inaktiverat p.g.a. 403. När du lagt in en giltig nyckel kan du aktivera FMP igen.")
         if st.button("🔓 Aktivera FMP igen"):
             st.session_state["fmp_disabled"] = False
             st.success("FMP återaktiverat.")
 
-    # summering
     cnt_y = _count_nonempty(st.session_state.get("draft_yahoo"))
     cnt_f = _count_nonempty(st.session_state.get("draft_fmp"))
     cnt_s = _count_nonempty(st.session_state.get("draft_sec"))
     st.markdown(f"**Summering:** Yahoo={cnt_y}, FMP={cnt_f}, SEC={cnt_s}")
 
-    # FMP debug – visar senaste diagnostik; gör INTE nya API-anrop
+    with st.expander("Yahoo debug (mappade fält + varningar)"):
+        ydiag = st.session_state.get("yahoo_diag", {}) or {}
+        yfields = ydiag.get("fields", []); ywarns = ydiag.get("warnings", []); ysum = ydiag.get("summary", "")
+        if ysum: st.write(ysum)
+        if yfields: st.write("Fält:", ", ".join(yfields))
+        if ywarns: st.write("Varningar:", " | ".join(ywarns))
+        st.json(st.session_state.get("draft_yahoo", {}))
+
     with st.expander("FMP debug (mappade fält + varningar)"):
-        diag = st.session_state.get("fmp_diag", {}) or {}
-        fields = diag.get("fields", [])
-        warns = diag.get("warnings", [])
-        summary = diag.get("summary", "")
-        if summary:
-            st.write(summary)
-        if fields:
-            st.write("Fält:", ", ".join(fields))
-        if warns:
-            st.write("Varningar:", " | ".join(warns))
+        fdiag = st.session_state.get("fmp_diag", {}) or {}
+        ffields = fdiag.get("fields", []); fwarns = fdiag.get("warnings", []); fsum = fdiag.get("summary", "")
+        if fsum: st.write(fsum)
+        if ffields: st.write("Fält:", ", ".join(ffields))
+        if fwarns: st.write("Varningar:", " | ".join(fwarns))
         st.json(st.session_state.get("draft_fmp", {}))
 
-    # förhandsgranskning
     show_preview = st.button("🔍 Förhandsgranska skillnader")
     preview_df = pd.DataFrame()
     if show_preview:
@@ -301,12 +273,11 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
             st.session_state.get("draft_fmp", {}) or {},
             st.session_state.get("draft_sec", {}) or {},
         )
-        if preview_df.empty:
-            st.info("Inga förändringar att spara.")
-        else:
-            st.dataframe(preview_df, use_container_width=True)
+        st.dataframe(preview_df if not preview_df.empty else pd.DataFrame(
+            columns=["Fält", "Före", "Efter", "Källa"]),
+            use_container_width=True
+        )
 
-    # spara
     if st.button("💾 Spara till Google Sheets", use_container_width=True):
         if preview_df.empty:
             preview_df = _merge_preview(
@@ -316,37 +287,22 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
                 st.session_state.get("draft_sec", {}) or {},
             )
         if preview_df.empty:
-            st.warning("Inget att spara.")
-            return df
-
+            st.warning("Inget att spara."); return df
         df2 = _apply_merge_to_df(df, row_idx, preview_df)
-
         if _sheets_ok and callable(_sheets_save_df):
             try:
-                _sheets_save_df(df2)
-                st.success("Sparat till Google Sheets.")
+                _sheets_save_df(df2); st.success("Sparat till Google Sheets.")
             except Exception as e:
                 st.warning(f"Kunde inte spara via sheets-modulen: {e}\nReturnerar uppdaterat df till appen.")
-                # nollställ drafts
-                st.session_state["draft_yahoo"] = {}
-                st.session_state["draft_fmp"] = {}
-                st.session_state["draft_sec"] = {}
+                st.session_state["draft_yahoo"] = {}; st.session_state["draft_fmp"] = {}; st.session_state["draft_sec"] = {}
                 return df2
         else:
             st.info("Ingen sheets-funktion hittad – returnerar uppdaterat df till appen.")
-
-        # nollställ drafts efter spar
-        st.session_state["draft_yahoo"] = {}
-        st.session_state["draft_fmp"] = {}
-        st.session_state["draft_sec"] = {}
+        st.session_state["draft_yahoo"] = {}; st.session_state["draft_fmp"] = {}; st.session_state["draft_sec"] = {}
         return df2
 
-    # kort vy av aktuell rad
     with st.expander("Visa aktuell rad (kort info)"):
-        show_cols = [c for c in [
-            "Ticker", "Bolagsnamn", "Kurs", "Valuta", "P/S",
-            "Utestående aktier (milj.)", "Omsättning i år (M)", "Kassa (M)"
-        ] if c in df.columns]
+        show_cols = [c for c in ["Ticker","Bolagsnamn","Kurs","Valuta","P/S",
+                                 "Utestående aktier (milj.)","Omsättning i år (M)","Kassa (M)"] if c in df.columns]
         st.dataframe(df.loc[[row_idx], show_cols] if show_cols else df.loc[[row_idx]], use_container_width=True)
-
     return df

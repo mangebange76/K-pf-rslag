@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+import time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -14,6 +15,7 @@ try:
 except Exception:
     manual_collect_view = None  # type: ignore
 
+# Våra moduler
 from stockapp.sheets import get_ws, ws_read_df, save_dataframe, list_sheet_names
 from stockapp.rates import read_rates, save_rates, DEFAULT_RATES, fetch_live_rates
 from stockapp.fetchers.yahoo import get_all as yahoo_get
@@ -72,10 +74,12 @@ def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
 def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     for i, rad in df.iterrows():
+        # P/S-snitt från manuella Q1..Q4 (om använda)
         ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
         ps_clean = [float(x) for x in ps_vals if float(x) > 0]
         df.at[i, "P/S-snitt"] = round(np.mean(ps_clean), 2) if ps_clean else 0.0
 
+        # P/B-snitt från SEC-kvartal
         pbs = [rad.get("P/B Q1", 0), rad.get("P/B Q2", 0), rad.get("P/B Q3", 0), rad.get("P/B Q4", 0)]
         pb_clean = [float(x) for x in pbs if float(x) > 0]
         df.at[i, "P/B-snitt (Q1..Q4)"] = round(np.mean(pb_clean), 2) if pb_clean else 0.0
@@ -241,6 +245,59 @@ def proposal_table(df: pd.DataFrame, strategy: str,
     tmp = tmp.sort_values(by=["Confidence (%)","Uppsida (%)"], ascending=[False, False])
     return tmp[[c for c in cols if c in tmp.columns]].reset_index(drop=True)
 
+# ---------------- Prisuppdatering (alla) ----------------
+def update_all_prices(df: pd.DataFrame, worksheet_name: str, delay_sec: float = 0.5) -> pd.DataFrame:
+    """Hämtar aktuell kurs (samt namn/valuta/MCAP om tillgängligt) för alla tickers och sparar till Sheets."""
+    if df.empty:
+        st.warning("Ingen data i vyn.")
+        return df
+
+    status = st.empty()
+    bar = st.progress(0.0)
+    total = len(df)
+
+    for i, (idx, row) in enumerate(df.iterrows()):
+        tkr = str(row.get("Ticker", "")).strip()
+        if not tkr:
+            bar.progress((i+1)/total)
+            continue
+
+        try:
+            y = yahoo_get(tkr)  # fetcher
+            price = float(y.get("price") or 0.0)
+
+            # Fallback till senaste stängning via yfinance om price saknas
+            if not price:
+                try:
+                    import yfinance as yf
+                    h = yf.Ticker(tkr).history(period="1d")
+                    if not h.empty and "Close" in h:
+                        price = float(h["Close"].iloc[-1])
+                except Exception:
+                    pass
+
+            if price:
+                df.at[idx, "Aktuell kurs"] = price
+            if y.get("name"):
+                df.at[idx, "Bolagsnamn"] = y["name"]
+            if y.get("currency"):
+                df.at[idx, "Valuta"] = y["currency"]
+            if y.get("market_cap"):
+                df.at[idx, "Market Cap"] = float(y["market_cap"])
+
+        except Exception as e:
+            st.write(f"⚠️ {tkr}: {e}")
+
+        status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
+        bar.progress((i+1)/total)
+        time.sleep(delay_sec)
+
+    # spara och uppdatera sessionen
+    st.session_state["_df_ref"] = df
+    _save_df(df, worksheet_name)
+    st.success("✅ Aktiekurser uppdaterade och sparade till Google Sheets.")
+    return df
+
 # ---------------- Sidopanel ----------------
 with st.sidebar:
     st.header("Google Sheets")
@@ -253,69 +310,63 @@ with st.sidebar:
     idx = blad.index(default_name) if (blad and default_name in blad) else 0
     ws_name = st.selectbox("Välj data-blad:", blad or [default_name], index=idx)
 
-    # Valutakurser
+    # --- Valutakurser ---
     st.markdown("---")
     st.subheader("💱 Valutakurser → SEK")
 
+    # 1) läs sparade från sheet
     rates_saved = read_rates()
-    # Widgets (använder sparade som förval)
-    usd = st.number_input("USD → SEK", value=float(rates_saved.get("USD", DEFAULT_RATES["USD"])), step=0.0001, format="%.6f")
-    nok = st.number_input("NOK → SEK", value=float(rates_saved.get("NOK", DEFAULT_RATES["NOK"])), step=0.0001, format="%.6f")
-    cad = st.number_input("CAD → SEK", value=float(rates_saved.get("CAD", DEFAULT_RATES["CAD"])), step=0.0001, format="%.6f")
-    eur = st.number_input("EUR → SEK", value=float(rates_saved.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
-    current_rates = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
 
-    c1, c2 = st.columns(2)
+    # 2) om vi redan hämtat live denna session – använd dem som förval i fälten
+    pref = st.session_state.get("_live_rates") or rates_saved
+
+    usd = st.number_input("USD → SEK", key="rate_usd", value=float(pref.get("USD", DEFAULT_RATES["USD"])), step=0.0001, format="%.6f")
+    nok = st.number_input("NOK → SEK", key="rate_nok", value=float(pref.get("NOK", DEFAULT_RATES["NOK"])), step=0.0001, format="%.6f")
+    cad = st.number_input("CAD → SEK", key="rate_cad", value=float(pref.get("CAD", DEFAULT_RATES["CAD"])), step=0.0001, format="%.6f")
+    eur = st.number_input("EUR → SEK", key="rate_eur", value=float(pref.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
+
+    def _rates_from_widgets():
+        return {"USD": st.session_state.rate_usd,
+                "NOK": st.session_state.rate_nok,
+                "CAD": st.session_state.rate_cad,
+                "EUR": st.session_state.rate_eur,
+                "SEK": 1.0}
+
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("💾 Spara valutakurser"):
-            save_rates(current_rates)
-            st.success("Valutakurser sparade till Google Sheets.")
-    with c2:
-        if st.button("↻ Läs sparade kurser"):
-            st.cache_data.clear()
-            st.rerun()
-
-    cc1, cc2 = st.columns(2)
-    with cc1:
         if st.button("🌐 Hämta livekurser"):
             try:
                 live = fetch_live_rates()
-                st.session_state["_live_rates_preview"] = live
-                st.success("Livekurser hämtade. Granska nedan och klicka 'Använd & spara' om du vill spara.")
+                # fyll fälten direkt
+                st.session_state.rate_usd = float(live["USD"])
+                st.session_state.rate_nok = float(live["NOK"])
+                st.session_state.rate_cad = float(live["CAD"])
+                st.session_state.rate_eur = float(live["EUR"])
+                st.session_state["_live_rates"] = live
+                st.success("Livekurser inlästa i fälten.")
             except Exception as e:
                 st.error(f"Kunde inte hämta livekurser: {e}")
-    with cc2:
-        if st.button("🌐 Hämta & spara livekurser"):
-            try:
-                live = fetch_live_rates()
-                save_rates(live)
-                st.success("Livekurser hämtade och sparade till Google Sheets.")
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Kunde inte hämta/spara livekurser: {e}")
 
-    # Förhandsvisning av livekurser (utan att spara)
-    if "_live_rates_preview" in st.session_state:
-        st.markdown("**Livekurser (förhandsvisning):**")
-        live = st.session_state["_live_rates_preview"]
-        st.table(
-            pd.DataFrame(
-                [{"Valuta": k, "Kurs (→SEK)": v} for k, v in live.items() if k in ["USD","NOK","CAD","EUR","SEK"]]
-            ).set_index("Valuta")
-        )
-        if st.button("✅ Använd & spara livekurser"):
-            try:
-                save_rates(live)
-                st.success("Livekurser sparade till Google Sheets.")
-                st.session_state.pop("_live_rates_preview", None)
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Kunde inte spara livekurser: {e}")
+    with c2:
+        if st.button("💾 Spara valutakurser"):
+            save_rates(_rates_from_widgets())
+            st.success("Valutakurser sparade till Google Sheets.")
+
+    with c3:
+        if st.button("↻ Läs sparade kurser"):
+            st.session_state.pop("_live_rates", None)
+            st.cache_data.clear()
+            st.rerun()
 
     st.markdown("---")
     use_sec_pb = st.checkbox("Beräkna P/B 4Q via SEC", value=True, help="Hämtar equity & shares per period från SEC och pris från Yahoo.")
+
+    # Force fresh (rensar cache för @st.cache_data)
+    force_fresh = st.checkbox(
+        "Ignorera cache (hämta färskt)",
+        value=False,
+        help="Rensar cache innan uppdatering från Yahoo/SEC."
+    )
 
     if st.button("🔄 Läs in data-bladet"):
         st.session_state["_df_ref"] = _load_df(ws_name)
@@ -333,7 +384,19 @@ with st.sidebar:
         _save_df(st.session_state.get("_df_ref", pd.DataFrame()), ws_name)
 
     st.markdown("---")
+    if st.button("📈 Uppdatera aktiekurser (alla)"):
+        if force_fresh:
+            st.cache_data.clear()
+        df0 = st.session_state.get("_df_ref", pd.DataFrame()).copy()
+        if df0.empty:
+            st.warning("Ingen data i vyn.")
+        else:
+            update_all_prices(df0, ws_name, delay_sec=0.5)
+
     if st.button("🚀 Uppdatera ALLA rader (Yahoo + ev. SEC P/B)"):
+        if force_fresh:
+            st.cache_data.clear()
+
         df0 = st.session_state.get("_df_ref", pd.DataFrame()).copy()
         if df0.empty:
             st.warning("Ingen data i vyn.")
@@ -341,6 +404,7 @@ with st.sidebar:
             status = st.empty()
             bar = st.progress(0.0)
             total = len(df0)
+
             for i, row in df0.iterrows():
                 tkr = str(row.get("Ticker", "")).strip()
                 if not tkr:
@@ -348,9 +412,9 @@ with st.sidebar:
 
                 # --- Yahoo ---
                 y = yahoo_get(tkr)
-                if y.get("name"):      df0.at[i, "Bolagsnamn"] = y["name"]
-                if y.get("currency"):  df0.at[i, "Valuta"] = y["currency"]
-                if y.get("price", 0)>0: df0.at[i, "Aktuell kurs"] = y["price"]
+                if y.get("name"):       df0.at[i, "Bolagsnamn"] = y["name"]
+                if y.get("currency"):   df0.at[i, "Valuta"] = y["currency"]
+                if y.get("price", 0)>0: df0.at[i, "Aktuell kurs"] = float(y["price"])
 
                 sh_out = float(y.get("shares_outstanding") or 0.0)
                 if sh_out > 0: df0.at[i, "Utestående aktier (milj.)"] = sh_out / 1e6
@@ -396,6 +460,7 @@ with st.sidebar:
 
                 status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
                 bar.progress((i+1)/total)
+                time.sleep(0.5)  # snäll paus även här
 
             df0 = update_calculations(df0)
             st.session_state["_df_ref"] = df0
@@ -431,7 +496,7 @@ with tab_port:
         st.info("Ingen data.")
     else:
         rates = read_rates()
-        port = df[df.get("Antal aktier", 0) > 0].copy()
+        port = df[df["Antal aktier"] > 0].copy()
         if port.empty:
             st.info("Du äger inga aktier.")
         else:
@@ -467,7 +532,7 @@ with tab_suggest:
 
         st.markdown("---")
         rates = read_rates()
-        table = proposal_table(
+        base_table = proposal_table(
             df, strategy,
             ps_target=ps_target,
             div_target_yield=div_target,
@@ -475,7 +540,60 @@ with tab_suggest:
             pb_target=pb_target,
             rates=rates
         )
-        if table.empty:
+
+        if base_table.empty:
             st.info("Inget målpris kunde beräknas – saknas nyckeltal för valda bolag/strategi.")
         else:
-            st.dataframe(table, use_container_width=True)
+            # ---- Filter ----
+            st.subheader("Filter")
+            f1, f2, f3 = st.columns([1,1,1])
+
+            only_green = f1.checkbox("Visa endast 🟢 (≥85%)", value=False)
+            min_conf = f2.slider("Min. Confidence (%)", 0, 100, 60, 5)
+            min_up = f3.slider("Min. uppsida (%)", 0.0, 200.0, 10.0, 1.0)
+
+            # Sektor (om kolumnen finns i ursprungstabellen)
+            sector_map = {}
+            if "Sektor" in df.columns:
+                try:
+                    sector_map = df.set_index("Ticker")["Sektor"].astype(str).to_dict()
+                    base_table["Sektor"] = base_table["Ticker"].map(sector_map)
+                    sektorer = sorted([s for s in base_table["Sektor"].dropna().unique() if str(s).strip() != ""])
+                    sel_sektorer = st.multiselect("Sektor", sektorer, default=sektorer)
+                except Exception:
+                    sel_sektorer = []
+            else:
+                sel_sektorer = []
+
+            # Tillämpa filter
+            filt = base_table.copy()
+            if only_green:
+                filt = filt[filt["Confidence (%)"] >= 85]
+            else:
+                filt = filt[filt["Confidence (%)"] >= min_conf]
+
+            filt = filt[filt["Uppsida (%)"] >= min_up]
+
+            if "Sektor" in filt.columns and sel_sektorer:
+                filt = filt[filt["Sektor"].isin(sel_sektorer)]
+
+            filt = filt.reset_index(drop=True)
+
+            st.caption(f"Visar {len(filt)}/{len(base_table)} rader efter filter.")
+            st.dataframe(filt, use_container_width=True)
+
+            st.markdown("---")
+            csave, cdl = st.columns([1,1])
+
+            with csave:
+                if st.button("💾 Spara förslag till Google Sheet"):
+                    try:
+                        sheet_name = f"Förslag-{pd.Timestamp.now().strftime('%Y%m%d-%H%M')}"
+                        save_dataframe(filt, worksheet_name=sheet_name)
+                        st.success(f"Sparat i blad: **{sheet_name}**")
+                    except Exception as e:
+                        st.error(f"Kunde inte spara förslagen: {e}")
+
+            with cdl:
+                csv_bytes = filt.to_csv(index=False).encode("utf-8-sig")
+                st.download_button("⬇️ Ladda ned CSV", data=csv_bytes, file_name="förslag.csv", mime="text/csv")

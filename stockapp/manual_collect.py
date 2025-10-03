@@ -7,28 +7,30 @@ import typing as t
 import pandas as pd
 import streamlit as st
 
-# ── Fetchers (tålbar import) ───────────────────────────────────────────────
+# ── Fetchers ───────────────────────────────────────────────────────────────
 try:
     from .fetchers.yahoo import get_all as yahoo_get_all
 except Exception:
     yahoo_get_all = None  # type: ignore
 
 try:
-    # Vi använder både kompakt och verbose för debug
-    from .fetchers.fmp import get_all as fmp_get_all, get_all_verbose as fmp_get_all_verbose
+    from .fetchers.fmp import (
+        get_all as fmp_get_all,
+        get_all_verbose as fmp_get_all_verbose,
+        format_fetch_summary as fmp_format_summary,
+    )
 except Exception:
     fmp_get_all = None  # type: ignore
     fmp_get_all_verbose = None  # type: ignore
+    fmp_format_summary = lambda s, f, w: "FMP: (ingen formatterare)"
 
 try:
-    from .fetchers.sec import get_all as sec_get_all  # returns dict
+    from .fetchers.sec import get_all as sec_get_all
 except Exception:
     sec_get_all = None  # type: ignore
 
 
-# ── (Valfri) sheets-integration ────────────────────────────────────────────
-# Appen brukar redan ha ett flöde som sparar hela df:et.
-# Men om stockapp.sheets finns, försöker vi spara direkt på knapptryck.
+# ── (Valfri) Sheets-integration ────────────────────────────────────────────
 _sheets_ok = False
 _sheets_save_df = None  # type: ignore
 try:
@@ -36,7 +38,6 @@ try:
     _sheets_ok = True
     _sheets_save_df = save_dataframe
 except Exception:
-    # fallback: ibland heter funktionen annorlunda
     try:
         from .sheets import write_dataframe as save_dataframe  # type: ignore
         _sheets_ok = True
@@ -46,33 +47,31 @@ except Exception:
         _sheets_save_df = None  # type: ignore
 
 
-# ── Konfiguration: fält-prioritet per källa ────────────────────────────────
-# OBS: Namnen här ska matcha dina kolumnrubriker i Google Sheet.
+# ── Fält-prioritet (matchar dina rubriker) ────────────────────────────────
 FIELD_PRIORITY: dict[str, list[str]] = {
     "Kurs": ["yahoo", "fmp", "sec"],
-    "P/S TTM": ["fmp", "yahoo", "sec"],
+    "P/S": ["fmp", "yahoo", "sec"],
+    "Market Cap": ["fmp", "yahoo", "sec"],
     "Market Cap (M)": ["fmp", "yahoo", "sec"],
     "Utestående aktier (milj.)": ["sec", "fmp", "yahoo"],
-    "Omsättning (M)": ["fmp", "sec", "yahoo"],
+    "Omsättning i år (M)": ["fmp", "sec", "yahoo"],
     "Kassa (M)": ["sec", "fmp", "yahoo"],
     "Valuta": ["yahoo", "fmp", "sec"],
     "Bolagsnamn": ["yahoo", "fmp", "sec"],
     "Börs": ["fmp", "yahoo", "sec"],
     "Sektor": ["fmp", "yahoo", "sec"],
-    "Bransch": ["fmp", "yahoo", "sec"],
     "Industri": ["fmp", "yahoo", "sec"],
-    # Lägg fler vid behov…
+    "Bransch": ["fmp", "yahoo", "sec"],
+    # lägg fler vid behov
 }
 
-# Om dina rubriker har synonymer — mappa dem här till en kanonisk nyckel.
 ALIASES: dict[str, str] = {
-    # exempel: "P/S-TTM": "P/S TTM",
+    "P/S TTM": "P/S",
+    "P/S (TTM, modell)": "P/S",
 }
 
-
-# ── Hjälpfunktioner ────────────────────────────────────────────────────────
+# ── Hjälpare ───────────────────────────────────────────────────────────────
 def _canon(field: str) -> str:
-    """Normalisera fältnamn utifrån ALIASES."""
     return ALIASES.get(field, field)
 
 def _is_nan(x: t.Any) -> bool:
@@ -87,9 +86,6 @@ def _count_nonempty(d: dict | None) -> int:
     return sum(1 for _, v in d.items() if _safe(v))
 
 def _pick_value(field: str, yv: dict, fv: dict, sv: dict) -> tuple[t.Any, str | None]:
-    """
-    Returnerar (värde, källa) enligt prioritet per fält.
-    """
     f = _canon(field)
     order = FIELD_PRIORITY.get(f, ["yahoo", "fmp", "sec"])
     for src in order:
@@ -102,69 +98,45 @@ def _pick_value(field: str, yv: dict, fv: dict, sv: dict) -> tuple[t.Any, str | 
     return None, None
 
 def _merge_preview(cur_row: dict, yv: dict, fv: dict, sv: dict) -> pd.DataFrame:
-    """
-    Skapar en tabell med 'Fält', 'Före', 'Efter', 'Källa' för de fält vi kan uppdatera.
-    Visar endast rader där värdet skulle ändras eller där före-värdet är tomt och efter ej tomt.
-    """
-    # Kandidatfält = union av (prioritetstabell + keys som faktiskt kommer från källorna)
     fields: set[str] = set(FIELD_PRIORITY.keys()) | set(yv.keys()) | set(fv.keys()) | set(sv.keys())
     rows: list[dict[str, t.Any]] = []
-
     for field in sorted(fields):
-        field_c = _canon(field)
-        before = cur_row.get(field_c)
-        after, src = _pick_value(field_c, yv, fv, sv)
-
-        # visa bara meningsfulla diffar
+        f = _canon(field)
+        before = cur_row.get(f)
+        after, src = _pick_value(f, yv, fv, sv)
         if _safe(after):
             if not _safe(before) or before != after:
-                rows.append({
-                    "Fält": field_c,
-                    "Före": before,
-                    "Efter": after,
-                    "Källa": src,
-                })
-
+                rows.append({"Fält": f, "Före": before, "Efter": after, "Källa": src})
     if not rows:
         return pd.DataFrame(columns=["Fält", "Före", "Efter", "Källa"])
-    dfp = pd.DataFrame(rows)
-    return dfp[["Fält", "Före", "Efter", "Källa"]]
+    return pd.DataFrame(rows)[["Fält", "Före", "Efter", "Källa"]]
 
 def _apply_merge_to_df(df: pd.DataFrame, row_idx: int, merged_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tar diff-tabellen (Fält/Före/Efter/Källa) och skriver 'Efter' till df på angiven radindex.
-    """
     if merged_df.empty:
         return df
     df2 = df.copy()
     for _, r in merged_df.iterrows():
         col = str(r["Fält"])
         val = r["Efter"]
-        if col in df2.columns:
-            df2.iat[row_idx, df2.columns.get_loc(col)] = val
-        else:
-            # Om kolumn saknas, skapa den (för att inte tappa data)
+        if col not in df2.columns:
             df2[col] = None
-            df2.iat[row_idx, df2.columns.get_loc(col)] = val
+        df2.iat[row_idx, df2.columns.get_loc(col)] = val
     return df2
 
 
 # ── Huvudvy ────────────────────────────────────────────────────────────────
 def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    UI för enskild uppdatering (Yahoo/FMP/SEC) och sparning.
-    Returnerar ev. uppdaterad DataFrame (df) som appen kan fortsätta använda.
-    """
     if df is None or df.empty:
         st.warning("Ingen data att visa.")
         return df
 
-    # Init session state för draft-källor
+    # init draft + diagnostik
     st.session_state.setdefault("draft_yahoo", {})
     st.session_state.setdefault("draft_fmp", {})
     st.session_state.setdefault("draft_sec", {})
+    st.session_state.setdefault("fmp_diag", {"fields": [], "warnings": [], "summary": ""})
 
-    # Välj ticker
+    # hitta ticker-kolumn
     tickers = []
     colname_ticker = None
     for cand in ["Ticker", "ticker", "Symbol", "symbol"]:
@@ -181,7 +153,7 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
     if not selected_ticker:
         return df
 
-    # Plocka aktuell rad
+    # aktuell rad
     mask = df[colname_ticker] == selected_ticker
     if not mask.any():
         st.error(f"Hittade ingen rad med {colname_ticker}='{selected_ticker}'.")
@@ -189,7 +161,7 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
     row_idx = df.index[mask][0]
     cur_row = df.loc[row_idx].to_dict()
 
-    # Knappar
+    # knappar
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("Hämta från Yahoo", use_container_width=True):
@@ -198,16 +170,30 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 try:
                     st.session_state["draft_yahoo"] = yahoo_get_all(selected_ticker) or {}
+                    st.success(f"Yahoo hämtade {len(st.session_state['draft_yahoo'])} fält.")
                 except Exception as e:
                     st.error(f"Fel vid Yahoo-hämtning: {e}")
 
     with col2:
         if st.button("Hämta från FMP", use_container_width=True):
-            if fmp_get_all is None:
+            if fmp_get_all_verbose is None:
                 st.error("FMP-fetchern saknas.")
             else:
                 try:
-                    st.session_state["draft_fmp"] = fmp_get_all(selected_ticker) or {}
+                    mapped, fields, warns = fmp_get_all_verbose(selected_ticker)
+                    st.session_state["draft_fmp"] = mapped or {}
+                    st.session_state["fmp_diag"] = {
+                        "fields": fields or [],
+                        "warnings": warns or [],
+                        "summary": fmp_format_summary("FMP", fields or [], warns or []),
+                    }
+                    if fields:
+                        st.success(f"FMP hämtade {len(fields)} fält: {', '.join(fields)}")
+                    else:
+                        if warns:
+                            st.warning("FMP hämtade 0 fält. " + " | ".join(warns))
+                        else:
+                            st.warning("FMP hämtade 0 fält.")
                 except Exception as e:
                     st.error(f"Fel vid FMP-hämtning: {e}")
 
@@ -218,31 +204,31 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 try:
                     st.session_state["draft_sec"] = sec_get_all(selected_ticker) or {}
+                    st.success(f"SEC hämtade {len(st.session_state['draft_sec'])} fält.")
                 except Exception as e:
                     st.error(f"Fel vid SEC-hämtning: {e}")
 
-    # Summering
+    # summering
     cnt_y = _count_nonempty(st.session_state.get("draft_yahoo"))
     cnt_f = _count_nonempty(st.session_state.get("draft_fmp"))
     cnt_s = _count_nonempty(st.session_state.get("draft_sec"))
     st.markdown(f"**Summering:** Yahoo={cnt_y}, FMP={cnt_f}, SEC={cnt_s}")
 
-    # FMP Debug-expander
-    try:
-        if fmp_get_all_verbose is not None:
-            with st.expander("FMP debug (mappade fält + varningar)"):
-                try:
-                    mapped, fields, warns = fmp_get_all_verbose(selected_ticker)
-                    st.write("Fält som mappas till appen:", fields)
-                    if warns:
-                        st.write("Varningar:", " | ".join(warns))
-                    st.json(mapped)
-                except Exception as e:
-                    st.info(f"FMP debug kunde inte visas: {e}")
-    except Exception:
-        pass
+    # FMP debug – visar senaste diagnostik; gör INTE nya API-anrop
+    with st.expander("FMP debug (mappade fält + varningar)"):
+        diag = st.session_state.get("fmp_diag", {}) or {}
+        fields = diag.get("fields", [])
+        warns = diag.get("warnings", [])
+        summary = diag.get("summary", "")
+        if summary:
+            st.write(summary)
+        if fields:
+            st.write("Fält:", ", ".join(fields))
+        if warns:
+            st.write("Varningar:", " | ".join(warns))
+        st.json(st.session_state.get("draft_fmp", {}))
 
-    # Förhandsgranska
+    # förhandsgranskning
     show_preview = st.button("🔍 Förhandsgranska skillnader")
     preview_df = pd.DataFrame()
     if show_preview:
@@ -257,9 +243,8 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
         else:
             st.dataframe(preview_df, use_container_width=True)
 
-    # Spara
+    # spara
     if st.button("💾 Spara till Google Sheets", use_container_width=True):
-        # Om ingen förhandsvisning renderats, skapa en on-the-fly för att spara rätt
         if preview_df.empty:
             preview_df = _merge_preview(
                 cur_row,
@@ -273,14 +258,13 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
 
         df2 = _apply_merge_to_df(df, row_idx, preview_df)
 
-        # Försök skriva tillbaka med sheets-modulen om den finns,
-        # annars returnerar vi df2 så app.py kan ta vid.
         if _sheets_ok and callable(_sheets_save_df):
             try:
-                _sheets_save_df(df2)  # skriv hela df till Google Sheets
+                _sheets_save_df(df2)
                 st.success("Sparat till Google Sheets.")
             except Exception as e:
                 st.warning(f"Kunde inte spara via sheets-modulen: {e}\nReturnerar uppdaterat df till appen.")
+                # nollställ drafts
                 st.session_state["draft_yahoo"] = {}
                 st.session_state["draft_fmp"] = {}
                 st.session_state["draft_sec"] = {}
@@ -288,17 +272,18 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
         else:
             st.info("Ingen sheets-funktion hittad – returnerar uppdaterat df till appen.")
 
-        # Nollställ drafts efter spar
+        # nollställ drafts efter spar
         st.session_state["draft_yahoo"] = {}
         st.session_state["draft_fmp"] = {}
         st.session_state["draft_sec"] = {}
         return df2
 
-    # Kort visning av aktuell rad
+    # kort vy av aktuell rad
     with st.expander("Visa aktuell rad (kort info)"):
-        show_cols = [c for c in ["Ticker", "Bolagsnamn", "Kurs", "Valuta", "P/S TTM",
-                                 "Utestående aktier (milj.)", "Omsättning (M)", "Kassa (M)"]
-                     if c in df.columns]
+        show_cols = [c for c in [
+            "Ticker", "Bolagsnamn", "Kurs", "Valuta", "P/S",
+            "Utestående aktier (milj.)", "Omsättning i år (M)", "Kassa (M)"
+        ] if c in df.columns]
         st.dataframe(df.loc[[row_idx], show_cols] if show_cols else df.loc[[row_idx]], use_container_width=True)
 
     return df

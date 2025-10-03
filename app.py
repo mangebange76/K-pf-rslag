@@ -1,19 +1,21 @@
 # app.py
 from __future__ import annotations
+
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="K-pf-rslag", layout="wide")
 st.title("K-pf-rslag")
 
-# Importera din vy (om du har den)
+# Din insamlingsvy om du har den (valfritt)
 try:
     from stockapp.manual_collect import manual_collect_view
 except Exception:
     manual_collect_view = None  # type: ignore
 
-# Sheets-helpers (URL-baserad, enligt din gamla app)
+# Sheets-helpers – URL-baserade (matchar din gamla app)
 from stockapp.sheets import get_ws, ws_read_df, save_dataframe, list_sheet_names
+
 
 def _load_df(worksheet_name: str | None) -> pd.DataFrame:
     try:
@@ -23,6 +25,7 @@ def _load_df(worksheet_name: str | None) -> pd.DataFrame:
         st.warning(f"🚫 Kunde inte läsa från Google Sheet: {e}")
         return pd.DataFrame()
 
+
 def _save_df(df: pd.DataFrame, worksheet_name: str | None) -> None:
     try:
         save_dataframe(df, worksheet_name=worksheet_name)
@@ -30,7 +33,8 @@ def _save_df(df: pd.DataFrame, worksheet_name: str | None) -> None:
     except Exception as e:
         st.warning(f"⚠️ Kunde inte spara: {e}")
 
-# Sidopanel: välj blad
+
+# ── Sidopanel: välj blad ───────────────────────────────────────────────────
 with st.sidebar:
     st.header("Google Sheets")
     blad = []
@@ -38,12 +42,15 @@ with st.sidebar:
         blad = list_sheet_names()
     except Exception as e:
         st.info(f"Kunde inte lista blad: {e}")
+
     default_name = st.secrets.get("WORKSHEET_NAME") or "Blad1"
     if blad and default_name in blad:
         idx = blad.index(default_name)
     else:
         idx = 0 if blad else 0
+
     ws_name = st.selectbox("Välj blad:", blad or [default_name], index=idx)
+
     if st.button("🔄 Läs in"):
         st.session_state["_df_ref"] = _load_df(ws_name)
         st.toast(f"Inläst '{ws_name}'", icon="✅")
@@ -59,11 +66,12 @@ with st.sidebar:
     if st.button("💾 Spara vy"):
         _save_df(st.session_state.get("_df_ref", pd.DataFrame()), ws_name)
 
-# Init-läsning
+
+# ── Första inläsning ───────────────────────────────────────────────────────
 if "_df_ref" not in st.session_state:
     st.session_state["_df_ref"] = _load_df(st.secrets.get("WORKSHEET_NAME") or "Blad1")
 
-# Flikar
+# ── Flikar ─────────────────────────────────────────────────────────────────
 tab_data, tab_collect = st.tabs(["📄 Data", "🧩 Manuell insamling"])
 
 with tab_data:

@@ -2,231 +2,212 @@
 """
 stockapp.fetchers.orchestrator
 ------------------------------
-Kör full uppdatering för en ticker genom flera källor i följd:
-1) Yahoo (pris/kapitalisering/kvartals-PS m.m.)
-2) FMP (EV/EBITDA, FCF-yield, Debt/Equity, P/B, sektor/industri/valuta m.m.)
-3) SEC (kompletterande siffror, kassaposter etc.)
+Kör full uppdatering av en ticker i ordningen:
+  1) Yahoo → 2) FMP → 3) SEC (om modul finns)
 
-Strategi:
-- Vi samlar upp dict från varje källa: {nyckel: värde}
-- Mappar till DF-kolumner via _map_to_df_fields(...)
-- Mergeregler: första källa (Yahoo) har prioritet; senare källor fyller luckor.
-- Beräknar P/S-snitt (Q1..Q4) om kvartal finns.
-- Sätter "TS Full" och "Senast uppdaterad källa".
-- Returnerar (df_out, logtext)
+Mergar nyckeltal enligt en tydlig prioritet per fält,
+skriver endast icke-tomma värden, rör INTE manuella prognosfält,
+stämplar TS-kolumner och uppdaterar Risklabel.
+
+Publikt API:
+- run_update_full(df, ticker, user_rates) -> (df_out, logstr)
 """
 
 from __future__ import annotations
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import math
-
-import numpy as np
 import pandas as pd
-import streamlit as st
 
-# Försök importera fetchers; om någon saknas hoppar vi bara över den
+# Källor
+from .yahoo import get_all as yf_get_all
+from .fmp import get_all as fmp_get_all
 try:
-    from .yahoo import get_all_fields as _yahoo_all
-except Exception:  # pragma: no cover
-    _yahoo_all = None  # type: ignore
+    from .sec import get_all as sec_get_all  # valfri
+except Exception:
+    sec_get_all = None  # type: ignore
 
-try:
-    from .fmp import get_all_fields as _fmp_all
-except Exception:  # pragma: no cover
-    _fmp_all = None  # type: ignore
-
-try:
-    from .sec import get_all_fields as _sec_all
-except Exception:  # pragma: no cover
-    _sec_all = None  # type: ignore
-
-# verktyg/konfig
-from ..utils import now_stamp, to_float  # konsekventa helpers
+# App-helpers
 from ..config import FINAL_COLS
+from ..utils import (
+    ensure_schema,
+    now_stamp,
+    to_float,
+    risk_label_from_mcap,
+)
 
-# ------------------------------------------------------------
-# Mapping från käll-nycklar till DF-kolumner
-# ------------------------------------------------------------
-# Vi stödjer både engelska & svenska kolumnnamn där appen använt båda.
-def _map_to_df_fields(src: Dict[str, Any]) -> Dict[str, Any]:
-    """Mappar generiska källnycklar -> dina DF-kolumner."""
+# ---- Fältprioritet (källor i ordning: först som finns vinner) ----------
+#  - Standard: Yahoo → FMP → SEC
+#  - För vissa fält (marginaler/kvoter) är FMP oftast bättre → lyft FMP först.
+FIELD_PRIORITY: Dict[str, List[str]] = {
+    # Bas
+    "Bolagsnamn": ["yahoo", "fmp", "sec"],
+    "Valuta": ["yahoo", "fmp", "sec"],
+    "Kurs": ["yahoo", "fmp", "sec"],
+    "Market Cap": ["yahoo", "fmp", "sec"],
+    "Utestående aktier (milj.)": ["fmp", "yahoo", "sec"],
+
+    # Multiplar & marginaler
+    "EV/EBITDA (ttm)": ["fmp", "yahoo", "sec"],
+    "P/B": ["fmp", "yahoo", "sec"],
+    "P/S": ["fmp", "yahoo", "sec"],
+    "Gross margin (%)": ["fmp", "yahoo", "sec"],
+    "Operating margin (%)": ["fmp", "yahoo", "sec"],
+    "Net margin (%)": ["fmp", "yahoo", "sec"],
+    "ROE (%)": ["fmp", "yahoo", "sec"],
+    "Debt/Equity": ["fmp", "yahoo", "sec"],
+    "Net debt / EBITDA": ["fmp", "sec", "yahoo"],
+    "FCF Yield (%)": ["fmp", "yahoo", "sec"],
+    "Dividend yield (%)": ["fmp", "yahoo", "sec"],
+    "Dividend payout (FCF) (%)": ["fmp", "sec", "yahoo"],
+    "Kassa (M)": ["fmp", "sec", "yahoo"],
+
+    # P/S-kvartal
+    "P/S Q1": ["fmp", "yahoo", "sec"],
+    "P/S Q2": ["fmp", "yahoo", "sec"],
+    "P/S Q3": ["fmp", "yahoo", "sec"],
+    "P/S Q4": ["fmp", "yahoo", "sec"],
+
+    # Klassificering
+    "Sektor": ["fmp", "yahoo", "sec"],
+    "Industri": ["fmp", "yahoo", "sec"],
+}
+
+# Vilka fält vi ALDRIG skriver automatiskt (manuella prognoser)
+MANUAL_FIELDS = {
+    "Omsättning i år (M)",
+    "Omsättning nästa år (M)",
+}
+
+# ----------------------------------------------------------------------
+
+def _non_empty(v: Any) -> bool:
+    """True om v är ett 'sättbart' värde (tillåter 0.0)."""
+    if v is None:
+        return False
+    if isinstance(v, float):
+        if math.isnan(v):
+            return False
+        return True
+    if isinstance(v, str):
+        return v.strip() != ""
+    return True
+
+def _pick_value(key: str, yv: Dict[str, Any], fv: Dict[str, Any], sv: Dict[str, Any]) -> Any:
+    """Välj värde för fält 'key' enligt FIELD_PRIORITY. Fallback: yahoo→fmp→sec."""
+    prio = FIELD_PRIORITY.get(key, ["yahoo", "fmp", "sec"])
+    for src in prio:
+        if src == "yahoo" and _non_empty(yv.get(key)):
+            return yv[key]
+        if src == "fmp" and _non_empty(fv.get(key)):
+            return fv[key]
+        if src == "sec" and sv is not None and _non_empty(sv.get(key)):
+            return sv[key]
+    return None
+
+def _compute_ps_avg(row_like: Dict[str, Any]) -> Optional[float]:
+    """Beräkna P/S-snitt (Q1..Q4) om P/S Q1..Q4 finns i row_like."""
+    qvals: List[float] = []
+    for q in ("P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4"):
+        v = to_float(row_like.get(q, None))
+        if v is not None and not math.isnan(v) and v > 0:
+            qvals.append(float(v))
+    if not qvals:
+        return None
+    return round(sum(qvals) / float(len(qvals)), 4)
+
+def _merge_sources(yv: Dict[str, Any], fv: Dict[str, Any], sv: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Slå ihop fält från källor enligt prioritet; rör inte MANUAL_FIELDS."""
+    keys = set(yv.keys()) | set(fv.keys()) | (set(sv.keys()) if sv else set())
     out: Dict[str, Any] = {}
+    for k in sorted(keys):
+        if k in MANUAL_FIELDS:
+            continue  # manuella fält hoppar vi
+        val = _pick_value(k, yv, fv, (sv or {}))
+        if _non_empty(val):
+            out[k] = val
 
-    # Bas – pris/kapitalisering/antal aktier
-    if "price" in src:
-        out["Kurs"] = to_float(src.get("price"))
-    if "marketCap" in src:
-        out["Market Cap"] = to_float(src.get("marketCap"))
-    if "sharesOutstanding" in src:
-        so = to_float(src.get("sharesOutstanding"))
-        if so is not None and so > 0:
-            # Vi sätter båda nycklarna (med & utan " (milj.)") för kompatibilitet
-            out["Utestående aktier"] = so / 1e6
-            out["Utestående aktier (milj.)"] = so / 1e6
+    # Lägg P/S-snitt (Q1..Q4) om möjliga kvartal finns
+    ps_avg = _compute_ps_avg(out)
+    if ps_avg is not None:
+        out["P/S-snitt (Q1..Q4)"] = ps_avg
 
-    # Valuta
-    if "currency" in src and src.get("currency"):
-        out["Valuta"] = str(src.get("currency")).upper()
+    # Risklabel (om Market Cap finns)
+    mc = to_float(out.get("Market Cap", None))
+    if mc is not None and mc > 0:
+        out["Risklabel"] = risk_label_from_mcap(mc)
 
-    # Sektor/industri – både ENG & SWE
-    if "sector" in src and src.get("sector"):
-        out["Sektor"] = str(src.get("sector"))
-        out["Sector"] = str(src.get("sector"))
-    if "industry" in src and src.get("industry"):
-        out["Industri"] = str(src.get("industry"))
-        out["Industry"] = str(src.get("industry"))
+    return out
 
-    # Multiplar / marginaler
-    if "psTTM" in src:
-        out["P/S"] = to_float(src.get("psTTM"))
-    if "evEbitdaTTM" in src:
-        out["EV/EBITDA (ttm)"] = to_float(src.get("evEbitdaTTM"))
-    if "debtToEquity" in src:
-        out["Debt/Equity"] = to_float(src.get("debtToEquity"))
-    if "pb" in src:
-        out["P/B"] = to_float(src.get("pb"))
-    if "dividendYield" in src:
-        out["Dividend yield (%)"] = to_float(src.get("dividendYield"))
-    if "payoutFCF" in src:
-        out["Dividend payout (FCF) (%)"] = to_float(src.get("payoutFCF"))
-    if "fcfYield" in src:
-        out["FCF Yield (%)"] = to_float(src.get("fcfYield"))
+# ----------------------------------------------------------------------
 
-    # Marginaler – skriv både ENG & SWE där det finns
-    if "grossMargin" in src:
-        gm = to_float(src.get("grossMargin"))
-        out["Gross margin (%)"] = gm
-        out["Bruttomarginal (%)"] = gm
-    if "operatingMargin" in src:
-        om = to_float(src.get("operatingMargin"))
-        out["Operating margin (%)"] = om
-        out["Rörelsemarginal (%)"] = om
-    if "netMargin" in src:
-        nm = to_float(src.get("netMargin"))
-        out["Net margin (%)"] = nm
-        out["Nettomarginal (%)"] = nm
-    if "roe" in src:
-        out["ROE (%)"] = to_float(src.get("roe"))
+def run_update_full(df: pd.DataFrame, ticker: str, user_rates: Dict[str, float]) -> Tuple[pd.DataFrame, str]:
+    """
+    Full uppdatering av en ticker. Returnerar (df_out, logtext).
+    - Hämtar från Yahoo, FMP och SEC (om SEC-modul finns).
+    - Mergar enligt FIELD_PRIORITY.
+    - Stämplar TS-kolumner: 'TS Full' (alltid) och 'TS Kurs' om Kurs ändrades.
+    - Skapar rad om tickern inte finns sedan tidigare.
+    """
+    if df is None:
+        df = pd.DataFrame(columns=FINAL_COLS)
+    df = ensure_schema(df.copy(), FINAL_COLS)
 
-    # Kassaposition – om vi får full valuta, visa även i miljoner
-    if "cashAndEquivalents" in src:
-        cash = to_float(src.get("cashAndEquivalents"))
-        if cash is not None:
-            out["Kassa (M)"] = cash / 1e6
+    tkr = str(ticker).upper().strip()
+    idxs = df.index[df["Ticker"].astype(str).str.upper() == tkr].tolist()
+    if not idxs:
+        # skapa ny rad om den inte finns
+        newrow = {c: None for c in FINAL_COLS}
+        newrow["Ticker"] = tkr
+        df = pd.concat([df, pd.DataFrame([newrow])], ignore_index=True)
+        ridx = df.index[-1]
+    else:
+        ridx = idxs[0]
 
-    # Kvartals-P/S om källa ger psQ1..psQ4
-    for i in (1, 2, 3, 4):
-        key = f"psQ{i}"
-        if key in src:
-            out[f"P/S Q{i}"] = to_float(src.get(key))
+    # Ursprungsvärden (för att upptäcka ändring på Kurs)
+    old_price = to_float(df.at[ridx, "Kurs"]) if "Kurs" in df.columns else None
 
-    return {k: v for k, v in out.items() if v is not None}
+    # -- Hämta källor --
+    yv = yf_get_all(tkr) or {}
+    fv = fmp_get_all(tkr) or {}
+    sv = {}
+    if sec_get_all is not None:
+        try:
+            sv = sec_get_all(tkr) or {}
+        except Exception:
+            sv = {}
 
+    y_count = len([k for k in yv.keys() if not str(k).startswith("__")])
+    f_count = len([k for k in fv.keys() if not str(k).startswith("__")])
+    s_count = len([k for k in sv.keys() if not str(k).startswith("__")]) if sv else 0
 
-def _merge_keep_first(dst: Dict[str, Any], add: Dict[str, Any]) -> None:
-    """Fyll luckor i dst med add, men skriv inte över befintliga (prioritet: tidigare källa)."""
-    for k, v in add.items():
-        if k not in dst or dst[k] is None or (isinstance(dst[k], float) and math.isnan(dst[k])):
-            dst[k] = v
+    merged = _merge_sources(yv, fv, sv)
 
-
-def _compute_ps_avg(payload: Dict[str, Any]) -> None:
-    """Beräkna P/S-snitt (Q1..Q4) om någon eller flera kvartal finns."""
-    qs = [payload.get("P/S Q1"), payload.get("P/S Q2"), payload.get("P/S Q3"), payload.get("P/S Q4")]
-    vals = [float(x) for x in qs if x is not None and not (isinstance(x, float) and math.isnan(x))]
-    if vals:
-        payload["P/S-snitt (Q1..Q4)"] = float(np.mean(vals))
-
-
-def _apply_payload_to_df(df: pd.DataFrame, ticker: str, payload: Dict[str, Any]) -> pd.DataFrame:
-    """Skriv in payload till rätt rad i df; skapa ev. rad om ticker saknas."""
-    if "Ticker" not in df.columns:
-        df["Ticker"] = ""
-    mask = df["Ticker"].astype(str).str.upper() == str(ticker).upper()
-    if not mask.any():
-        # skapa ny rad med FINAL_COLS som stomme
-        base = {c: np.nan for c in FINAL_COLS}
-        base["Ticker"] = ticker
-        df = pd.concat([df, pd.DataFrame([base])], ignore_index=True)
-        mask = df["Ticker"].astype(str).str.upper() == str(ticker).upper()
-
-    idx = df.index[mask][0]
-    for k, v in payload.items():
+    # -- Skriv in i df --
+    changed_fields: List[str] = []
+    for k, v in merged.items():
         if k not in df.columns:
-            # lägg till kolumn on-the-fly
-            df[k] = np.nan
-        df.at[idx, k] = v
+            # lägg inte till nya okända kolumner här; håll oss till FINAL_COLS
+            continue
+        prev = df.at[ridx, k]
+        # sätt om skillnad eller tidigare tomt
+        if (prev is None) or (isinstance(prev, float) and math.isnan(prev)) or (str(prev) != str(v)):
+            df.at[ridx, k] = v
+            changed_fields.append(k)
 
-    # TS Full & källa
-    df.at[idx, "TS Full"] = now_stamp()
-    return df
+    # TS-stämplar
+    now = now_stamp()
+    if "TS Full" in df.columns:
+        df.at[ridx, "TS Full"] = now
 
+    new_price = to_float(df.at[ridx, "Kurs"]) if "Kurs" in df.columns else None
+    if new_price is not None and (old_price is None or float(new_price) != float(old_price)):
+        if "TS Kurs" in df.columns:
+            df.at[ridx, "TS Kurs"] = now
 
-# ------------------------------------------------------------
-# Publikt API
-# ------------------------------------------------------------
-def run_update_full(df: pd.DataFrame, ticker: str, user_rates: Dict[str, float] | None = None) -> Tuple[pd.DataFrame, str]:
-    """
-    Kör full uppdatering för 'ticker' och returnerar (df_out, logstr).
-    - Anropar Yahoo → FMP → SEC.
-    - Mergar data och skriver in i df.
-    """
-    tkr = (ticker or "").upper().strip()
-    if not tkr:
-        return df, "Ingen ticker"
+    # Loggtext
+    upd_n = len(changed_fields)
+    log = f"{tkr}: Yahoo {y_count} fält, FMP {f_count} fält, SEC {s_count} fält → uppdaterade {upd_n} fält."
+    if upd_n > 0:
+        log += " (" + ", ".join(sorted(changed_fields)) + ")"
 
-    payload: Dict[str, Any] = {}
-    used_sources: List[str] = []
-    logs: List[str] = []
-
-    # 1) Yahoo
-    if _yahoo_all is not None:
-        try:
-            y = _yahoo_all(tkr) or {}
-            if y:
-                used_sources.append("Yahoo")
-                mapped = _map_to_df_fields(y)
-                _merge_keep_first(payload, mapped)
-                logs.append(f"Yahoo: {len(mapped)} fält")
-        except Exception as e:
-            logs.append(f"Yahoo: fel {e}")
-
-    # 2) FMP
-    if _fmp_all is not None:
-        try:
-            f = _fmp_all(tkr) or {}
-            if f:
-                used_sources.append("FMP")
-                mapped = _map_to_df_fields(f)
-                _merge_keep_first(payload, mapped)
-                logs.append(f"FMP: {len(mapped)} fält")
-        except Exception as e:
-            logs.append(f"FMP: fel {e}")
-
-    # 3) SEC
-    if _sec_all is not None:
-        try:
-            s = _sec_all(tkr) or {}
-            if s:
-                used_sources.append("SEC")
-                mapped = _map_to_df_fields(s)
-                _merge_keep_first(payload, mapped)
-                logs.append(f"SEC: {len(mapped)} fält")
-        except Exception as e:
-            logs.append(f"SEC: fel {e}")
-
-    # Om inget kom in alls – logga och returnera original
-    if not payload:
-        logs.append("Inga fält från någon källa.")
-        return df, " | ".join(logs)
-
-    # Beräkna P/S-snitt (Q1..Q4) om möjligt
-    _compute_ps_avg(payload)
-
-    # Sätt "Senast uppdaterad källa"
-    if used_sources:
-        payload["Senast uppdaterad källa"] = ",".join(used_sources)
-
-    # Skriv in i DF
-    df2 = _apply_payload_to_df(df.copy(), tkr, payload)
-    return df2, " | ".join(logs)
+    return df, log

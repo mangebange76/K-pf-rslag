@@ -1,6 +1,5 @@
 # app.py
 from __future__ import annotations
-
 import pandas as pd
 import streamlit as st
 
@@ -16,19 +15,13 @@ except Exception as e:
 
 _sheets_ok = True
 try:
-    from stockapp.sheets import (
-        get_ws, ws_read_df, save_dataframe,
-        set_runtime_service_account, set_runtime_sheet,
-        secrets_diagnose,
-    )
+    from stockapp.sheets import get_ws, ws_read_df, save_dataframe
 except Exception as e:
     _sheets_ok = False
+    st.error(f"Kunde inte ladda sheets-modulen: {e}")
     def get_ws(*_, **__): raise RuntimeError(f"Sheets-modulen saknas: {e}")
     def ws_read_df(*_, **__): raise RuntimeError(f"Sheets-modulen saknas: {e}")
     def save_dataframe(*_, **__): raise RuntimeError(f"Sheets-modulen saknas: {e}")
-    def set_runtime_service_account(*_, **__): raise RuntimeError("set_runtime_service_account saknas.")
-    def set_runtime_sheet(*_, **__): raise RuntimeError("set_runtime_sheet saknas.")
-    def secrets_diagnose(): return {"info": "secrets_diagnose saknas i sheets.py."}
 
 try:
     from stockapp.storage import hamta_data  # valfri
@@ -47,10 +40,8 @@ def _load_df_from_sheets() -> pd.DataFrame:
 def _ensure_df_in_state() -> None:
     if "_df_ref" in st.session_state:
         return
-
     df = pd.DataFrame()
-
-    # 1) Försök via storage.hamta_data om den finns (utan truthiness-bugg)
+    # Försök via storage.hamta_data (utan truthiness-bugg)
     if callable(hamta_data):
         try:
             tmp = hamta_data()
@@ -58,11 +49,9 @@ def _ensure_df_in_state() -> None:
                 df = tmp
         except Exception as e:
             st.info(f"Info: hamta_data() misslyckades: {e}")
-
-    # 2) Annars försök Sheets
+    # Annars, Sheets
     if df.empty and _sheets_ok:
         df = _load_df_from_sheets()
-
     st.session_state["_df_ref"] = df
 
 def _save_df_via_sheets(df: pd.DataFrame) -> None:
@@ -75,38 +64,7 @@ def _save_df_via_sheets(df: pd.DataFrame) -> None:
     except Exception as e:
         st.warning(f"⚠️ Kunde inte spara via sheets-modulen: {e}")
 
-# ── Felsökning/override UI ─────────────────────────────────────────────────
-with st.expander("🛠 Google Sheets – felsökning / snabb override"):
-    st.caption("Behövs endast om secrets bråkar – gäller bara nuvarande session.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        sa_text = st.text_area("Klistra in Service Account (JSON / base64 / key=value / Python-dict):", height=160)
-        if st.button("Använd klistrad SA-nyckel"):
-            try:
-                set_runtime_service_account(sa_text)
-                st.success("Service account satt för sessionen ✅")
-            except Exception as e:
-                st.error(f"Kunde inte tolka SA: {e}")
-
-    with c2:
-        sheet_url = st.text_input("Sheet URL eller ID (valfritt – om secrets saknar ID):", value="")
-        ws_name   = st.text_input("Bladnamn (valfritt):", value="")
-        if st.button("Använd Sheet-ID/bladnamn ovan"):
-            try:
-                set_runtime_sheet(sheet_url, ws_name or None)
-                st.success("Sheet-konfiguration satt för sessionen ✅")
-            except Exception as e:
-                st.error(f"Ogiltigt Sheet-ID/URL: {e}")
-
-    if st.button("Visa secrets-nycklar (diagnos)"):
-        try:
-            diag = secrets_diagnose()
-            st.json(diag)  # visar endast nyckelNAMN/struktur – inga hemligheter
-        except Exception as e:
-            st.error(f"Kunde inte hämta diagnos: {e}")
-
-# ── Initiera data ──────────────────────────────────────────────────────────
+# ── Init-data ──────────────────────────────────────────────────────────────
 _ensure_df_in_state()
 
 # ── Sidopanel ──────────────────────────────────────────────────────────────
@@ -148,4 +106,4 @@ with tab_collect:
             st.session_state["_df_ref"] = df_out
             st.success("Vyn returnerade uppdaterat DataFrame – uppdaterade sessionens data.")
 
-st.caption("Build OK • Använd felsökningssektionen ovan om Sheets-strular (klistra SA + Sheet-ID/URL).")
+st.caption("Build OK • Enkel Sheets-koppling (GOOGLE_CREDENTIALS + SPREADSHEET_ID).")

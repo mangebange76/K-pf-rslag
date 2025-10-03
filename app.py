@@ -15,7 +15,7 @@ except Exception:
     manual_collect_view = None  # type: ignore
 
 from stockapp.sheets import get_ws, ws_read_df, save_dataframe, list_sheet_names
-from stockapp.rates import read_rates, save_rates, DEFAULT_RATES
+from stockapp.rates import read_rates, save_rates, DEFAULT_RATES, fetch_live_rates
 from stockapp.fetchers.yahoo import get_all as yahoo_get
 from stockapp.fetchers.sec import get_pb_quarters  # SEC-P/B 4 kvartal
 
@@ -34,7 +34,7 @@ FINAL_COLS = [
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
     "Antal aktier", "CAGR 5 år (%)", "P/S-snitt", "Senast manuellt uppdaterad",
-    # Råfält för EV/EBITDA-strategi (lagras vid Yahoo-uppd.)
+    # Råfält för EV/EBITDA-strategi
     "_y_ev_now", "_y_ebitda_now",
 ]
 
@@ -72,11 +72,10 @@ def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
 def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     for i, rad in df.iterrows():
-        # P/S-snitt (om manuella Q1..Q4 används)
         ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
         ps_clean = [float(x) for x in ps_vals if float(x) > 0]
         df.at[i, "P/S-snitt"] = round(np.mean(ps_clean), 2) if ps_clean else 0.0
-        # P/B-snitt – från SEC-fälten
+
         pbs = [rad.get("P/B Q1", 0), rad.get("P/B Q2", 0), rad.get("P/B Q3", 0), rad.get("P/B Q4", 0)]
         pb_clean = [float(x) for x in pbs if float(x) > 0]
         df.at[i, "P/B-snitt (Q1..Q4)"] = round(np.mean(pb_clean), 2) if pb_clean else 0.0
@@ -257,22 +256,63 @@ with st.sidebar:
     # Valutakurser
     st.markdown("---")
     st.subheader("💱 Valutakurser → SEK")
+
     rates_saved = read_rates()
-    usd = st.number_input("USD → SEK", value=float(rates_saved.get("USD", DEFAULT_RATES["USD"])), step=0.01, format="%.4f")
-    nok = st.number_input("NOK → SEK", value=float(rates_saved.get("NOK", DEFAULT_RATES["NOK"])), step=0.01, format="%.4f")
-    cad = st.number_input("CAD → SEK", value=float(rates_saved.get("CAD", DEFAULT_RATES["CAD"])), step=0.01, format="%.4f")
-    eur = st.number_input("EUR → SEK", value=float(rates_saved.get("EUR", DEFAULT_RATES["EUR"])), step=0.01, format="%.4f")
-    new_rates = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
+    # Widgets (använder sparade som förval)
+    usd = st.number_input("USD → SEK", value=float(rates_saved.get("USD", DEFAULT_RATES["USD"])), step=0.0001, format="%.6f")
+    nok = st.number_input("NOK → SEK", value=float(rates_saved.get("NOK", DEFAULT_RATES["NOK"])), step=0.0001, format="%.6f")
+    cad = st.number_input("CAD → SEK", value=float(rates_saved.get("CAD", DEFAULT_RATES["CAD"])), step=0.0001, format="%.6f")
+    eur = st.number_input("EUR → SEK", value=float(rates_saved.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
+    current_rates = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
+
     c1, c2 = st.columns(2)
     with c1:
         if st.button("💾 Spara valutakurser"):
-            save_rates(new_rates)
-            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
-            st.success("Valutakurser sparade.")
+            save_rates(current_rates)
+            st.success("Valutakurser sparade till Google Sheets.")
     with c2:
         if st.button("↻ Läs sparade kurser"):
             st.cache_data.clear()
             st.rerun()
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        if st.button("🌐 Hämta livekurser"):
+            try:
+                live = fetch_live_rates()
+                st.session_state["_live_rates_preview"] = live
+                st.success("Livekurser hämtade. Granska nedan och klicka 'Använd & spara' om du vill spara.")
+            except Exception as e:
+                st.error(f"Kunde inte hämta livekurser: {e}")
+    with cc2:
+        if st.button("🌐 Hämta & spara livekurser"):
+            try:
+                live = fetch_live_rates()
+                save_rates(live)
+                st.success("Livekurser hämtade och sparade till Google Sheets.")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Kunde inte hämta/spara livekurser: {e}")
+
+    # Förhandsvisning av livekurser (utan att spara)
+    if "_live_rates_preview" in st.session_state:
+        st.markdown("**Livekurser (förhandsvisning):**")
+        live = st.session_state["_live_rates_preview"]
+        st.table(
+            pd.DataFrame(
+                [{"Valuta": k, "Kurs (→SEK)": v} for k, v in live.items() if k in ["USD","NOK","CAD","EUR","SEK"]]
+            ).set_index("Valuta")
+        )
+        if st.button("✅ Använd & spara livekurser"):
+            try:
+                save_rates(live)
+                st.success("Livekurser sparade till Google Sheets.")
+                st.session_state.pop("_live_rates_preview", None)
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Kunde inte spara livekurser: {e}")
 
     st.markdown("---")
     use_sec_pb = st.checkbox("Beräkna P/B 4Q via SEC", value=True, help="Hämtar equity & shares per period från SEC och pris från Yahoo.")

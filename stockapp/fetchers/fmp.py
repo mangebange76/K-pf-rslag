@@ -1,17 +1,17 @@
 # stockapp/fetchers/fmp.py
 """
-FMP fetcher – gratis-endpoints, robust felhantering och tydlig fältmapping.
+FMP fetcher – gratis-endpoints, robust felhantering och kompatibelt API.
 
-Använder *endast* fria endpoints:
+Endast fria endpoints används:
 - /v3/profile/{ticker}
 - /v3/quote/{ticker}
 - /v3/key-metrics-ttm/{ticker}?limit=1
 - /v3/income-statement/{ticker}?period=annual&limit=1
 
-Publika API (kompatibelt med manual_collect.py):
-- get_all(ticker) -> (data: dict, fetched_fields: list[str], warnings: list[str])
-
-Dessutom finns fetch_fmp(ticker) (som get_all anropar).
+Publikt API:
+- get_all(ticker) -> dict                (kompatibel med manual_collect.py)
+- get_all_verbose(ticker) -> (dict, fetched_fields, warnings)
+- format_fetch_summary(source, fetched, warnings) -> str
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ API_VERSION = "v3"
 
 __all__ = [
     "get_all",
+    "get_all_verbose",
     "fetch_fmp",
     "format_fetch_summary",
 ]
@@ -214,9 +215,23 @@ def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
 
 # ── Publikt API (kompatibelt) ──────────────────────────────────────────────
 
-def get_all(ticker: str) -> tuple[dict, list[str], list[str]]:
+def get_all(ticker: str) -> dict:
     """
-    Kompatibel wrapper som används av manual_collect.py
+    Kompatibel funktion för manual_collect.py: returnerar ENBART en dict med fältvärden.
+    Fångar fel internt och returnerar {} istället för att kasta exception.
+    """
+    try:
+        data, _fetched, _warn = fetch_fmp(ticker)
+        # Returnera endast fält-dict så .get funkar i merge-logiken.
+        return data or {}
+    except Exception:
+        # Säkert fallback – ingen krasch i UI.
+        return {}
+
+def get_all_verbose(ticker: str) -> tuple[dict, list[str], list[str]]:
+    """
+    Som fetch_fmp men med stabilt namn för extern loggning i appen.
+    Kastar exceptions vidare.
     """
     return fetch_fmp(ticker)
 

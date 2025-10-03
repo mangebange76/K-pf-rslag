@@ -2,7 +2,5 @@
 from __future__ import annotations
 
 def get_all(ticker: str) -> dict:
-    """
-    SEC-hämtning är inte aktiv i denna bas. Returnera tomt för kompatibilitet.
-    """
+    # Implementeras senare vid behov. Tomt svar är avsett.
     return {}

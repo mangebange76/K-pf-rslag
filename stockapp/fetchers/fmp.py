@@ -1,20 +1,21 @@
 # stockapp/fetchers/fmp.py
 """
-FMP fetcher – fria endpoints + mappning till appens svenska kolumnnamn.
+FMP fetcher – fria endpoints + mappning till appens kolumnnamn.
 
-Endpoints (gratis):
+Gratis-endpoints:
 - /v3/profile/{ticker}
 - /v3/quote/{ticker}
 - /v3/key-metrics-ttm/{ticker}?limit=1
 - /v3/income-statement/{ticker}?period=annual&limit=1
 
 Publikt API:
-- get_all(ticker) -> dict                          (ENBART app-nycklar)
-- get_all_verbose(ticker) -> (dict, list, list)    (app-nycklar, fetched_fields, warnings)
+- get_all(ticker) -> dict               (endast app-nycklar; robust mot fel)
+- get_all_verbose(ticker) -> (dict, list[str], list[str])  (för debug/logg)
 - format_fetch_summary(source, fetched, warnings) -> str
 """
 
 from __future__ import annotations
+
 import os
 import time
 import json
@@ -32,10 +33,12 @@ __all__ = [
 ]
 
 # ── Feltyp ──────────────────────────────────────────────────────────────────
+
 class FMPError(RuntimeError):
     pass
 
 # ── Hjälpare ────────────────────────────────────────────────────────────────
+
 def _get_api_key() -> str:
     key = os.environ.get("FMP_API_KEY")
     if key:
@@ -90,22 +93,19 @@ def _to_millions(x: t.Any) -> t.Optional[float]:
         return None
     return v / 1_000_000.0
 
-def _round4(x: t.Any) -> t.Any:
-    v = _safe_num(x)
-    return round(v, 4) if v is not None else None
+def _round4(v: t.Any) -> t.Any:
+    n = _safe_num(v)
+    return round(n, 4) if n is not None else None
 
-# ── Kärninhämtning ─────────────────────────────────────────────────────────
-def _fetch_raw_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
-    """
-    Hämtar rådata från FMP och returnerar nycklar med FMP-prefix.
-    Return: (raw_dict, fetched_fields, warnings)
-    """
+# ── Inhämtning (rådata) ────────────────────────────────────────────────────
+
+def _fetch_raw(ticker: str) -> tuple[dict, list[str], list[str]]:
     api_key = _get_api_key()
     params = {"apikey": api_key}
 
     raw: dict[str, t.Any] = {}
     fetched: list[str] = []
-    warnings: list[str] = []
+    warns: list[str] = []
 
     symbol = (ticker or "").strip().upper()
     if not symbol:
@@ -116,20 +116,20 @@ def _fetch_raw_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
         resp = _req(_endpoint(f"profile/{symbol}"), params)
         if isinstance(resp, list) and resp:
             p = resp[0]
-            if (n := p.get("companyName") or p.get("company_name")):
-                raw["FMP:Company Name"] = n; fetched.append("FMP:Company Name")
-            if (c := p.get("currency")):
-                raw["FMP:Currency"] = c; fetched.append("FMP:Currency")
-            if (s := p.get("sector")):
-                raw["FMP:Sector"] = s; fetched.append("FMP:Sector")
-            if (i := p.get("industry")):
-                raw["FMP:Industry"] = i; fetched.append("FMP:Industry")
-            if (ex := p.get("exchangeShortName") or p.get("exchange")):
-                raw["FMP:Exchange"] = ex; fetched.append("FMP:Exchange")
+            if (v := p.get("companyName") or p.get("company_name")):
+                raw["FMP:Company Name"] = v; fetched.append("FMP:Company Name")
+            if (v := p.get("currency")):
+                raw["FMP:Currency"] = v; fetched.append("FMP:Currency")
+            if (v := p.get("sector")):
+                raw["FMP:Sector"] = v; fetched.append("FMP:Sector")
+            if (v := p.get("industry")):
+                raw["FMP:Industry"] = v; fetched.append("FMP:Industry")
+            if (v := p.get("exchangeShortName") or p.get("exchange")):
+                raw["FMP:Exchange"] = v; fetched.append("FMP:Exchange")
         else:
-            warnings.append("Profile: inga data (tom lista).")
+            warns.append("Profile: inga data (tom lista).")
     except FMPError as e:
-        warnings.append(f"Profile fel: {e}")
+        warns.append(f"Profile fel: {e}")
 
     # QUOTE
     try:
@@ -140,14 +140,12 @@ def _fetch_raw_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
                 raw["FMP:Price"] = v; fetched.append("FMP:Price")
             if (v := _safe_num(q.get("marketCap"))) is not None:
                 raw["FMP:Market Cap"] = v; fetched.append("FMP:Market Cap")
-            if (v := _safe_num(q.get("changesPercentage"))) is not None:
-                raw["FMP:Change %"] = v; fetched.append("FMP:Change %")
         else:
-            warnings.append("Quote: inga data (tom lista).")
+            warns.append("Quote: inga data (tom lista).")
     except FMPError as e:
-        warnings.append(f"Quote fel: {e}")
+        warns.append(f"Quote fel: {e}")
 
-    # KEY-METRICS TTM
+    # KEY METRICS TTM
     try:
         resp = _req(_endpoint(f"key-metrics-ttm/{symbol}"), params | {"limit": 1})
         if isinstance(resp, list) and resp:
@@ -155,16 +153,14 @@ def _fetch_raw_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
             ps = km.get("priceToSalesRatioTTM") or km.get("priceToSalesTTM")
             if (v := _safe_num(ps)) is not None:
                 raw["FMP:P/S TTM"] = v; fetched.append("FMP:P/S TTM")
-            if (v := _safe_num(km.get("revenuePerShareTTM"))) is not None:
-                raw["FMP:Revenue/Share TTM"] = v; fetched.append("FMP:Revenue/Share TTM")
             if (v := _safe_num(km.get("sharesOutstanding"))) is not None:
                 raw["FMP:Shares Outstanding"] = v; fetched.append("FMP:Shares Outstanding")
         else:
-            warnings.append("Key-metrics TTM: inga data (tom lista).")
+            warns.append("Key-metrics TTM: inga data (tom lista).")
     except FMPError as e:
-        warnings.append(f"Key-metrics TTM fel: {e}")
+        warns.append(f"Key-metrics TTM fel: {e}")
 
-    # INCOME STATEMENT (senaste årsrevenue)
+    # INCOME STATEMENT (senaste års omsättning)
     try:
         resp = _req(_endpoint(f"income-statement/{symbol}"), params | {"period": "annual", "limit": 1})
         if isinstance(resp, list) and resp:
@@ -172,92 +168,95 @@ def _fetch_raw_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
             if (v := _safe_num(inc.get("revenue"))) is not None:
                 raw["FMP:Revenue (Annual)"] = v; fetched.append("FMP:Revenue (Annual)")
         else:
-            warnings.append("Income-statement: inga data (tom lista).")
+            warns.append("Income-statement: inga data (tom lista).")
     except FMPError as e:
-        warnings.append(f"Income-statement fel: {e}")
+        warns.append(f"Income-statement fel: {e}")
 
     # Fallback currency för US-börser
     if "FMP:Currency" not in raw:
         ex = raw.get("FMP:Exchange")
         if isinstance(ex, str) and ex.upper() in {"NASDAQ", "NYSE", "AMEX"}:
             raw["FMP:Currency"] = "USD"
-            warnings.append("Currency saknades i profile – antog USD (US-börs).")
+            warns.append("Currency saknades i profile – antog USD (US-börs).")
 
     if not fetched:
-        warnings.append("FMP returnerade inga fält (kontrollera API-nyckel/plan/kvot).")
+        warns.append("FMP returnerade inga fält (kontrollera API-nyckel/plan/kvot).")
 
-    return raw, fetched, warnings
+    return raw, fetched, warns
 
-# ── Mappning till appens kolumner ──────────────────────────────────────────
-def _map_to_app_fields(raw: dict) -> dict:
+# ── Mappning till dina rubriker ────────────────────────────────────────────
+
+def _map_to_app(raw: dict) -> dict:
     """
-    Konverterar FMP:* nycklar till appens svenska kolumnnamn.
-    Skalning:
-      - Market Cap -> 'Market Cap (M)' i miljoner
-      - Shares Outstanding -> 'Utestående aktier (milj.)' i miljoner
-      - Revenue (Annual) -> 'Omsättning (M)' i miljoner
+    Mappar till DINA kolumner. Lägger även aliasfält för kompatibilitet.
+    Skalning till miljoner där det är rimligt.
     """
-    mapped: dict[str, t.Any] = {}
+    m: dict[str, t.Any] = {}
 
-    # Namn / metadata
+    # Metadata
     if raw.get("FMP:Company Name"):
-        mapped["Bolagsnamn"] = raw["FMP:Company Name"]
+        m["Bolagsnamn"] = raw["FMP:Company Name"]
     if raw.get("FMP:Currency"):
-        mapped["Valuta"] = raw["FMP:Currency"]
+        m["Valuta"] = raw["FMP:Currency"]
     if raw.get("FMP:Exchange"):
-        mapped["Börs"] = raw["FMP:Exchange"]
+        m["Börs"] = raw["FMP:Exchange"]
     if raw.get("FMP:Sector"):
-        mapped["Sektor"] = raw["FMP:Sector"]
+        m["Sektor"] = raw["FMP:Sector"]
     if raw.get("FMP:Industry"):
-        # Kolumnen kan heta 'Bransch' eller 'Industri' i din sheet – exportera båda
-        mapped["Bransch"] = raw["FMP:Industry"]
-        mapped["Industri"] = raw["FMP:Industry"]
+        m["Industri"] = raw["FMP:Industry"]
+        # vissa views använder "Bransch"
+        m["Bransch"] = raw["FMP:Industry"]
 
-    # Pris / marknad
+    # Pris/MCAP
     if (v := _safe_num(raw.get("FMP:Price"))) is not None:
-        mapped["Kurs"] = v
-    if (v := _to_millions(raw.get("FMP:Market Cap"))) is not None:
-        mapped["Market Cap (M)"] = _round4(v)
-        # Ibland har man även en kolumn utan (M); lägg till båda för säkerhets skull
-        mapped["Market Cap"] = raw.get("FMP:Market Cap")
-    if (v := _safe_num(raw.get("FMP:Change %"))) is not None:
-        mapped["Förändring %"] = _round4(v)
+        m["Kurs"] = v
 
-    # Nyckeltal
+    if (v := _safe_num(raw.get("FMP:Market Cap"))) is not None:
+        # Din sheet har "Market Cap" (ej (M) som primär).
+        m["Market Cap"] = v
+        # lägg även en skalerad variant i miljoner (om du har en (M)-kolumn i andra vyer)
+        m["Market Cap (M)"] = _round4(v / 1_000_000.0)
+
+    # P/S
     if (v := _safe_num(raw.get("FMP:P/S TTM"))) is not None:
-        mapped["P/S TTM"] = _round4(v)
-    if (v := _to_millions(raw.get("FMP:Shares Outstanding"))) is not None:
-        mapped["Utestående aktier (milj.)"] = _round4(v)
-    if (v := _to_millions(raw.get("FMP:Revenue (Annual)"))) is not None:
-        mapped["Omsättning (M)"] = _round4(v)
-        # Om du har separata kolumner för 'Omsättning i år (M)'
-        mapped["Omsättning i år (M)"] = _round4(v)
+        # Din kolumn heter "P/S"; lägg även alias "P/S TTM" för bakåtkomp.
+        m["P/S"] = _round4(v)
+        m["P/S TTM"] = _round4(v)
+        m["P/S (TTM, modell)"] = _round4(v)
 
-    return {k: v for k, v in mapped.items() if v is not None}
+    # Shares outstanding (till miljoner)
+    if (v := _to_millions(raw.get("FMP:Shares Outstanding"))) is not None:
+        m["Utestående aktier (milj.)"] = _round4(v)
+        # lägg även TS-kolumn om du använder den i vissa vyer
+        m["TS_Utestående aktier"] = _round4(v)
+
+    # Revenue (senaste års) → "Omsättning i år (M)"
+    if (v := _to_millions(raw.get("FMP:Revenue (Annual)"))) is not None:
+        m["Omsättning i år (M)"] = _round4(v)
+        # vissa kalkyler använder även "TS_Omsättning idag"
+        m["TS_Omsättning idag"] = _round4(v)
+
+    return {k: v for k, v in m.items() if v is not None}
 
 # ── Publikt API ────────────────────────────────────────────────────────────
+
 def get_all(ticker: str) -> dict:
-    """
-    Returnerar ENBART en dict med appens svenska kolumnnamn.
-    Fångar fel och returnerar {} vid problem, så UI inte kraschar.
-    """
+    """Stabil: returnerar endast dict (inga exceptions bubblar upp)."""
     try:
-        raw, _fetched, _warn = _fetch_raw_fmp(ticker)
-        return _map_to_app_fields(raw)
+        raw, _f, _w = _fetch_raw(ticker)
+        return _map_to_app(raw)
     except Exception:
         return {}
 
 def get_all_verbose(ticker: str) -> tuple[dict, list[str], list[str]]:
-    """
-    Som get_all men behåller fetched_fields + warnings för loggning.
-    """
-    raw, fetched, warnings = _fetch_raw_fmp(ticker)
-    mapped = _map_to_app_fields(raw)
-    # Markera vilka fält som faktiskt mappades till appens nycklar
+    """För debug/loggning i UI."""
+    raw, fetched, warns = _fetch_raw(ticker)
+    mapped = _map_to_app(raw)
     mapped_fields = list(mapped.keys())
-    return mapped, mapped_fields, warnings
+    return mapped, mapped_fields, warns
 
 # ── UI-hjälp ───────────────────────────────────────────────────────────────
+
 def format_fetch_summary(source: str, fetched: list[str], warnings: list[str]) -> str:
     parts: list[str] = []
     if fetched:

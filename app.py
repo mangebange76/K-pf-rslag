@@ -1,7 +1,6 @@
 # app.py
 from __future__ import annotations
 
-import math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -30,11 +29,13 @@ FINAL_COLS = [
     "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
     # P/B historik (SEC)
     "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
-    # Kompatibilitet med din äldre modell
+    # Kompatibilitet med äldre modell
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
     "Antal aktier", "CAGR 5 år (%)", "P/S-snitt", "Senast manuellt uppdaterad",
+    # Råfält för EV/EBITDA-strategi (lagras vid Yahoo-uppd.)
+    "_y_ev_now", "_y_ebitda_now",
 ]
 
 NUMERIC_COLS = [
@@ -48,6 +49,7 @@ NUMERIC_COLS = [
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
     "Antal aktier", "CAGR 5 år (%)", "P/S-snitt",
+    "_y_ev_now", "_y_ebitda_now",
 ]
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -70,11 +72,10 @@ def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
 def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     for i, rad in df.iterrows():
-        # P/S-snitt (om de manuella Q1..Q4-fälten används)
+        # P/S-snitt (om manuella Q1..Q4 används)
         ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
         ps_clean = [float(x) for x in ps_vals if float(x) > 0]
         df.at[i, "P/S-snitt"] = round(np.mean(ps_clean), 2) if ps_clean else 0.0
-
         # P/B-snitt – från SEC-fälten
         pbs = [rad.get("P/B Q1", 0), rad.get("P/B Q2", 0), rad.get("P/B Q3", 0), rad.get("P/B Q4", 0)]
         pb_clean = [float(x) for x in pbs if float(x) > 0]
@@ -100,7 +101,7 @@ def _save_df(df: pd.DataFrame, worksheet_name: str | None) -> None:
     except Exception as e:
         st.warning(f"⚠️ Kunde inte spara: {e}")
 
-# ---------------- Hjälp-funktioner för målpris ----------------
+# ---------------- Målpris-hjälpare ----------------
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -139,19 +140,15 @@ def target_price_pb(row: pd.Series, pb_target: float) -> float:
     return pb_target * bvps
 
 def target_price_pb_avg(row: pd.Series) -> float:
-    """Målpris baserat på P/B-snitt (Q1..Q4) från SEC."""
     pb_avg = float(row.get("P/B-snitt (Q1..Q4)", 0.0))
     if pb_avg <= 0:
-        # fallback: snitta explicit om snitt saknas
         vals = [float(row.get(k, 0.0)) for k in ["P/B Q1","P/B Q2","P/B Q3","P/B Q4"] if float(row.get(k,0.0))>0]
         pb_avg = np.mean(vals) if vals else 0.0
     return target_price_pb(row, pb_avg)
 
-# ---------------- Hälsa-check / Confidence ----------------
+# ---------------- Hälsa-check ----------------
 def confidence_for_row(row: pd.Series, strategy: str) -> tuple[int, str]:
-    """Returnerar (confidence%, notes)."""
-    missing = []
-    notes = []
+    missing, notes = [], []
 
     def need(field: str):
         v = row.get(field, None)
@@ -166,7 +163,6 @@ def confidence_for_row(row: pd.Series, strategy: str) -> tuple[int, str]:
     if strategy == "Tillväxt (P/S)":
         req = ["P/S (TTM)","Revenue TTM (M)","Revenue growth (%)","Utestående aktier (milj.)","Aktuell kurs"]
         for f in req: need(f)
-        # bonus/straff
         if float(row.get("Gross margin (%)",0)) <= 0: notes.append("saknar gross margin")
     elif strategy == "Utdelning":
         req = ["Årlig utdelning","Aktuell kurs"]
@@ -203,7 +199,6 @@ def proposal_table(df: pd.DataFrame, strategy: str,
     if df.empty: return pd.DataFrame()
     tmp = df.copy()
 
-    # Targetpris per strategi
     if strategy == "Tillväxt (P/S)":
         tmp["Målpris"] = tmp.apply(lambda r: target_price_growth(r, ps_target), axis=1)
     elif strategy == "Utdelning":
@@ -212,20 +207,17 @@ def proposal_table(df: pd.DataFrame, strategy: str,
         tmp["Målpris"] = tmp.apply(lambda r: target_price_ev_ebitda(r, ev_ebitda_target), axis=1)
     elif strategy == "P/B (4Q-snitt)":
         tmp["Målpris"] = tmp.apply(target_price_pb_avg, axis=1)
-    else:  # "P/B (Finans)"
+    else:
         tmp["Målpris"] = tmp.apply(lambda r: target_price_pb(r, pb_target), axis=1)
 
-    # Uppsida
     tmp["Uppsida (%)"] = np.where(tmp["Aktuell kurs"] > 0,
                                   (tmp["Målpris"] - tmp["Aktuell kurs"]) / tmp["Aktuell kurs"] * 100.0,
                                   0.0)
 
-    # SEK-konvertering
     tmp["Växelkurs"] = tmp["Valuta"].apply(lambda v: rates.get(str(v).upper(), 1.0))
     tmp["Kurs (SEK)"] = (tmp["Aktuell kurs"] * tmp["Växelkurs"]).round(2)
     tmp["Målpris (SEK)"] = (tmp["Målpris"] * tmp["Växelkurs"]).round(2)
 
-    # Confidence / Notes
     conf_list, notes_list = [], []
     for _, r in tmp.iterrows():
         c, n = confidence_for_row(r, strategy)
@@ -234,7 +226,6 @@ def proposal_table(df: pd.DataFrame, strategy: str,
     tmp["Notiser"] = notes_list
     tmp["Hälsa"] = tmp["Confidence (%)"].apply(lambda x: "🟢" if x>=85 else ("🟡" if x>=60 else "🔴"))
 
-    # Relevanta kolumner per strategi
     common = ["Hälsa","Confidence (%)","Notiser","Ticker","Bolagsnamn","Valuta",
               "Aktuell kurs","Kurs (SEK)","Målpris","Målpris (SEK)","Uppsida (%)"]
     if strategy == "Tillväxt (P/S)":
@@ -325,7 +316,6 @@ with st.sidebar:
                 if sh_out > 0: df0.at[i, "Utestående aktier (milj.)"] = sh_out / 1e6
                 if y.get("market_cap", 0)>0: df0.at[i, "Market Cap"] = float(y["market_cap"])
 
-                # Multiplar/nyckeltal
                 for src_key, dst_col in [
                     ("ps_ttm", "P/S (TTM)"),
                     ("pb", "P/B"),
@@ -430,7 +420,6 @@ with tab_suggest:
         st.subheader("Strategi & parametrar")
         c1, c2, c3, c4, c5 = st.columns(5)
         strategy = c1.selectbox("Strategi", ["Tillväxt (P/S)", "Utdelning", "EV/EBITDA", "P/B (Finans)", "P/B (4Q-snitt)"])
-
         ps_target = c2.slider("PS-mål (Tillväxt)", 1.0, 15.0, 6.0, 0.5)
         div_target = c3.slider("Målyield % (Utdelning)", 2.0, 10.0, 4.0, 0.1)
         ev_target = c4.slider("EV/EBITDA-mål", 6.0, 20.0, 12.0, 0.5)

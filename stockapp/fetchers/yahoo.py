@@ -1,235 +1,136 @@
-# -*- coding: utf-8 -*-
-"""
-stockapp.fetchers.yahoo
------------------------
-Robusta Yahoo-funktioner (utan externa paket) via quoteSummary-API:t.
-
-Publikt API:
-- get_live_price(ticker) -> float | None
-- get_all(ticker) -> Dict[str, Any]
-"""
-
+# stockapp/fetchers/yahoo.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
-import requests
-import math
-import time
+import math, typing as t
 
-YF_BASE = "https://query1.finance.yahoo.com/v10/finance/quoteSummary"
+try:
+    import yfinance as yf  # type: ignore
+except Exception as _imp_err:
+    yf = None  # type: ignore
+    _YF_IMPORT_ERR = _imp_err
+else:
+    _YF_IMPORT_ERR = None  # type: ignore
 
-# ---- Hjälpare ---------------------------------------------------------
-
-def _yf_get_json(ticker: str, modules: List[str], timeout: float = 12.0) -> Dict[str, Any]:
-    """
-    Hämtar quoteSummary-json för givna modules.
-    Returnerar {} om fel.
-    """
-    params = {"modules": ",".join(modules)}
-    url = f"{YF_BASE}/{ticker}"
+def _safe_num(x: t.Any) -> t.Optional[float]:
     try:
-        r = requests.get(url, params=params, timeout=timeout)
-        if r.status_code != 200:
-            return {}
-        j = r.json() or {}
-        res = (j.get("quoteSummary") or {}).get("result")
-        if not res or not isinstance(res, list):
-            return {}
-        return res[0] or {}
+        if x is None or (isinstance(x, str) and x.strip() == ""): return None
+        v = float(x)
+        if math.isnan(v) or math.isinf(v): return None
+        return v
+    except Exception:
+        return None
+
+def _to_millions(x: t.Any) -> t.Optional[float]:
+    v = _safe_num(x);  return None if v is None else v / 1_000_000.0
+
+def _round4(v: t.Any) -> t.Any:
+    n = _safe_num(v);  return round(n, 4) if n is not None else None
+
+def _fetch_raw(ticker: str) -> tuple[dict, list[str], list[str]]:
+    raw, fetched, warns = {}, [], []
+    if yf is None:
+        warns.append(f"yfinance saknas: {_YF_IMPORT_ERR}")
+        return raw, fetched, warns
+
+    tkr = yf.Ticker((ticker or '').strip().upper())
+    info: dict[str, t.Any] = {}
+    fast: dict[str, t.Any] = {}
+
+    # fast_info
+    try:
+        fi = getattr(tkr, "fast_info", None)
+        if fi:
+            fast = {k: getattr(fi, k) for k in dir(fi) if not k.startswith("_")}
+    except Exception as e:
+        warns.append(f"fast_info fel: {e}")
+
+    # info
+    try:
+        info = tkr.get_info()
+    except Exception:
+        try:
+            info = tkr.info
+        except Exception as e:
+            warns.append(f"info fel: {e}")
+            info = {}
+
+    price = (_safe_num(fast.get("last_price")) or
+             _safe_num(fast.get("lastTradePrice")) or
+             _safe_num(info.get("currentPrice")) or
+             _safe_num(info.get("regularMarketPrice")))
+    if price is not None:
+        raw["YH:Price"] = price; fetched.append("YH:Price")
+
+    mcap = _safe_num(fast.get("market_cap")) or _safe_num(info.get("marketCap"))
+    if mcap is not None:
+        raw["YH:Market Cap"] = mcap; fetched.append("YH:Market Cap")
+
+    shares = _safe_num(fast.get("shares")) or _safe_num(info.get("sharesOutstanding"))
+    if shares is not None:
+        raw["YH:Shares Outstanding"] = shares; fetched.append("YH:Shares Outstanding")
+
+    currency = info.get("currency") or fast.get("currency")
+    if isinstance(currency, str) and currency:
+        raw["YH:Currency"] = currency; fetched.append("YH:Currency")
+
+    name = info.get("longName") or info.get("shortName")
+    if name: raw["YH:Company Name"] = name; fetched.append("YH:Company Name")
+    if info.get("sector"):   raw["YH:Sector"] = info.get("sector"); fetched.append("YH:Sector")
+    if info.get("industry"): raw["YH:Industry"] = info.get("industry"); fetched.append("YH:Industry")
+
+    rev = (_safe_num(info.get("totalRevenue")) or
+           _safe_num(info.get("trailingAnnualRevenue")))
+    if rev is None:
+        try:
+            fin = tkr.get_income_stmt(freq="annual")
+            for key in ["TotalRevenue","Total Revenue","Total_Revenue","Total revenue","Totalrevenue"]:
+                if key in fin.index:
+                    series = fin.loc[key].astype("float64").dropna()
+                    if not series.empty:
+                        rev = float(series.iloc[-1])
+                    break
+        except Exception as e:
+            warns.append(f"income_stmt fel: {e}")
+    if rev is not None:
+        raw["YH:Revenue (Annual)"] = rev; fetched.append("YH:Revenue (Annual)")
+
+    if not fetched:
+        warns.append("Yahoo returnerade inga fält.")
+    return raw, fetched, warns
+
+def _map_to_app(raw: dict) -> dict:
+    m: dict[str, t.Any] = {}
+    if raw.get("YH:Company Name"): m["Bolagsnamn"] = raw["YH:Company Name"]
+    if raw.get("YH:Currency"):     m["Valuta"] = raw["YH:Currency"]
+    if raw.get("YH:Sector"):       m["Sektor"] = raw["YH:Sector"]
+    if raw.get("YH:Industry"):     m["Industri"] = raw["YH:Industry"]; m["Bransch"] = raw["YH:Industry"]
+
+    if (v := _safe_num(raw.get("YH:Price"))) is not None: m["Kurs"] = v
+    if (v := _safe_num(raw.get("YH:Market Cap"))) is not None:
+        m["Market Cap"] = v; m["Market Cap (M)"] = _round4(v / 1_000_000.0)
+    if (v := _to_millions(raw.get("YH:Shares Outstanding"))) is not None:
+        m["Utestående aktier (milj.)"] = _round4(v); m["TS_Utestående aktier"] = _round4(v)
+    if (v := _to_millions(raw.get("YH:Revenue (Annual)"))) is not None:
+        m["Omsättning i år (M)"] = _round4(v); m["TS_Omsättning idag"] = _round4(v)
+
+    mc = _safe_num(raw.get("YH:Market Cap")); rv = _safe_num(raw.get("YH:Revenue (Annual)"))
+    if mc is not None and rv and rv > 0:
+        ps = mc / rv
+        m["P/S"] = _round4(ps); m["P/S TTM"] = _round4(ps); m["P/S (TTM, modell)"] = _round4(ps)
+
+    return {k: v for k, v in m.items() if v is not None}
+
+def get_all(ticker: str) -> dict:
+    try:
+        raw, _f, _w = _fetch_raw(ticker); return _map_to_app(raw)
     except Exception:
         return {}
 
-def _safe_get(d: Dict[str, Any], path: List[str], default=None):
-    cur = d
-    for p in path:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(p)
-        if cur is None:
-            return default
-    return cur
+def get_all_verbose(ticker: str):
+    raw, fetched, warns = _fetch_raw(ticker)
+    mapped = _map_to_app(raw)
+    return mapped, list(mapped.keys()), warns
 
-def _safe_float(x, default=None):
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-def _as_pct(val) -> Optional[float]:
-    v = _safe_float(val, None)
-    if v is None:
-        return None
-    # Yahoo anger ofta t.ex. dividendYield som 0.0123 (=1.23%)
-    if 0 < v < 1.0:
-        return round(v * 100.0, 2)
-    return round(v, 2)
-
-def _fmt_millions(x: Optional[float]) -> Optional[float]:
-    if x is None:
-        return None
-    try:
-        return float(x) / 1e6
-    except Exception:
-        return None
-
-# ---- Publika funktioner -----------------------------------------------
-
-def get_live_price(ticker: str) -> Optional[float]:
-    """
-    Snabbt pris. Returnerar None om det inte fanns.
-    """
-    data = _yf_get_json(ticker, ["price"])
-    p = _safe_get(data, ["price", "regularMarketPrice", "raw"], None)
-    if p is None:
-        # prova fallback (ibland ligger den i "regularMarketOpen" när stängt)
-        p = _safe_get(data, ["price", "regularMarketPreviousClose", "raw"], None)
-    return _safe_float(p, None)
-
-def _get_quarter_revenues(ticker: str, limit: int = 6) -> List[Tuple[str, float]]:
-    """
-    Hämtar kvartalsintäkter [(date, revenue), ...] från Yahoo.
-    Returnerar max 'limit' senaste.
-    """
-    data = _yf_get_json(ticker, ["incomeStatementHistoryQuarterly"])
-    arr = _safe_get(data, ["incomeStatementHistoryQuarterly", "incomeStatementHistory"], [])
-    out: List[Tuple[str, float]] = []
-    if isinstance(arr, list):
-        for it in arr[:limit]:
-            try:
-                end_date = _safe_get(it, ["endDate", "fmt"], None) or _safe_get(it, ["endDate", "raw"], None)
-                rev = _safe_get(it, ["totalRevenue", "raw"], None)
-                revf = _safe_float(rev, None)
-                if end_date and revf is not None:
-                    out.append((str(end_date), float(revf)))
-            except Exception:
-                pass
-    return out
-
-def get_all(ticker: str) -> Dict[str, Any]:
-    """
-    Komplett hämtning från Yahoo (price, key stats, profile, margins m.m.).
-    Returnerar ett dict med svenska kolumnnamn när möjligt.
-    """
-    # Försök i ett par "omgångar" om nät strular
-    modules = [
-        "price",
-        "summaryDetail",
-        "defaultKeyStatistics",
-        "financialData",
-        "assetProfile",
-        "quoteType",
-    ]
-    data: Dict[str, Any] = {}
-    for attempt in range(2):
-        data = _yf_get_json(ticker, modules)
-        if data:
-            break
-        time.sleep(0.8)
-
-    out: Dict[str, Any] = {}
-    logs: List[str] = []
-
-    # Bas
-    price = _safe_get(data, ["price"], {}) or {}
-    ks = _safe_get(data, ["defaultKeyStatistics"], {}) or {}
-    sd = _safe_get(data, ["summaryDetail"], {}) or {}
-    fin = _safe_get(data, ["financialData"], {}) or {}
-    prof = _safe_get(data, ["assetProfile"], {}) or {}
-    qtype = _safe_get(data, ["quoteType"], {}) or {}
-
-    # Namn, valuta
-    namn = _safe_get(price, ["longName"], None) or _safe_get(price, ["shortName"], None)
-    if namn:
-        out["Bolagsnamn"] = str(namn)
-    val = _safe_get(price, ["currency"], None)
-    if val:
-        out["Valuta"] = str(val)
-
-    # Kurs
-    kurs = _safe_get(price, ["regularMarketPrice", "raw"], None)
-    if kurs is None:
-        kurs = _safe_get(price, ["regularMarketPreviousClose", "raw"], None)
-    if kurs is not None:
-        out["Kurs"] = _safe_float(kurs, None)
-
-    # Market Cap
-    mcap = _safe_get(price, ["marketCap", "raw"], None)
-    if mcap is None:
-        mcap = _safe_get(ks, ["marketCap", "raw"], None)
-    if mcap is not None:
-        out["Market Cap"] = _safe_float(mcap, None)
-
-    # Utestående aktier (milj.)
-    sh = _safe_get(ks, ["sharesOutstanding", "raw"], None)
-    if sh is not None:
-        out["Utestående aktier (milj.)"] = _fmt_millions(_safe_float(sh, None))
-    else:
-        # fallback: mcap/price
-        if out.get("Market Cap") and out.get("Kurs"):
-            try:
-                out["Utestående aktier (milj.)"] = float(out["Market Cap"]) / float(out["Kurs"]) / 1e6
-            except Exception:
-                pass
-
-    # Marginaler & multiplar
-    ps_ttm = _safe_get(sd, ["priceToSalesTrailing12Months", "raw"], None)
-    if ps_ttm is not None:
-        out["P/S"] = _safe_float(ps_ttm, None)
-
-    ev_ebitda = _safe_get(ks, ["enterpriseToEbitda", "raw"], None)
-    if ev_ebitda is not None:
-        out["EV/EBITDA (ttm)"] = _safe_float(ev_ebitda, None)
-
-    pb = _safe_get(ks, ["priceToBook", "raw"], None)
-    if pb is not None:
-        out["P/B"] = _safe_float(pb, None)
-
-    gm = _safe_get(fin, ["grossMargins", "raw"], None)
-    if gm is not None:
-        out["Gross margin (%)"] = _as_pct(gm)
-
-    opm = _safe_get(fin, ["operatingMargins", "raw"], None)
-    if opm is not None:
-        out["Operating margin (%)"] = _as_pct(opm)
-
-    nm = _safe_get(fin, ["profitMargins", "raw"], None)
-    if nm is not None:
-        out["Net margin (%)"] = _as_pct(nm)
-
-    dy = _safe_get(sd, ["dividendYield", "raw"], None)
-    if dy is not None:
-        out["Dividend yield (%)"] = _as_pct(dy)
-
-    # Sektor/Industri
-    sector = _safe_get(prof, ["sector"], None)
-    if sector:
-        out["Sektor"] = str(sector)
-    industry = _safe_get(prof, ["industry"], None)
-    if industry:
-        out["Industri"] = str(industry)
-
-    # Kvartalsintäkter (för att kunna fylla P/S Q1..Q4 rudimentärt)
-    # OBS: Detta är "per kvartal" revenue; om du vill P/S per kvartal kan man
-    # dela MarketCap med just den kvartalets revenue (inte helt standardiserat).
-    try:
-        revs = _get_quarter_revenues(ticker, limit=4)  # [(date, rev), ...], senaste först
-        if revs and out.get("Market Cap"):
-            m = float(out["Market Cap"])
-            # Sortera senaste först → Q1 = senaste
-            # Vi returnerar P/S Q1..Q4 på denna approximativa metod
-            if len(revs) > 0 and revs[0][1] > 0:
-                out["P/S Q1"] = float(m / float(revs[0][1]))
-            if len(revs) > 1 and revs[1][1] > 0:
-                out["P/S Q2"] = float(m / float(revs[1][1]))
-            if len(revs) > 2 and revs[2][1] > 0:
-                out["P/S Q3"] = float(m / float(revs[2][1]))
-            if len(revs) > 3 and revs[3][1] > 0:
-                out["P/S Q4"] = float(m / float(revs[3][1]))
-    except Exception:
-        pass
-
-    # Liten logg
-    out["__yahoo_fields__"] = len([k for k in out.keys() if not k.startswith("__")])
-
-    return out
+def format_fetch_summary(source: str, fetched: list[str], warnings: list[str]) -> str:
+    parts = [f"{source}: Hämtade {len(fetched)} fält." if fetched else f"{source}: Hämtade 0 fält."]
+    if warnings: parts.append("Varningar: " + " | ".join(warnings))
+    return " ".join(parts)

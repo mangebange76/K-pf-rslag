@@ -1,222 +1,225 @@
-# -*- coding: utf-8 -*-
+# stockapp/fetchers/fmp.py
 """
-stockapp.fetchers.fmp
----------------------
-Hämtar nyckeltal från Financial Modeling Prep.
+FMP fetcher – gratis-endpoints, robust felhantering och tydlig fältmapping.
 
-Publik funktion:
-- get_all(ticker: str) -> dict
+Hämtar bara från öppna (free) endpoints:
+- /v3/profile/{ticker}
+- /v3/quote/{ticker}
+- /v3/key-metrics-ttm/{ticker}?limit=1
+- /v3/income-statement/{ticker}?period=annual&limit=1
 
-Behöver:
-- st.secrets["FMP_API_KEY"] (obligatorisk)
-Valfritt:
-- st.secrets["FMP_BASE"] (default https://financialmodelingprep.com/api/v3)
+Returnerar (dict, fetched_fields:list[str], warnings:list[str]).
 """
 
 from __future__ import annotations
-from typing import Any, Dict, Optional, List
+import os
 import time
+import json
 import math
+import typing as t
 import requests
-import streamlit as st
 
+DEFAULT_BASE = "https://financialmodelingprep.com/api"
+API_VERSION = "v3"
 
-def _base() -> str:
-    b = str(st.secrets.get("FMP_BASE", "")).strip()
-    return b or "https://financialmodelingprep.com/api/v3"
+# ---- Hjälpare --------------------------------------------------------------
 
+class FMPError(RuntimeError):
+    pass
 
-def _api_key() -> str:
-    return str(st.secrets.get("FMP_API_KEY", "")).strip()
-
-
-def _get(url: str, params: Optional[Dict[str, Any]] = None, tries: int = 3, sleep_s: float = 0.7):
-    if params is None:
-        params = {}
-    ak = _api_key()
-    if not ak:
-        return None
-    params = {**params, "apikey": ak}
-    for i in range(tries):
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            if r.status_code == 200:
-                return r.json()
-            time.sleep(sleep_s * (i + 1))
-        except Exception:
-            time.sleep(sleep_s * (i + 1))
-    return None
-
-
-def _to_float(x, default=None):
+def _get_api_key() -> str:
+    # Försök läsa från miljövariabel först; fall tillbaka till Streamlit secrets om möjligt.
+    key = os.environ.get("FMP_API_KEY")
+    if key:
+        return key
     try:
-        if x is None:
-            return default
-        return float(x)
+        import streamlit as st  # type: ignore
+        return st.secrets["FMP_API_KEY"]
     except Exception:
-        return default
+        pass
+    raise FMPError("FMP_API_KEY saknas. Lägg in den i miljövariabler eller st.secrets.")
 
-
-def _to_millions(x) -> Optional[float]:
-    v = _to_float(x, None)
-    if v is None:
-        return None
-    return round(v / 1e6, 3)
-
-
-def _pick_latest(arr, *keys):
-    """Plocka första nyckel som finns i dict/list-svar."""
-    if not arr:
-        return None
-    d = arr[0] if isinstance(arr, list) else arr
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return None
-
-
-def get_all(ticker: str) -> Dict[str, Any]:
-    """
-    Returnerar ett dict med de fält vi hittar för tickern.
-    Mappar till våra svenska kolumnnamn.
-    """
-    out: Dict[str, Any] = {}
-    t = str(ticker or "").upper().strip()
-    if not t:
-        return out
-    if not _api_key():
-        # ingen API-nyckel => inget att göra
-        return out
-
-    base = _base()
-
-    # --------- PROFILE (namn, sektor, industri, valuta)
-    prof = _get(f"{base}/profile/{t}")
-    if isinstance(prof, list) and prof:
-        p0 = prof[0]
-        name = p0.get("companyName") or p0.get("company-name")
-        if name:
-            out["Bolagsnamn"] = name
-        sector = p0.get("sector") or p0.get("sectorName")
-        if sector:
-            out["Sektor"] = sector
-        industry = p0.get("industry") or p0.get("industryName")
-        if industry:
-            out["Industri"] = industry
-        ccy = p0.get("currency")
-        if ccy:
-            out["Valuta"] = ccy
-
-    # --------- QUOTE (kurs, market cap, P/S ttm, P/B, utdelning)
-    quote = _get(f"{base}/quote/{t}")
-    if isinstance(quote, list) and quote:
-        q0 = quote[0]
-        price = _to_float(q0.get("price"))
-        if price:
-            out["Kurs"] = price
-        mcap = _to_float(q0.get("marketCap"))
-        if mcap:
-            out["Market Cap"] = mcap  # i bolagets valuta
-        ps_ttm = _to_float(q0.get("priceToSalesTrailing12Months"))
-        if ps_ttm is not None:
-            out["P/S"] = ps_ttm
-        pb = _to_float(q0.get("priceToBook"))
-        if pb is not None:
-            out["P/B"] = pb
-        dy = _to_float(q0.get("trailingAnnualDividendYield"))
-        if dy is not None and dy > 0:
-            out["Dividend yield (%)"] = round(dy * 100.0, 2)
-
-        # vissa svar har sharesOutstanding här
-        sh = _to_float(q0.get("sharesOutstanding"))
-        if sh and sh > 0:
-            out["Utestående aktier (milj.)"] = round(sh / 1e6, 3)
-
-    # --------- RATIOS TTM (marginaler, ROE, D/E)
-    ratios = _get(f"{base}/ratios-ttm/{t}")
-    if isinstance(ratios, list) and ratios:
-        r0 = ratios[0]
-        gm = _to_float(r0.get("grossProfitMarginTTM"))
-        if gm is not None:
-            out["Gross margin (%)"] = round(gm * 100.0, 2)
-        om = _to_float(r0.get("operatingProfitMarginTTM"))
-        if om is not None:
-            out["Operating margin (%)"] = round(om * 100.0, 2)
-        nm = _to_float(r0.get("netProfitMarginTTM"))
-        if nm is not None:
-            out["Net margin (%)"] = round(nm * 100.0, 2)
-        roe = _to_float(r0.get("returnOnEquityTTM"))
-        if roe is not None:
-            out["ROE (%)"] = round(roe * 100.0, 2)
-        de = _to_float(r0.get("debtEquityRatioTTM"))
-        if de is not None:
-            out["Debt/Equity"] = de
-
-        dy2 = _to_float(r0.get("dividendYieldTTM"))
-        if dy2 is not None and dy2 > 0:
-            out["Dividend yield (%)"] = round(dy2 * 100.0, 2)
-
-        payout = _to_float(r0.get("payoutRatioTTM"))
-        # payoutRatioTTM är ofta på EPS-basis – vi visar den som % om den är rimlig
-        if payout is not None and payout >= 0:
-            out["Dividend payout (FCF) (%)"] = round(payout * 100.0, 2)
-
-    # --------- KEY METRICS TTM (EV/EBITDA, FCF Yield, P/B ibland)
-    km = _get(f"{base}/key-metrics-ttm/{t}")
-    if isinstance(km, list) and km:
-        k0 = km[0]
-        ev_eb = _to_float(k0.get("enterpriseValueOverEBITDATTM") or k0.get("enterpriseValueOverEBITDA"))
-        if ev_eb is not None and ev_eb > 0:
-            out["EV/EBITDA (ttm)"] = ev_eb
-        fcfy = _to_float(k0.get("freeCashFlowYieldTTM"))
-        if fcfy is not None:
-            out["FCF Yield (%)"] = round(fcfy * 100.0, 2)
-        pb2 = _to_float(k0.get("priceToBookRatioTTM"))
-        if pb2 is not None:
-            out["P/B"] = pb2
-
-    # --------- Income statement (senaste års omsättning)
-    inc = _get(f"{base}/income-statement/{t}", params={"limit": 1})
-    if isinstance(inc, list) and inc:
-        rev = _to_float(inc[0].get("revenue"))
-        if rev is not None:
-            out["Omsättning i år (M)"] = _to_millions(rev)
-
-    # --------- Balance sheet (cash, shares) – ibland bättre källor än quote
-    bs = _get(f"{base}/balance-sheet-statement/{t}", params={"limit": 1})
-    if isinstance(bs, list) and bs:
-        cash = _to_float(bs[0].get("cashAndCashEquivalents"))
-        if cash is not None:
-            out["Kassa (M)"] = _to_millions(cash)
-        sh2 = _to_float(bs[0].get("commonStockSharesOutstanding"))
-        if (sh2 is not None) and sh2 > 0:
-            out["Utestående aktier (milj.)"] = round(sh2 / 1e6, 3)
-
-    # --------- Cash flow (Free Cash Flow) – för ev. härledd FCF Yield (om market cap finns)
-    cf = _get(f"{base}/cash-flow-statement/{t}", params={"limit": 1})
-    if isinstance(cf, list) and cf:
-        fcf = _to_float(cf[0].get("freeCashFlow"))
-        if fcf is not None:
-            out["FCF (M)"] = _to_millions(fcf)
-            if "Market Cap" in out and out["Market Cap"]:
-                try:
-                    fcfy_calc = (fcf / float(out["Market Cap"])) * 100.0
-                    # Om vi saknade FCF Yield från metrics kan vi härleda en grov
-                    if "FCF Yield (%)" not in out and not math.isnan(fcfy_calc):
-                        out["FCF Yield (%)"] = round(fcfy_calc, 2)
-                except Exception:
-                    pass
-
-    # Filtrera bort None/NaN
-    clean: Dict[str, Any] = {}
-    for k, v in out.items():
+def _req(url: str, params: dict[str, t.Any], max_retries: int = 3, timeout: int = 20) -> t.Any:
+    """GET med enkel backoff och särskild hantering för 402/429."""
+    backoff = 1.2
+    last_err = None
+    for attempt in range(1, max_retries + 1):
         try:
-            if v is None:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 402:
+                # Premium endpoint – förklara tydligt vad som hände.
+                raise FMPError("FMP svarade 402 (Premium Endpoint). Byt endpoint eller uppgradera plan.")
+            if r.status_code == 429:
+                # Rate limit – backoff och försök igen
+                time.sleep(backoff * attempt)
                 continue
-            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                continue
-            clean[k] = v
-        except Exception:
-            continue
+            r.raise_for_status()
+            # FMP returnerar ofta tomma listor [] vid “no data”.
+            try:
+                return r.json()
+            except json.JSONDecodeError:
+                raise FMPError(f"Kunde inte tolka JSON från {url}")
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff * attempt)
+    # Sista försöket misslyckades
+    if isinstance(last_err, FMPError):
+        raise last_err
+    raise FMPError(str(last_err) if last_err else "Okänt fel mot FMP")
 
-    return clean
+def _endpoint(path: str) -> str:
+    return f"{DEFAULT_BASE}/{API_VERSION}/{path.lstrip('/')}"
+
+def _safe_num(x: t.Any) -> t.Optional[float]:
+    try:
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return None
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+# ---- Publika funktioner ----------------------------------------------------
+
+def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
+    """
+    Hämtar data för givna 'ticker' från FMP gratis-endpoints.
+    Returnerar: (data_dict, fetched_fields, warnings)
+    """
+    api_key = _get_api_key()
+    params = {"apikey": api_key}
+
+    data: dict[str, t.Any] = {}
+    fetched: list[str] = []
+    warnings: list[str] = []
+
+    # Normalisera ticker (NVDA ska vara NVDA)
+    symbol = (ticker or "").strip().upper()
+    if not symbol:
+        return {}, [], ["Tom ticker"]
+
+    # 1) PROFILE – namn, valuta (ibland), sektor/industri m.m.
+    try:
+        resp = _req(_endpoint(f"profile/{symbol}"), params)
+        if isinstance(resp, list) and resp:
+            prof = resp[0]
+            name = prof.get("companyName") or prof.get("company_name")
+            currency = prof.get("currency")  # kan vara None
+            sector = prof.get("sector")
+            industry = prof.get("industry")
+            exchange = prof.get("exchangeShortName") or prof.get("exchange")
+
+            if name:
+                data["FMP:Company Name"] = name
+                fetched.append("FMP:Company Name")
+            if currency:
+                data["FMP:Currency"] = currency
+                fetched.append("FMP:Currency")
+            if sector:
+                data["FMP:Sector"] = sector
+                fetched.append("FMP:Sector")
+            if industry:
+                data["FMP:Industry"] = industry
+                fetched.append("FMP:Industry")
+            if exchange:
+                data["FMP:Exchange"] = exchange
+                fetched.append("FMP:Exchange")
+        else:
+            warnings.append("Profile: inga data (tom lista)")
+    except FMPError as e:
+        warnings.append(f"Profile fel: {e}")
+
+    # 2) QUOTE – pris, market cap etc (gratis)
+    try:
+        resp = _req(_endpoint(f"quote/{symbol}"), params)
+        if isinstance(resp, list) and resp:
+            q = resp[0]
+            price = _safe_num(q.get("price"))
+            market_cap = _safe_num(q.get("marketCap"))
+            changes_pct = _safe_num(q.get("changesPercentage"))
+
+            if price is not None:
+                data["FMP:Price"] = price
+                fetched.append("FMP:Price")
+            if market_cap is not None:
+                data["FMP:Market Cap"] = market_cap
+                fetched.append("FMP:Market Cap")
+            if changes_pct is not None:
+                data["FMP:Change %"] = changes_pct
+                fetched.append("FMP:Change %")
+        else:
+            warnings.append("Quote: inga data (tom lista)")
+    except FMPError as e:
+        warnings.append(f"Quote fel: {e}")
+
+    # 3) KEY METRICS TTM – P/S TTM, revenue per share TTM, shares outstanding (ibland)
+    try:
+        resp = _req(_endpoint(f"key-metrics-ttm/{symbol}"), params | {"limit": 1})
+        if isinstance(resp, list) and resp:
+            km = resp[0]
+            ps_ttm = _safe_num(km.get("priceToSalesRatioTTM") or km.get("priceToSalesTTM"))
+            rps_ttm = _safe_num(km.get("revenuePerShareTTM"))
+            shares = _safe_num(km.get("sharesOutstanding"))
+
+            if ps_ttm is not None:
+                data["FMP:P/S TTM"] = ps_ttm
+                fetched.append("FMP:P/S TTM")
+            if rps_ttm is not None:
+                data["FMP:Revenue/Share TTM"] = rps_ttm
+                fetched.append("FMP:Revenue/Share TTM")
+            if shares is not None:
+                data["FMP:Shares Outstanding"] = shares
+                fetched.append("FMP:Shares Outstanding")
+        else:
+            warnings.append("Key-metrics TTM: inga data (tom lista)")
+    except FMPError as e:
+        # Vissa konton får 402 här – då noterar vi det och går vidare.
+        warnings.append(f"Key-metrics TTM fel: {e}")
+
+    # 4) INCOME STATEMENT – revenue (TTM saknas ofta på free; tar senaste års-värde)
+    try:
+        resp = _req(_endpoint(f"income-statement/{symbol}"), params | {"period": "annual", "limit": 1})
+        if isinstance(resp, list) and resp:
+            inc = resp[0]
+            revenue = _safe_num(inc.get("revenue"))
+            if revenue is not None:
+                data["FMP:Revenue (Annual)"] = revenue
+                fetched.append("FMP:Revenue (Annual)")
+        else:
+            warnings.append("Income-statement: inga data (tom lista)")
+    except FMPError as e:
+        warnings.append(f"Income-statement fel: {e}")
+
+    # Sanity: Om vi inte fick currency från profile, gissa USD för US-exchanges (bättre än blankt)
+    if "FMP:Currency" not in data:
+        ex = data.get("FMP:Exchange")
+        if isinstance(ex, str) and ex.upper() in {"NASDAQ", "NYSE", "AMEX"}:
+            data["FMP:Currency"] = "USD"
+            warnings.append("Currency saknades i profile – antog USD (US-börs).")
+
+    # Särskilt fall: Om *allt* blev 0 fält – ge tydlig varning
+    if not fetched:
+        warnings.append(
+            "FMP returnerade inga fält. Vanliga orsaker: saknad/fel API-nyckel, 402 (premium-endpoint), eller tomma svar."
+        )
+
+    return data, fetched, warnings
+
+
+# ---- Hjälpfunktion för UI-loggning ----------------------------------------
+
+def format_fetch_summary(source: str, fetched: list[str], warnings: list[str]) -> str:
+    """
+    Gör en läsbar summering till UI-loggen, ex:
+    'FMP: Hämtade 3 fält: FMP:Price, FMP:Market Cap, FMP:P/S TTM. Varningar: …'
+    """
+    parts: list[str] = []
+    if fetched:
+        parts.append(f"{source}: Hämtade {len(fetched)} fält: " + ", ".join(fetched) + ".")
+    else:
+        parts.append(f"{source}: Hämtade 0 fält.")
+    if warnings:
+        parts.append("Varningar: " + " | ".join(warnings))
+    return " ".join(parts)

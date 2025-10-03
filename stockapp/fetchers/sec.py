@@ -2,339 +2,187 @@
 """
 stockapp.fetchers.sec
 ---------------------
-Hämtar kvartals-/årsdata från SEC (data.sec.gov) och härleder nyckeltal.
+Hämtar utvalda fält från SEC/EDGAR Company Facts API.
 
-Returnerar ett dict med KÄLLNYCKLAR som vår orkestrator förstår:
-- sharesOutstanding            (CommonStockSharesOutstanding, instant)
-- cash                         (CashAndCashEquivalents*, instant)
-- grossMargin (%)             = GrossProfitTTM / RevenueTTM * 100
-- operatingMargin (%)         = OperatingIncomeTTM / RevenueTTM * 100
-- netMargin (%)               = NetIncomeTTM / RevenueTTM * 100
-- roe (%)                     = NetIncomeTTM / Avg(Equity Instants) * 100  (fallback: senaste equity)
-- debtToEquity                = (ShortTermDebt + CurrentPortionLTD + LongTermDebt) / StockholdersEquity
-- netDebtToEbitda             = (TotalDebt - Cash) / EBITDA_TTM
+Offentliga funktioner:
+- get_all(ticker: str) -> dict
 
-Dessutom returneras underlag (om tillgängligt):
-- revenueTTM, grossProfitTTM, operatingIncomeTTM, netIncomeTTM
-- ebitdaTTM, equity (instant), totalDebt (instant)
+Returnerar ett dict med nycklar där data fanns, t.ex.:
+{
+  "Kassa (M)": 1234.5,
+  "Utestående aktier (milj.)": 2500.0,
+  "Net debt / EBITDA": 1.8
+}
 
-OBS:
-- SEC tillhandahåller inte pris/marketCap → lämnas tomt här (fylls av Yahoo/FMP).
-- Valuta antas USD (SEC-filings). 'currency' sätts till "USD" om något returneras.
+Kräver nätverkstillgång och en giltig SEC_USER_AGENT i st.secrets.
 """
 
 from __future__ import annotations
-from typing import Dict, Any, Optional, List, Tuple
-import math
+from typing import Any, Dict, Optional, Tuple, List
 import time
-import json
-
+import math
 import requests
 import streamlit as st
 
+# --------------------------------------------
+# SEC headers & enkel backoff
+# --------------------------------------------
+def _sec_headers() -> Dict[str, str]:
+    # SEC kräver tydlig UA med kontaktuppgift
+    ua = st.secrets.get("SEC_USER_AGENT", "").strip()
+    if not ua:
+        # Fallback – funkar ofta, men sätt gärna SEC_USER_AGENT i secrets!
+        ua = "StockApp/1.0 (contact: please-set-SEC_USER_AGENT-in-secrets@example.com)"
+    return {
+        "User-Agent": ua,
+        "Accept": "application/json",
+    }
 
-# ------------------------------------------------------------
-# Konfiguration
-# ------------------------------------------------------------
-_SEC_UA = st.secrets.get("SEC_USER_AGENT", "contact@example.com")
-_SEC_BASE = "https://data.sec.gov"
-_TICKERS_INDEX = "https://www.sec.gov/files/company_tickers.json"
-
-_HEADERS = {
-    "User-Agent": _SEC_UA,
-    "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov",
-}
-
-
-# ------------------------------------------------------------
-# Hjälpare
-# ------------------------------------------------------------
-def _to_float(x, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if x is None or (isinstance(x, str) and not x.strip()):
-            return default
-        v = float(x)
-        if math.isnan(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-def _pick_unit(units: Dict[str, list], prefer: str = "USD") -> Optional[List[dict]]:
-    """
-    Välj en lista av datapunkter för given valuta ('USD' eller liknande).
-    Faller tillbaka på första nyckeln om USD saknas.
-    """
-    if not isinstance(units, dict):
-        return None
-    if prefer in units:
-        return units.get(prefer) or None
-    # fallback: ta första nyckeln
-    for k, v in units.items():
-        if isinstance(v, list):
-            return v
+def _get_json(url: str, params: Optional[Dict[str, Any]] = None, tries: int = 3, sleep_s: float = 0.8) -> Optional[Dict[str, Any]]:
+    headers = _sec_headers()
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            # 429/403 etc – vänta och försök igen
+            time.sleep(sleep_s * (i + 1))
+        except Exception:
+            time.sleep(sleep_s * (i + 1))
     return None
 
-def _sort_by_end_desc(points: List[dict]) -> List[dict]:
-    """
-    Sortera datapunkter på 'end' (YYYY-MM-DD) fallande, med fallback på 'fy'/'fp'.
-    """
-    def _key(p: dict):
-        end = p.get("end") or ""
-        # sorts by end; None sist
-        return (0 if end else 1, end)
-    return sorted(points, key=_key, reverse=True)
+# --------------------------------------------
+# Ticker → CIK
+# --------------------------------------------
+_TICKER_MAP_CACHE: Dict[str, str] = {}
 
-def _latest_instant(points: List[dict]) -> Optional[dict]:
-    """
-    Plocka senaste "instant" (qtrs == 0) – helst från 10-Q/10-K.
-    """
-    if not points:
-        return None
-    # sortera
-    pts = _sort_by_end_desc(points)
-    for p in pts:
-        if p.get("qtrs", 0) == 0:
-            return p
-    # fallback: ta första
-    return pts[0]
-
-def _latest_quarters(points: List[dict], n: int = 4) -> List[dict]:
-    """
-    Hämta senaste N kvartalsvärden (qtrs == 1). Om färre finns – returnera färre.
-    """
-    out: List[dict] = []
-    if not points:
-        return out
-    pts = _sort_by_end_desc(points)
-    for p in pts:
-        if int(p.get("qtrs", 0)) == 1:
-            out.append(p)
-            if len(out) >= n:
-                break
-    return out
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _load_ticker_index() -> Dict[str, str]:
-    """
-    Hämtar SEC:s ticker-index → {TICKER: CIK-10-digits-str}.
-    Cache i 24h.
-    """
-    try:
-        r = requests.get(_TICKERS_INDEX, headers={"User-Agent": _SEC_UA}, timeout=20)
-        if r.status_code != 200:
-            return {}
-        j = r.json()
-        # Strukturen: { "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ... }
-        out: Dict[str, str] = {}
+def _load_ticker_map() -> None:
+    global _TICKER_MAP_CACHE
+    if _TICKER_MAP_CACHE:
+        return
+    j = _get_json("https://www.sec.gov/files/company_tickers.json")
+    if not j:
+        return
+    # Kan komma som { "0": {...}, "1": {...} } eller som lista
+    mapping: Dict[str, str] = {}
+    if isinstance(j, dict) and "0" in j:
         for _, row in j.items():
-            t = str(row.get("ticker") or "").upper()
-            cik_num = int(row.get("cik_str") or 0)
-            if t and cik_num:
-                out[t] = f"{cik_num:010d}"
-        return out
-    except Exception:
-        return {}
+            t = str(row.get("ticker", "")).upper().strip()
+            cik = str(row.get("cik_str", "")).strip()
+            if t and cik:
+                mapping[t] = cik
+    elif isinstance(j, list):
+        for row in j:
+            t = str(row.get("ticker", "")).upper().strip()
+            cik = str(row.get("cik_str", "")).strip()
+            if t and cik:
+                mapping[t] = cik
+    _TICKER_MAP_CACHE = mapping
 
-def _cik_for_ticker(ticker: str) -> Optional[str]:
-    t = str(ticker or "").upper().strip()
-    if not t:
+def _ticker_to_cik(ticker: str) -> Optional[str]:
+    _load_ticker_map()
+    t = str(ticker).upper().strip()
+    cik = _TICKER_MAP_CACHE.get(t, "")
+    if not cik:
         return None
-    idx = _load_ticker_index()
-    return idx.get(t)
+    # SEC kräver 10-siffrig CIK i URL
+    return cik.zfill(10)
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_company_facts(cik10: str) -> Optional[dict]:
+# --------------------------------------------
+# Company Facts helpers
+# --------------------------------------------
+def _company_facts(cik10: str) -> Optional[Dict[str, Any]]:
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json"
+    return _get_json(url)
+
+def _latest_fact(facts: Dict[str, Any], taxonomy: str, tag: str, prefer_units: Optional[List[str]] = None) -> Optional[Tuple[float, str]]:
     """
-    Läser companyfacts JSON från SEC.
-    Cache i 1h för att inte slå i rate limits.
+    Returnerar (värde, unit) för senaste datapunkt som hittas för (taxonomy:tag).
+    Om prefer_units anges, försöker välja en av dessa.
     """
     try:
-        url = f"{_SEC_BASE}/api/xbrl/companyfacts/CIK{cik10}.json"
-        r = requests.get(url, headers=_HEADERS, timeout=25)
-        if r.status_code != 200:
+        data = (facts.get("facts") or {}).get(taxonomy, {}).get(tag, {})
+        units = data.get("units") or {}
+        if not units:
             return None
-        return r.json()
+        # välj unit
+        keys = list(units.keys())
+        unit_key = None
+        if prefer_units:
+            for u in prefer_units:
+                if u in units:
+                    unit_key = u
+                    break
+        if unit_key is None:
+            unit_key = keys[0]
+        arr = units.get(unit_key, [])
+        if not arr:
+            return None
+        # sortera på 'end' datum om finns, annars ta sista
+        def _end_ts(x):
+            e = x.get("end") or x.get("fy") or ""
+            return e
+        arr_sorted = sorted(arr, key=_end_ts)
+        val = arr_sorted[-1].get("val", None)
+        if val is None:
+            return None
+        # val kan vara str/float/int
+        try:
+            v = float(val)
+        except Exception:
+            return None
+        return v, unit_key
     except Exception:
         return None
 
-def _find_fact_units(cf: dict, taxonomy: str) -> Optional[Dict[str, list]]:
-    """Navigerar cf['facts']['us-gaap'][taxonomy]['units'] säkert."""
+def _to_millions(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
     try:
-        return cf.get("facts", {}).get("us-gaap", {}).get(taxonomy, {}).get("units", None)
+        return round(float(x) / 1e6, 3)
     except Exception:
         return None
 
-def _sum_last4(points: List[dict]) -> Optional[float]:
-    if not points:
-        return None
-    vals = [_to_float(p.get("val")) for p in points if p.get("val") is not None]
-    vals = [v for v in vals if v is not None]
-    if not vals:
-        return None
-    return float(sum(vals))
-
-def _avg_last2_inst(points: List[dict]) -> Optional[float]:
-    if not points:
-        return None
-    # ta 2 senaste instanter
-    inst = [p for p in _sort_by_end_desc(points) if int(p.get("qtrs", 0)) == 0]
-    vals = [_to_float(p.get("val")) for p in inst[:2]]
-    vals = [v for v in vals if v is not None]
-    if not vals:
-        return None
-    return float(sum(vals) / len(vals))
-
-# ------------------------------------------------------------
-# Huvud: hämta & härled nyckeltal
-# ------------------------------------------------------------
-def get_all_fields(ticker: str) -> Dict[str, Any]:
+# --------------------------------------------
+# Publik funktion
+# --------------------------------------------
+def get_all(ticker: str) -> Dict[str, Any]:
     """
-    Returnerar ett dict med SEC-härledda fält:
-      sharesOutstanding, cash, grossMargin, operatingMargin, netMargin,
-      roe, debtToEquity, netDebtToEbitda
-    + underlag: revenueTTM, grossProfitTTM, operatingIncomeTTM, netIncomeTTM, ebitdaTTM,
-                equity, totalDebt
+    Hämtar ett litet urval nycklar från SEC Company Facts:
+    - "Kassa (M)" (us-gaap:CashAndCashEquivalentsAtCarryingValue)
+      fallback: us-gaap:CashAndCashEquivalentsPeriodEnd
+    - "Utestående aktier (milj.)" (us-gaap:CommonStockSharesOutstanding)
+    - "Net debt / EBITDA" om (us-gaap:NetDebtToEBITDA) finns
+    Kan utökas senare med fler taggar.
     """
     out: Dict[str, Any] = {}
-    tkr = str(ticker or "").upper().strip()
-    if not tkr:
+
+    cik10 = _ticker_to_cik(ticker)
+    if not cik10:
         return out
 
-    cik = _cik_for_ticker(tkr)
-    if not cik:
+    facts = _company_facts(cik10)
+    if not facts:
         return out
 
-    cf = _fetch_company_facts(cik)
-    if not cf:
-        return out
+    # Kassa
+    cash = None
+    for tag in ["CashAndCashEquivalentsAtCarryingValue", "CashAndCashEquivalentsPeriodEnd"]:
+        r = _latest_fact(facts, "us-gaap", tag, prefer_units=["USD"])
+        if r:
+            cash = _to_millions(r[0])
+            break
+    if cash is not None and cash > 0:
+        out["Kassa (M)"] = cash
 
-    # 0) Grundantagande: USD
-    out["currency"] = "USD"
+    # Utestående aktier
+    shares = _latest_fact(facts, "us-gaap", "CommonStockSharesOutstanding", prefer_units=["shares"])
+    if shares and shares[0] > 0:
+        out["Utestående aktier (milj.)"] = round(float(shares[0]) / 1e6, 3)
 
-    # 1) Shares outstanding (instant)
-    units = _find_fact_units(cf, "CommonStockSharesOutstanding")
-    if units:
-        pts = _pick_unit(units, "USD") or _pick_unit(units)  # värdet är "shares" men indexeras ibland ändå
-        p = _latest_instant(pts or [])
-        v = _to_float(p.get("val")) if p else None
-        if v and v > 0:
-            out["sharesOutstanding"] = v  # styck
+    # Net debt / EBITDA – direkt tag om finns
+    nde = _latest_fact(facts, "us-gaap", "NetDebtToEBITDA", prefer_units=None)
+    if nde and nde[0] is not None and not math.isnan(float(nde[0])):
+        out["Net debt / EBITDA"] = round(float(nde[0]), 3)
 
-    # 2) Cash (instant) – CashAndCashEquivalents* eller inkl. restricted
-    cash_units = _find_fact_units(cf, "CashAndCashEquivalentsAtCarryingValue")
-    if not cash_units:
-        cash_units = _find_fact_units(cf, "CashAndCashEquivalentsIncludingRestrictedCash")
-    if cash_units:
-        pts = _pick_unit(cash_units, "USD") or _pick_unit(cash_units)
-        p = _latest_instant(pts or [])
-        cv = _to_float(p.get("val")) if p else None
-        if cv is not None:
-            out["cash"] = cv
-
-    # 3) Total debt (instant) = LTD + ShortTermBorrowings + CurrentPortionLTD (så gott det går)
-    def _inst_val(tax: str) -> Optional[float]:
-        u = _find_fact_units(cf, tax)
-        if not u:
-            return None
-        pts = _pick_unit(u, "USD") or _pick_unit(u)
-        p = _latest_instant(pts or [])
-        return _to_float(p.get("val")) if p else None
-
-    ltd = _inst_val("LongTermDebtNoncurrent") or _inst_val("LongTermDebt")
-    std = _inst_val("ShortTermBorrowings")
-    cur_ltd = _inst_val("LongTermDebtCurrent")
-    total_debt = 0.0
-    has_any_debt = False
-    for part in (ltd, std, cur_ltd):
-        if part is not None:
-            total_debt += float(part)
-            has_any_debt = True
-    if has_any_debt:
-        out["totalDebt"] = total_debt
-
-    # 4) Equity (instant)
-    eq = _inst_val("StockholdersEquity") or _inst_val("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
-    if eq is not None:
-        out["equity"] = eq
-
-    # 5) Kvartalsserier (4 st): revenue, grossProfit, operatingIncome, netIncome, depreciationAmortization
-    def _q4_sum(tax: str) -> Optional[float]:
-        u = _find_fact_units(cf, tax)
-        if not u:
-            return None
-        pts = _pick_unit(u, "USD") or _pick_unit(u)
-        q = _latest_quarters(pts or [], n=4)
-        return _sum_last4(q)
-
-    # Revenue (försök flera kandidat-taggar)
-    rev = _q4_sum("Revenues") or _q4_sum("SalesRevenueNet") or _q4_sum("RevenueFromContractWithCustomerExcludingAssessedTax")
-    if rev is not None:
-        out["revenueTTM"] = rev
-
-    gp = _q4_sum("GrossProfit")
-    if gp is not None:
-        out["grossProfitTTM"] = gp
-
-    op = _q4_sum("OperatingIncomeLoss")
-    if op is not None:
-        out["operatingIncomeTTM"] = op
-
-    ni = _q4_sum("NetIncomeLoss")
-    if ni is not None:
-        out["netIncomeTTM"] = ni
-
-    da = _q4_sum("DepreciationAndAmortization")
-    # EBITDA_TTM ≈ OperatingIncomeTTM + DepreciationAndAmortization_TTM
-    ebitda_ttm = None
-    if op is not None and da is not None:
-        ebitda_ttm = op + da
-        out["ebitdaTTM"] = ebitda_ttm
-
-    # 6) Margins (TTM)
-    if rev and rev > 0:
-        if gp is not None:
-            out["grossMargin"] = float(gp / rev * 100.0)
-        if op is not None:
-            out["operatingMargin"] = float(op / rev * 100.0)
-        if ni is not None:
-            out["netMargin"] = float(ni / rev * 100.0)
-
-    # 7) ROE (TTM NetIncome / avg equity instants)
-    # försök: ta equity-instant-serie och medelvärde av 2 senaste
-    eq_units = _find_fact_units(cf, "StockholdersEquity") or _find_fact_units(cf, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
-    if ni is not None and eq_units:
-        pts = _pick_unit(eq_units, "USD") or _pick_unit(eq_units)
-        avg2 = _avg_last2_inst(pts or [])
-        base_eq = avg2 if avg2 and avg2 > 0 else _to_float((_latest_instant(pts or []) or {}).get("val"))
-        if base_eq and base_eq > 0:
-            out["roe"] = float(ni / base_eq * 100.0)
-
-    # 8) Debt/Equity
-    if "equity" in out and out["equity"] and out["equity"] > 0 and has_any_debt:
-        out["debtToEquity"] = float(total_debt / out["equity"])
-
-    # 9) NetDebt/EBITDA
-    if has_any_debt and "cash" in out and out["cash"] is not None and ebitda_ttm and ebitda_ttm > 0:
-        net_debt = float(total_debt - float(out["cash"] or 0.0))
-        out["netDebtToEbitda"] = float(net_debt / ebitda_ttm)
-
-    # Rensa orimliga procent (ibland enorma värden vid små nämnare)
-    for pk in ("grossMargin", "operatingMargin", "netMargin", "roe"):
-        if pk in out:
-            v = _to_float(out[pk])
-            if v is None:
-                del out[pk]
-            else:
-                # klipp extrema värden till rimligt spann (-200..200)
-                out[pk] = max(-200.0, min(200.0, float(v)))
-
-    # Returnera endast fält med värde
-    clean: Dict[str, Any] = {}
-    for k, v in out.items():
-        if v is None:
-            continue
-        clean[k] = v
-
-    return clean
+    return out

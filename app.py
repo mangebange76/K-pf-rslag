@@ -7,7 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="K-pf-rslag", layout="wide")
 st.title("K-pf-rslag")
 
-# Din insamlingsvy om du har den (valfritt)
+# (Valfritt) din insamlingsvy — om filen saknas visar vi ett snällt meddelande.
 try:
     from stockapp.manual_collect import manual_collect_view
 except Exception:
@@ -83,7 +83,7 @@ with tab_data:
 
 with tab_collect:
     if manual_collect_view is None:
-        st.info("Insamlingsvyn saknas i detta exempel.")
+        st.info("Insamlingsvyn är inte aktiverad i denna bas. (FMP är avstängt tills vidare.)")
     else:
         df_in = st.session_state.get("_df_ref", pd.DataFrame())
         df_out = manual_collect_view(df_in)

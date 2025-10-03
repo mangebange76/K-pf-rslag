@@ -2,13 +2,16 @@
 """
 FMP fetcher – gratis-endpoints, robust felhantering och tydlig fältmapping.
 
-Hämtar bara från öppna (free) endpoints:
+Använder *endast* fria endpoints:
 - /v3/profile/{ticker}
 - /v3/quote/{ticker}
 - /v3/key-metrics-ttm/{ticker}?limit=1
 - /v3/income-statement/{ticker}?period=annual&limit=1
 
-Returnerar (dict, fetched_fields:list[str], warnings:list[str]).
+Publika API (kompatibelt med manual_collect.py):
+- get_all(ticker) -> (data: dict, fetched_fields: list[str], warnings: list[str])
+
+Dessutom finns fetch_fmp(ticker) (som get_all anropar).
 """
 
 from __future__ import annotations
@@ -22,13 +25,21 @@ import requests
 DEFAULT_BASE = "https://financialmodelingprep.com/api"
 API_VERSION = "v3"
 
-# ---- Hjälpare --------------------------------------------------------------
+__all__ = [
+    "get_all",
+    "fetch_fmp",
+    "format_fetch_summary",
+]
+
+# ── Feltyp ──────────────────────────────────────────────────────────────────
 
 class FMPError(RuntimeError):
     pass
 
+# ── Hjälpare ────────────────────────────────────────────────────────────────
+
 def _get_api_key() -> str:
-    # Försök läsa från miljövariabel först; fall tillbaka till Streamlit secrets om möjligt.
+    # 1) Miljövariabel; 2) st.secrets; annars fel
     key = os.environ.get("FMP_API_KEY")
     if key:
         return key
@@ -37,24 +48,25 @@ def _get_api_key() -> str:
         return st.secrets["FMP_API_KEY"]
     except Exception:
         pass
-    raise FMPError("FMP_API_KEY saknas. Lägg in den i miljövariabler eller st.secrets.")
+    raise FMPError("FMP_API_KEY saknas. Lägg in den i env eller st.secrets.")
+
+def _endpoint(path: str) -> str:
+    return f"{DEFAULT_BASE}/{API_VERSION}/{path.lstrip('/')}"
 
 def _req(url: str, params: dict[str, t.Any], max_retries: int = 3, timeout: int = 20) -> t.Any:
     """GET med enkel backoff och särskild hantering för 402/429."""
     backoff = 1.2
-    last_err = None
+    last_err: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 402:
-                # Premium endpoint – förklara tydligt vad som hände.
-                raise FMPError("FMP svarade 402 (Premium Endpoint). Byt endpoint eller uppgradera plan.")
+                # Premium endpoint – upplys men låt andra endpoints köras vidare.
+                raise FMPError("402 Premium Endpoint – kräver betalplan. Byt endpoint eller uppgradera.")
             if r.status_code == 429:
-                # Rate limit – backoff och försök igen
                 time.sleep(backoff * attempt)
                 continue
             r.raise_for_status()
-            # FMP returnerar ofta tomma listor [] vid “no data”.
             try:
                 return r.json()
             except json.JSONDecodeError:
@@ -62,13 +74,9 @@ def _req(url: str, params: dict[str, t.Any], max_retries: int = 3, timeout: int 
         except Exception as e:
             last_err = e
             time.sleep(backoff * attempt)
-    # Sista försöket misslyckades
     if isinstance(last_err, FMPError):
         raise last_err
     raise FMPError(str(last_err) if last_err else "Okänt fel mot FMP")
-
-def _endpoint(path: str) -> str:
-    return f"{DEFAULT_BASE}/{API_VERSION}/{path.lstrip('/')}"
 
 def _safe_num(x: t.Any) -> t.Optional[float]:
     try:
@@ -81,11 +89,11 @@ def _safe_num(x: t.Any) -> t.Optional[float]:
     except Exception:
         return None
 
-# ---- Publika funktioner ----------------------------------------------------
+# ── Kärnlogik ──────────────────────────────────────────────────────────────
 
 def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
     """
-    Hämtar data för givna 'ticker' från FMP gratis-endpoints.
+    Hämtar data för given ticker från fria FMP-endpoints.
     Returnerar: (data_dict, fetched_fields, warnings)
     """
     api_key = _get_api_key()
@@ -95,18 +103,17 @@ def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
     fetched: list[str] = []
     warnings: list[str] = []
 
-    # Normalisera ticker (NVDA ska vara NVDA)
     symbol = (ticker or "").strip().upper()
     if not symbol:
         return {}, [], ["Tom ticker"]
 
-    # 1) PROFILE – namn, valuta (ibland), sektor/industri m.m.
+    # 1) PROFILE
     try:
         resp = _req(_endpoint(f"profile/{symbol}"), params)
         if isinstance(resp, list) and resp:
             prof = resp[0]
             name = prof.get("companyName") or prof.get("company_name")
-            currency = prof.get("currency")  # kan vara None
+            currency = prof.get("currency")
             sector = prof.get("sector")
             industry = prof.get("industry")
             exchange = prof.get("exchangeShortName") or prof.get("exchange")
@@ -127,11 +134,11 @@ def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
                 data["FMP:Exchange"] = exchange
                 fetched.append("FMP:Exchange")
         else:
-            warnings.append("Profile: inga data (tom lista)")
+            warnings.append("Profile: inga data (tom lista).")
     except FMPError as e:
         warnings.append(f"Profile fel: {e}")
 
-    # 2) QUOTE – pris, market cap etc (gratis)
+    # 2) QUOTE
     try:
         resp = _req(_endpoint(f"quote/{symbol}"), params)
         if isinstance(resp, list) and resp:
@@ -150,11 +157,11 @@ def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
                 data["FMP:Change %"] = changes_pct
                 fetched.append("FMP:Change %")
         else:
-            warnings.append("Quote: inga data (tom lista)")
+            warnings.append("Quote: inga data (tom lista).")
     except FMPError as e:
         warnings.append(f"Quote fel: {e}")
 
-    # 3) KEY METRICS TTM – P/S TTM, revenue per share TTM, shares outstanding (ibland)
+    # 3) KEY METRICS TTM
     try:
         resp = _req(_endpoint(f"key-metrics-ttm/{symbol}"), params | {"limit": 1})
         if isinstance(resp, list) and resp:
@@ -173,12 +180,11 @@ def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
                 data["FMP:Shares Outstanding"] = shares
                 fetched.append("FMP:Shares Outstanding")
         else:
-            warnings.append("Key-metrics TTM: inga data (tom lista)")
+            warnings.append("Key-metrics TTM: inga data (tom lista).")
     except FMPError as e:
-        # Vissa konton får 402 här – då noterar vi det och går vidare.
         warnings.append(f"Key-metrics TTM fel: {e}")
 
-    # 4) INCOME STATEMENT – revenue (TTM saknas ofta på free; tar senaste års-värde)
+    # 4) INCOME STATEMENT (senaste årsrevenue)
     try:
         resp = _req(_endpoint(f"income-statement/{symbol}"), params | {"period": "annual", "limit": 1})
         if isinstance(resp, list) and resp:
@@ -188,32 +194,37 @@ def fetch_fmp(ticker: str) -> tuple[dict, list[str], list[str]]:
                 data["FMP:Revenue (Annual)"] = revenue
                 fetched.append("FMP:Revenue (Annual)")
         else:
-            warnings.append("Income-statement: inga data (tom lista)")
+            warnings.append("Income-statement: inga data (tom lista).")
     except FMPError as e:
         warnings.append(f"Income-statement fel: {e}")
 
-    # Sanity: Om vi inte fick currency från profile, gissa USD för US-exchanges (bättre än blankt)
+    # Fallback currency för US-börser
     if "FMP:Currency" not in data:
         ex = data.get("FMP:Exchange")
         if isinstance(ex, str) and ex.upper() in {"NASDAQ", "NYSE", "AMEX"}:
             data["FMP:Currency"] = "USD"
             warnings.append("Currency saknades i profile – antog USD (US-börs).")
 
-    # Särskilt fall: Om *allt* blev 0 fält – ge tydlig varning
     if not fetched:
         warnings.append(
-            "FMP returnerade inga fält. Vanliga orsaker: saknad/fel API-nyckel, 402 (premium-endpoint), eller tomma svar."
+            "FMP returnerade inga fält. Vanliga orsaker: saknad/fel API-nyckel, 402 (premium-endpoint), tomma svar eller rate limit."
         )
 
     return data, fetched, warnings
 
+# ── Publikt API (kompatibelt) ──────────────────────────────────────────────
 
-# ---- Hjälpfunktion för UI-loggning ----------------------------------------
+def get_all(ticker: str) -> tuple[dict, list[str], list[str]]:
+    """
+    Kompatibel wrapper som används av manual_collect.py
+    """
+    return fetch_fmp(ticker)
+
+# ── UI-hjälp ───────────────────────────────────────────────────────────────
 
 def format_fetch_summary(source: str, fetched: list[str], warnings: list[str]) -> str:
     """
-    Gör en läsbar summering till UI-loggen, ex:
-    'FMP: Hämtade 3 fält: FMP:Price, FMP:Market Cap, FMP:P/S TTM. Varningar: …'
+    Ex: 'FMP: Hämtade 3 fält: FMP:Price, FMP:Market Cap, FMP:P/S TTM. Varningar: …'
     """
     parts: list[str] = []
     if fetched:

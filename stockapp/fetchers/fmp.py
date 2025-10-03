@@ -2,42 +2,53 @@
 """
 stockapp.fetchers.fmp
 ---------------------
-FinancialModelingPrep (FMP) fetcher.
-Kräver FMP_API_KEY i st.secrets. (Ingen extern modul – bara requests.)
+Hämtar nyckeltal från Financial Modeling Prep.
 
-Publikt API:
-- get_all(ticker) -> Dict[str, Any]
+Publik funktion:
+- get_all(ticker: str) -> dict
+
+Behöver:
+- st.secrets["FMP_API_KEY"] (obligatorisk)
+Valfritt:
+- st.secrets["FMP_BASE"] (default https://financialmodelingprep.com/api/v3)
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, List
+import time
+import math
 import requests
 import streamlit as st
 
-def _fmp_base() -> str:
-    # Låt användaren överskriva bas-URL via secrets, annars officiell
-    return st.secrets.get("FMP_BASE", "https://financialmodelingprep.com")
 
-def _fmp_key() -> str:
-    return st.secrets.get("FMP_API_KEY", "")
+def _base() -> str:
+    b = str(st.secrets.get("FMP_BASE", "")).strip()
+    return b or "https://financialmodelingprep.com/api/v3"
 
-def _get_json(path: str, params: Dict[str, Any] | None = None, timeout: float = 12.0) -> Any:
-    key = _fmp_key()
-    if not key:
-        return {"__error__": "Missing FMP_API_KEY"}
-    base = _fmp_base().rstrip("/")
-    url = f"{base}{path}"
-    p = dict(params or {})
-    p["apikey"] = key
-    try:
-        r = requests.get(url, params=p, timeout=timeout)
-        if r.status_code != 200:
-            return {"__error__": f"HTTP {r.status_code}"}
-        return r.json()
-    except Exception as e:
-        return {"__error__": str(e)}
 
-def _safe_float(x, default=None):
+def _api_key() -> str:
+    return str(st.secrets.get("FMP_API_KEY", "")).strip()
+
+
+def _get(url: str, params: Optional[Dict[str, Any]] = None, tries: int = 3, sleep_s: float = 0.7):
+    if params is None:
+        params = {}
+    ak = _api_key()
+    if not ak:
+        return None
+    params = {**params, "apikey": ak}
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            time.sleep(sleep_s * (i + 1))
+        except Exception:
+            time.sleep(sleep_s * (i + 1))
+    return None
+
+
+def _to_float(x, default=None):
     try:
         if x is None:
             return default
@@ -45,153 +56,167 @@ def _safe_float(x, default=None):
     except Exception:
         return default
 
-def _as_pct(val) -> Optional[float]:
-    v = _safe_float(val, None)
+
+def _to_millions(x) -> Optional[float]:
+    v = _to_float(x, None)
     if v is None:
         return None
-    return round(v * 100.0, 2)
+    return round(v / 1e6, 3)
 
-def _fmt_millions(x: Optional[float]) -> Optional[float]:
-    if x is None:
+
+def _pick_latest(arr, *keys):
+    """Plocka första nyckel som finns i dict/list-svar."""
+    if not arr:
         return None
-    try:
-        return float(x) / 1e6
-    except Exception:
-        return None
+    d = arr[0] if isinstance(arr, list) else arr
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
 
 def get_all(ticker: str) -> Dict[str, Any]:
     """
-    Hämtar ett rimligt paket nyckeltal från FMP.
-    Returnerar ett dict med svenska kolumnnamn när möjligt.
+    Returnerar ett dict med de fält vi hittar för tickern.
+    Mappar till våra svenska kolumnnamn.
     """
     out: Dict[str, Any] = {}
-    logs: List[str] = []
+    t = str(ticker or "").upper().strip()
+    if not t:
+        return out
+    if not _api_key():
+        # ingen API-nyckel => inget att göra
+        return out
 
-    # 1) Profile – sektor, industri, valuta, mcap, price, shares
-    prof = _get_json(f"/api/v3/profile/{ticker}")
+    base = _base()
+
+    # --------- PROFILE (namn, sektor, industri, valuta)
+    prof = _get(f"{base}/profile/{t}")
     if isinstance(prof, list) and prof:
-        p0 = prof[0] or {}
-        sector = p0.get("sector")
+        p0 = prof[0]
+        name = p0.get("companyName") or p0.get("company-name")
+        if name:
+            out["Bolagsnamn"] = name
+        sector = p0.get("sector") or p0.get("sectorName")
         if sector:
-            out["Sektor"] = str(sector)
-        industry = p0.get("industry")
+            out["Sektor"] = sector
+        industry = p0.get("industry") or p0.get("industryName")
         if industry:
-            out["Industri"] = str(industry)
-
-        mcap = _safe_float(p0.get("mktCap"), None)
-        if mcap is not None:
-            out["Market Cap"] = mcap
-
-        price = _safe_float(p0.get("price"), None)
-        if price is not None:
-            out["Kurs"] = price
-
+            out["Industri"] = industry
         ccy = p0.get("currency")
         if ccy:
-            out["Valuta"] = str(ccy)
+            out["Valuta"] = ccy
 
-        shares = _safe_float(p0.get("sharesOutstanding"), None)
-        if shares:
-            out["Utestående aktier (milj.)"] = _fmt_millions(shares)
+    # --------- QUOTE (kurs, market cap, P/S ttm, P/B, utdelning)
+    quote = _get(f"{base}/quote/{t}")
+    if isinstance(quote, list) and quote:
+        q0 = quote[0]
+        price = _to_float(q0.get("price"))
+        if price:
+            out["Kurs"] = price
+        mcap = _to_float(q0.get("marketCap"))
+        if mcap:
+            out["Market Cap"] = mcap  # i bolagets valuta
+        ps_ttm = _to_float(q0.get("priceToSalesTrailing12Months"))
+        if ps_ttm is not None:
+            out["P/S"] = ps_ttm
+        pb = _to_float(q0.get("priceToBook"))
+        if pb is not None:
+            out["P/B"] = pb
+        dy = _to_float(q0.get("trailingAnnualDividendYield"))
+        if dy is not None and dy > 0:
+            out["Dividend yield (%)"] = round(dy * 100.0, 2)
 
-        dy = _safe_float(p0.get("lastDiv"), None)
-        if dy and price and price > 0:
-            # Om lastDiv är "annual dividend per share", kan vi grovt beräkna yield
-            out["Dividend yield (%)"] = round((dy / price) * 100.0, 2)
-    elif isinstance(prof, dict) and prof.get("__error__"):
-        logs.append(f"profile: {prof['__error__']}")
+        # vissa svar har sharesOutstanding här
+        sh = _to_float(q0.get("sharesOutstanding"))
+        if sh and sh > 0:
+            out["Utestående aktier (milj.)"] = round(sh / 1e6, 3)
 
-    # 2) Ratios TTM – marginaler, ROE, P/B, DE, EV/EBITDA, PS, DY TTM
-    ratios = _get_json(f"/api/v3/ratios-ttm/{ticker}")
+    # --------- RATIOS TTM (marginaler, ROE, D/E)
+    ratios = _get(f"{base}/ratios-ttm/{t}")
     if isinstance(ratios, list) and ratios:
-        r0 = ratios[0] or {}
-        # Marginaler
-        if r0.get("grossProfitMarginTTM") is not None:
-            out["Gross margin (%)"] = round(float(r0["grossProfitMarginTTM"]) * 100.0, 2)
-        if r0.get("operatingProfitMarginTTM") is not None:
-            out["Operating margin (%)"] = round(float(r0["operatingProfitMarginTTM"]) * 100.0, 2)
-        if r0.get("netProfitMarginTTM") is not None:
-            out["Net margin (%)"] = round(float(r0["netProfitMarginTTM"]) * 100.0, 2)
+        r0 = ratios[0]
+        gm = _to_float(r0.get("grossProfitMarginTTM"))
+        if gm is not None:
+            out["Gross margin (%)"] = round(gm * 100.0, 2)
+        om = _to_float(r0.get("operatingProfitMarginTTM"))
+        if om is not None:
+            out["Operating margin (%)"] = round(om * 100.0, 2)
+        nm = _to_float(r0.get("netProfitMarginTTM"))
+        if nm is not None:
+            out["Net margin (%)"] = round(nm * 100.0, 2)
+        roe = _to_float(r0.get("returnOnEquityTTM"))
+        if roe is not None:
+            out["ROE (%)"] = round(roe * 100.0, 2)
+        de = _to_float(r0.get("debtEquityRatioTTM"))
+        if de is not None:
+            out["Debt/Equity"] = de
 
-        # Lönsamhet & multiplar
-        if r0.get("returnOnEquityTTM") is not None:
-            out["ROE (%)"] = round(float(r0["returnOnEquityTTM"]) * 100.0, 2)
-        if r0.get("priceToBookRatioTTM") is not None:
-            out["P/B"] = _safe_float(r0["priceToBookRatioTTM"], None)
-        if r0.get("debtEquityRatioTTM") is not None:
-            out["Debt/Equity"] = _safe_float(r0["debtEquityRatioTTM"], None)
+        dy2 = _to_float(r0.get("dividendYieldTTM"))
+        if dy2 is not None and dy2 > 0:
+            out["Dividend yield (%)"] = round(dy2 * 100.0, 2)
 
-        # EV/EBITDA
-        ev_eb = r0.get("enterpriseValueOverEBITDATTM")
-        if ev_eb is None:
-            ev_eb = r0.get("evToEbitdaTTM")
-        if ev_eb is not None:
-            out["EV/EBITDA (ttm)"] = _safe_float(ev_eb, None)
+        payout = _to_float(r0.get("payoutRatioTTM"))
+        # payoutRatioTTM är ofta på EPS-basis – vi visar den som % om den är rimlig
+        if payout is not None and payout >= 0:
+            out["Dividend payout (FCF) (%)"] = round(payout * 100.0, 2)
 
-        # P/S TTM
-        ps = r0.get("priceToSalesRatioTTM")
-        if ps is not None:
-            out["P/S"] = _safe_float(ps, None)
+    # --------- KEY METRICS TTM (EV/EBITDA, FCF Yield, P/B ibland)
+    km = _get(f"{base}/key-metrics-ttm/{t}")
+    if isinstance(km, list) and km:
+        k0 = km[0]
+        ev_eb = _to_float(k0.get("enterpriseValueOverEBITDATTM") or k0.get("enterpriseValueOverEBITDA"))
+        if ev_eb is not None and ev_eb > 0:
+            out["EV/EBITDA (ttm)"] = ev_eb
+        fcfy = _to_float(k0.get("freeCashFlowYieldTTM"))
+        if fcfy is not None:
+            out["FCF Yield (%)"] = round(fcfy * 100.0, 2)
+        pb2 = _to_float(k0.get("priceToBookRatioTTM"))
+        if pb2 is not None:
+            out["P/B"] = pb2
 
-        # Dividend yield TTM
-        dy_ttm = r0.get("dividendYielTTM") or r0.get("dividendYieldTTM")
-        if dy_ttm is not None:
-            out["Dividend yield (%)"] = round(float(dy_ttm) * 100.0, 2)
-    elif isinstance(ratios, dict) and ratios.get("__error__"):
-        logs.append(f"ratios-ttm: {ratios['__error__']}")
-
-    # 3) Cash flow (senaste kvartal) – FCF och utdelningspayout mot FCF
-    cfs = _get_json(f"/api/v3/cash-flow-statement/{ticker}", params={"period": "quarter", "limit": 1})
-    if isinstance(cfs, list) and cfs:
-        c0 = cfs[0] or {}
-        fcf = _safe_float(c0.get("freeCashFlow"), None)
-        if fcf is not None:
-            out["FCF (M)"] = _fmt_millions(fcf)
-        div_paid = _safe_float(c0.get("dividendsPaid"), None)  # ofta negativt
-        if div_paid is not None and fcf and fcf != 0:
-            # Payout som andel av FCF (= utdelningar / FCF)
-            payout = abs(div_paid) / abs(fcf) * 100.0
-            out["Dividend payout (FCF) (%)"] = round(payout, 1)
-    elif isinstance(cfs, dict) and cfs.get("__error__"):
-        logs.append(f"cash-flow: {cfs['__error__']}")
-
-    # 4) Balansräkning – kassa (senaste kvartal)
-    bs = _get_json(f"/api/v3/balance-sheet-statement/{ticker}", params={"period": "quarter", "limit": 1})
-    if isinstance(bs, list) and bs:
-        b0 = bs[0] or {}
-        cash = _safe_float(b0.get("cashAndCashEquivalents"), None)
-        if cash is not None:
-            out["Kassa (M)"] = _fmt_millions(cash)
-    elif isinstance(bs, dict) and bs.get("__error__"):
-        logs.append(f"balance-sheet: {bs['__error__']}")
-
-    # 5) Income statement – ta 4 senaste quarter revenue för att approximera P/S Q1..Q4
-    inc = _get_json(f"/api/v3/income-statement/{ticker}", params={"period": "quarter", "limit": 4})
-    revs: List[float] = []
+    # --------- Income statement (senaste års omsättning)
+    inc = _get(f"{base}/income-statement/{t}", params={"limit": 1})
     if isinstance(inc, list) and inc:
-        for it in inc:
-            r = _safe_float(it.get("revenue"), None)
-            if r is not None:
-                revs.append(float(r))
-        if revs:
-            # Fyll P/S Q1..Q4 via mcap/revenue (approx), Q1 = senaste kvartalet
-            m = out.get("Market Cap", None)
-            if m:
-                if len(revs) > 0 and revs[0] > 0:
-                    out["P/S Q1"] = float(m) / float(revs[0])
-                if len(revs) > 1 and revs[1] > 0:
-                    out["P/S Q2"] = float(m) / float(revs[1])
-                if len(revs) > 2 and revs[2] > 0:
-                    out["P/S Q3"] = float(m) / float(revs[2])
-                if len(revs) > 3 and revs[3] > 0:
-                    out["P/S Q4"] = float(m) / float(revs[3])
-    elif isinstance(inc, dict) and inc.get("__error__"):
-        logs.append(f"income-statement: {inc['__error__']}")
+        rev = _to_float(inc[0].get("revenue"))
+        if rev is not None:
+            out["Omsättning i år (M)"] = _to_millions(rev)
 
-    # 6) (valfritt) Market cap history – kan användas för risklabel etc. (hoppar nu)
-    # mc_hist = _get_json(f"/api/v3/market-capitalization/{ticker}", params={"limit": 5})
+    # --------- Balance sheet (cash, shares) – ibland bättre källor än quote
+    bs = _get(f"{base}/balance-sheet-statement/{t}", params={"limit": 1})
+    if isinstance(bs, list) and bs:
+        cash = _to_float(bs[0].get("cashAndCashEquivalents"))
+        if cash is not None:
+            out["Kassa (M)"] = _to_millions(cash)
+        sh2 = _to_float(bs[0].get("commonStockSharesOutstanding"))
+        if (sh2 is not None) and sh2 > 0:
+            out["Utestående aktier (milj.)"] = round(sh2 / 1e6, 3)
 
-    out["__fmp_fields__"] = len([k for k in out.keys() if not k.startswith("__")])
-    if logs:
-        out["__fmp_log__"] = "; ".join(logs)
-    return out
+    # --------- Cash flow (Free Cash Flow) – för ev. härledd FCF Yield (om market cap finns)
+    cf = _get(f"{base}/cash-flow-statement/{t}", params={"limit": 1})
+    if isinstance(cf, list) and cf:
+        fcf = _to_float(cf[0].get("freeCashFlow"))
+        if fcf is not None:
+            out["FCF (M)"] = _to_millions(fcf)
+            if "Market Cap" in out and out["Market Cap"]:
+                try:
+                    fcfy_calc = (fcf / float(out["Market Cap"])) * 100.0
+                    # Om vi saknade FCF Yield från metrics kan vi härleda en grov
+                    if "FCF Yield (%)" not in out and not math.isnan(fcfy_calc):
+                        out["FCF Yield (%)"] = round(fcfy_calc, 2)
+                except Exception:
+                    pass
+
+    # Filtrera bort None/NaN
+    clean: Dict[str, Any] = {}
+    for k, v in out.items():
+        try:
+            if v is None:
+                continue
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                continue
+            clean[k] = v
+        except Exception:
+            continue
+
+    return clean

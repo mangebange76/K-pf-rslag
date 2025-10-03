@@ -62,13 +62,13 @@ FIELD_PRIORITY: dict[str, list[str]] = {
     "Sektor": ["fmp", "yahoo", "sec"],
     "Industri": ["fmp", "yahoo", "sec"],
     "Bransch": ["fmp", "yahoo", "sec"],
-    # lägg fler vid behov
 }
 
 ALIASES: dict[str, str] = {
     "P/S TTM": "P/S",
     "P/S (TTM, modell)": "P/S",
 }
+
 
 # ── Hjälpare ───────────────────────────────────────────────────────────────
 def _canon(field: str) -> str:
@@ -85,6 +85,42 @@ def _count_nonempty(d: dict | None) -> int:
         return 0
     return sum(1 for _, v in d.items() if _safe(v))
 
+def _clean_keys(d: dict | None) -> dict:
+    """Ta bort interna/okända nycklar (t.ex. __yahoo_fields__) och None/NaN."""
+    if not isinstance(d, dict):
+        return {}
+    out: dict[str, t.Any] = {}
+    for k, v in d.items():
+        if isinstance(k, str) and k.startswith("__"):
+            continue
+        if _safe(v):
+            out[k] = v
+    return out
+
+def _compute_ps_from(yv: dict, fv: dict, sv: dict) -> t.Optional[float]:
+    """Beräkna P/S = Market Cap / Omsättning i år, med rimlig källa-prio."""
+    def pick(field: str) -> t.Optional[float]:
+        for src_dict in (fv, yv, sv):  # FMP -> Yahoo -> SEC
+            v = src_dict.get(field)
+            if isinstance(v, (int, float)) and not math.isnan(float(v)):
+                return float(v)
+        return None
+
+    # Market Cap i kronor (ev. från (M))
+    mc = pick("Market Cap")
+    if mc is None:
+        m_m = pick("Market Cap (M)")
+        if m_m is not None:
+            mc = m_m * 1_000_000.0
+
+    # Omsättning i år i kronor via (M)
+    rev_m = pick("Omsättning i år (M)")
+    rev = rev_m * 1_000_000.0 if rev_m is not None else None
+
+    if mc and rev and rev > 0:
+        return round(mc / rev, 4)
+    return None
+
 def _pick_value(field: str, yv: dict, fv: dict, sv: dict) -> tuple[t.Any, str | None]:
     f = _canon(field)
     order = FIELD_PRIORITY.get(f, ["yahoo", "fmp", "sec"])
@@ -98,15 +134,28 @@ def _pick_value(field: str, yv: dict, fv: dict, sv: dict) -> tuple[t.Any, str | 
     return None, None
 
 def _merge_preview(cur_row: dict, yv: dict, fv: dict, sv: dict) -> pd.DataFrame:
+    """
+    Skapar tabell 'Fält' / 'Före' / 'Efter' / 'Källa' för meningsfulla ändringar.
+    Har extra fallback för 'P/S' genom lokal beräkning.
+    """
     fields: set[str] = set(FIELD_PRIORITY.keys()) | set(yv.keys()) | set(fv.keys()) | set(sv.keys())
     rows: list[dict[str, t.Any]] = []
+
     for field in sorted(fields):
         f = _canon(field)
         before = cur_row.get(f)
         after, src = _pick_value(f, yv, fv, sv)
+
+        # Fallback: beräkna P/S
+        if f == "P/S" and not _safe(after):
+            ps_calc = _compute_ps_from(yv, fv, sv)
+            if _safe(ps_calc):
+                after, src = ps_calc, "Beräknad"
+
         if _safe(after):
             if not _safe(before) or before != after:
                 rows.append({"Fält": f, "Före": before, "Efter": after, "Källa": src})
+
     if not rows:
         return pd.DataFrame(columns=["Fält", "Före", "Efter", "Källa"])
     return pd.DataFrame(rows)[["Fält", "Före", "Efter", "Källa"]]
@@ -135,6 +184,7 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
     st.session_state.setdefault("draft_fmp", {})
     st.session_state.setdefault("draft_sec", {})
     st.session_state.setdefault("fmp_diag", {"fields": [], "warnings": [], "summary": ""})
+    st.session_state.setdefault("fmp_disabled", False)
 
     # hitta ticker-kolumn
     tickers = []
@@ -169,29 +219,35 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
                 st.error("Yahoo-fetchern saknas.")
             else:
                 try:
-                    st.session_state["draft_yahoo"] = yahoo_get_all(selected_ticker) or {}
+                    st.session_state["draft_yahoo"] = _clean_keys(yahoo_get_all(selected_ticker) or {})
                     st.success(f"Yahoo hämtade {len(st.session_state['draft_yahoo'])} fält.")
                 except Exception as e:
                     st.error(f"Fel vid Yahoo-hämtning: {e}")
 
     with col2:
-        if st.button("Hämta från FMP", use_container_width=True):
+        if st.button(
+            "Hämta från FMP",
+            use_container_width=True,
+            disabled=st.session_state.get("fmp_disabled", False),
+        ):
             if fmp_get_all_verbose is None:
                 st.error("FMP-fetchern saknas.")
             else:
                 try:
                     mapped, fields, warns = fmp_get_all_verbose(selected_ticker)
-                    st.session_state["draft_fmp"] = mapped or {}
+                    st.session_state["draft_fmp"] = _clean_keys(mapped or {})
                     st.session_state["fmp_diag"] = {
                         "fields": fields or [],
                         "warnings": warns or [],
                         "summary": fmp_format_summary("FMP", fields or [], warns or []),
                     }
                     if fields:
-                        st.success(f"FMP hämtade {len(fields)} fält: {', '.join(fields)}")
+                        st.success(f"FMP hämtade {len(fields)} fält.")
                     else:
-                        if warns:
-                            st.warning("FMP hämtade 0 fält. " + " | ".join(warns))
+                        # Om 403 dök upp: inaktivera knappen denna session
+                        if any("403" in w for w in (warns or [])):
+                            st.session_state["fmp_disabled"] = True
+                            st.error("FMP-nyckeln avvisas (403). Har inaktiverat FMP-knappen denna session.")
                         else:
                             st.warning("FMP hämtade 0 fält.")
                 except Exception as e:
@@ -203,10 +259,17 @@ def manual_collect_view(df: pd.DataFrame) -> pd.DataFrame:
                 st.error("SEC-fetchern saknas.")
             else:
                 try:
-                    st.session_state["draft_sec"] = sec_get_all(selected_ticker) or {}
+                    st.session_state["draft_sec"] = _clean_keys(sec_get_all(selected_ticker) or {})
                     st.success(f"SEC hämtade {len(st.session_state['draft_sec'])} fält.")
                 except Exception as e:
                     st.error(f"Fel vid SEC-hämtning: {e}")
+
+    # möjlighet att låsa upp FMP igen när ny nyckel är inlagd
+    if st.session_state.get("fmp_disabled", False):
+        st.info("FMP är tillfälligt inaktiverat p.g.a. 403. När du lagt in en giltig nyckel kan du aktivera FMP igen.")
+        if st.button("🔓 Aktivera FMP igen"):
+            st.session_state["fmp_disabled"] = False
+            st.success("FMP återaktiverat.")
 
     # summering
     cnt_y = _count_nonempty(st.session_state.get("draft_yahoo"))

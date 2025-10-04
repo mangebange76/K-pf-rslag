@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import datetime as _dt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,7 +10,7 @@ import streamlit as st
 st.set_page_config(page_title="K-pf-rslag", layout="wide")
 st.title("K-pf-rslag")
 
-# Valfri manuell insamlingsvy (om den finns i projektet)
+# Valfri manuell insamlingsvy
 try:
     from stockapp.manual_collect import manual_collect_view
 except Exception:
@@ -19,11 +20,12 @@ except Exception:
 from stockapp.sheets import get_ws, ws_read_df, save_dataframe, list_sheet_names
 from stockapp.rates import read_rates, save_rates, DEFAULT_RATES, fetch_live_rates
 from stockapp.fetchers.yahoo import get_all as yahoo_get
-from stockapp.fetchers.sec import get_pb_quarters  # SEC-P/B 4 kvartal
-# Nya fetchers (valfria, styrs via toggles):
+from stockapp.fetchers.sec import get_pb_quarters  # SEC-P/B 4 kvartal (+ bvps i details)
+# Valfria kompletteringskällor
 from stockapp.fetchers.finviz import get_overview as finviz_get
 from stockapp.fetchers.morningstar import get_overview as ms_get
 from stockapp.fetchers.stocktwits import get_symbol_summary as stw_get
+
 
 # ---------------- Schema ----------------
 FINAL_COLS = [
@@ -35,6 +37,9 @@ FINAL_COLS = [
     "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
     # P/B historik (SEC)
     "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
+    # PB-riktkurser (NYTT)
+    "PB Riktkurs idag", "PB Riktkurs om 1 år", "PB Riktkurs om 2 år", "PB Riktkurs om 3 år",
+    "BVPS CAGR (%)",
     # PS-modellen & omsättningar
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
@@ -59,6 +64,8 @@ NUMERIC_COLS = [
     "Revenue TTM (M)", "Revenue growth (%)", "Book value / share",
     "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
     "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
+    "PB Riktkurs idag", "PB Riktkurs om 1 år", "PB Riktkurs om 2 år", "PB Riktkurs om 3 år",
+    "BVPS CAGR (%)",
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
@@ -71,8 +78,8 @@ NUMERIC_COLS = [
 # ---- Dividend scoring baseline ----
 DIV_BASE_YIELD = 15.0   # % yield som ger full pott vid baseline
 DIV_BASE_PAYOUT = 80.0  # % payout som baseline
-DIV_MIN_PAYOUT = 30.0   # clamp (stabilitet)
-DIV_MAX_PAYOUT = 200.0  # clamp (stabilitet)
+DIV_MIN_PAYOUT = 30.0   # clamp
+DIV_MAX_PAYOUT = 200.0  # clamp
 
 # ---- Stödkonstanter för vyer ----
 HORIZONS = ["Idag", "Om 1 år", "Om 2 år", "Om 3 år"]
@@ -121,7 +128,7 @@ def _pb_avg(row: pd.Series) -> float:
     if pbs > 0:
         return pbs
     vals = [float(row.get(k, 0.0)) for k in ["P/B Q1","P/B Q2","P/B Q3","P/B Q4"] if float(row.get(k,0.0))>0]
-    return float(np.mean(vals)) if vals else 0.0
+    return float(np.mean(vals)) if vals else float(row.get("P/B", 0.0))
 
 # ---- Prognos av omsättning (sparas) från "Nästa år" via CAGR5 + dämpning
 def _proj_from_next_year(row: pd.Series) -> tuple[float, float]:
@@ -157,10 +164,67 @@ def target_price_ps(row: pd.Series, horizon: str) -> float:
 def ps_targets_all(row: pd.Series) -> dict:
     return {hz: target_price_ps(row, hz) for hz in HORIZONS}
 
-def pb_target(row: pd.Series) -> float:
+# ---- PB via BVPS CAGR ----
+def _annual_years_between(d0: _dt.date, d1: _dt.date) -> float:
+    return max(1e-6, abs((d1 - d0).days) / 365.25)
+
+def _cagr_from_points(v0: float, v1: float, years: float) -> float:
+    if v0 <= 0 or v1 <= 0 or years <= 0:
+        return 0.0
+    return (v1 / v0) ** (1.0 / years) - 1.0
+
+def _bvps_cagr_from_sec_details(details: list[dict]) -> float:
+    """
+    details: från sec.get_pb_quarters() → [{"date": "YYYY-MM-DD", "bvps": 12.34}, ...]
+    Returnerar CAGR (andel) och klampar till [-0.20, +0.30].
+    """
+    if not details or len(details) < 2:
+        return 0.0
+    d_sorted = sorted(details, key=lambda x: x.get("date", ""))
+    try:
+        d0 = _dt.date.fromisoformat(d_sorted[0]["date"])
+        d1 = _dt.date.fromisoformat(d_sorted[-1]["date"])
+    except Exception:
+        return 0.0
+    v0 = float(d_sorted[0].get("bvps") or 0.0)
+    v1 = float(d_sorted[-1].get("bvps") or 0.0)
+    yrs = _annual_years_between(d0, d1)
+    g = _cagr_from_points(v0, v1, yrs)
+    return _clamp(g, -0.20, 0.30)
+
+def pb_targets_all_from_bvps(pb_avg: float, bvps0: float, g_bv: float) -> dict:
+    """
+    Returnerar PB-riktkurser för Idag/1y/2y/3y baserat på BVPS-tillväxt (dämpad 0.7/0.5).
+    """
+    if pb_avg <= 0 or bvps0 <= 0:
+        return {"Idag": 0.0, "Om 1 år": 0.0, "Om 2 år": 0.0, "Om 3 år": 0.0}
+    bvps1 = bvps0 * (1.0 + g_bv)
+    bvps2 = bvps1 * (1.0 + 0.7*g_bv)
+    bvps3 = bvps2 * (1.0 + 0.5*g_bv)
+    return {
+        "Idag": round(pb_avg * bvps0, 2),
+        "Om 1 år": round(pb_avg * bvps1, 2),
+        "Om 2 år": round(pb_avg * bvps2, 2),
+        "Om 3 år": round(pb_avg * bvps3, 2),
+    }
+
+def pb_targets_from_row(row: pd.Series) -> dict:
+    """Använd sparade PB-riktkurser om de finns – annars försök räkna 'Idag' från P/B * BVPS."""
+    have_all = all(float(row.get(f"PB Riktkurs {hz}", 0.0)) > 0 for hz in ["idag", "om 1 år", "om 2 år", "om 3 år"])
+    if have_all:
+        return {
+            "Idag": float(row.get("PB Riktkurs idag", 0.0)),
+            "Om 1 år": float(row.get("PB Riktkurs om 1 år", 0.0)),
+            "Om 2 år": float(row.get("PB Riktkurs om 2 år", 0.0)),
+            "Om 3 år": float(row.get("PB Riktkurs om 3 år", 0.0)),
+        }
+    # fallback: endast idag
     pb = _pb_avg(row)
-    bvps = float(row.get("Book value / share", 0.0))
-    return round(pb * bvps, 2) if (pb>0 and bvps>0) else 0.0
+    bvps0 = float(row.get("Book value / share", 0.0))
+    return {
+        "Idag": round(pb * bvps0, 2) if (pb > 0 and bvps0 > 0) else 0.0,
+        "Om 1 år": 0.0, "Om 2 år": 0.0, "Om 3 år": 0.0
+    }
 
 def upsides_from(price: float, targets: dict) -> dict:
     return {hz: (round(((tp - price)/price*100.0), 2) if (price>0 and tp>0) else 0.0) for hz, tp in targets.items()}
@@ -172,7 +236,7 @@ def sund_utdelning_80(row: pd.Series) -> float:
         return round(div * (0.80 / (p/100.0)), 4)
     return 0.0
 
-# --- Format-hjälpare för prydlig visning ---
+# --- Format-hjälpare ---
 def _fmt_num(v, nd=2):
     try:
         f = float(v)
@@ -190,6 +254,7 @@ def _fmt_pct(v, nd=2):
         return f"{f:.{nd}f}%"
     except Exception:
         return "—"
+
 
 # ---------------- Beräkningar + persist ----------------
 def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
@@ -220,6 +285,7 @@ def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
         df.at[i, "Riktkurs om 3 år"] = target_price_ps(df.loc[i], "Om 3 år")
     return df
 
+
 # ---------------- I/O Sheets ----------------
 def _load_df(worksheet_name: str | None) -> pd.DataFrame:
     try:
@@ -240,6 +306,7 @@ def _save_df(df: pd.DataFrame, worksheet_name: str | None) -> None:
         st.success("Sparat till Google Sheets.")
     except Exception as e:
         st.warning(f"⚠️ Kunde inte spara: {e}")
+
 
 # ---------------- Scoring (poäng) ----------------
 def _norm(val: float, top: float) -> float:
@@ -275,8 +342,8 @@ def score_utdelning(row: pd.Series, horizon: str) -> float:
     price = float(row.get("Aktuell kurs", 0.0))
     t_ps = target_price_ps(row, horizon)
     up_ps = ((t_ps - price) / price * 100.0) if (price > 0 and t_ps > 0) else 0.0
-    t_pb = pb_target(row)
-    up_pb = ((t_pb - price) / price * 100.0) if (price > 0 and t_pb > 0) else 0.0
+    pb_t = pb_targets_from_row(row)
+    up_pb = ((pb_t.get(horizon,0.0) - price) / price * 100.0) if (price>0 and pb_t.get(horizon,0.0)>0) else 0.0
     value_up = max(up_ps, up_pb)
     value_bonus = 10.0 * _norm(value_up, 60.0)
 
@@ -288,7 +355,8 @@ def score_utdelning(row: pd.Series, horizon: str) -> float:
 
 def score_finans_pb(row: pd.Series, horizon: str) -> float:
     price = float(row.get("Aktuell kurs", 0.0))
-    tpb = pb_target(row)
+    pb_t = pb_targets_from_row(row)
+    tpb = pb_t.get(horizon, 0.0)
     pb_up = ((tpb - price) / price * 100.0) if price > 0 and tpb > 0 else 0.0
 
     nm = float(row.get("Net margin (%)", 0.0))
@@ -308,6 +376,7 @@ def infer_mode_from_sector(sector: str) -> str:
     if any(x in s for x in ["utility", "telecom", "real estate", "staples", "försörjning", "fastigheter"]):
         return "Utdelning"
     return "Tillväxt"
+
 
 # ---------------- Kortvy-render ----------------
 def _get_score_for_mode(row: pd.Series, mode: str, horizon: str) -> float:
@@ -332,12 +401,14 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
         st.caption(meta)
 
     price = float(row.get("Aktuell kurs", 0.0))
+    # PS
     tps_all = ps_targets_all(row)
     ups_ps_all = upsides_from(price, tps_all)
-    tpb = pb_target(row)
-    up_pb = ((tpb - price)/price*100.0) if (price>0 and tpb>0) else 0.0
     tp_sel = tps_all.get(horizon, 0.0)
     up_sel = ups_ps_all.get(horizon, 0.0)
+    # PB
+    pb_targets = pb_targets_from_row(row)
+    pb_ups = upsides_from(price, pb_targets)
 
     yld_calc = current_yield_pct(row)
     payout = float(row.get("Payout ratio (%)", 0.0))
@@ -354,10 +425,10 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
     with c2:
         st.metric(f"Riktkurs ({horizon}) [PS]", _fmt_num(tp_sel))
         st.metric("Uppsida (Vald) [PS]", _fmt_pct(up_sel))
-        st.write("Riktkurs [PB]:", _fmt_num(tpb))
-    with c3:
-        st.metric("Uppsida [PB]", _fmt_pct(up_pb))
         st.write("P/S-snitt (Q1-4):", _fmt_num(row.get("P/S-snitt",0)))
+    with c3:
+        st.metric(f"Riktkurs ({horizon}) [PB]", _fmt_num(pb_targets.get(horizon,0)))
+        st.metric("Uppsida (Vald) [PB]", _fmt_pct(pb_ups.get(horizon,0)))
         st.write("P/B-snitt (Q1-4):", _fmt_num(row.get("P/B-snitt (Q1..Q4)",0)))
     with c4:
         st.metric("Poäng", _fmt_num(score, 1))
@@ -365,7 +436,7 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
         st.write("P/B (nu):", _fmt_num(row.get("P/B",0)))
 
     with st.expander("📌 Riktkurser & uppsidor (PS & PB)", expanded=True):
-        rk_cols = st.columns(5)
+        rk_cols = st.columns(4)
         with rk_cols[0]:
             st.write("**PS – Riktkurs**")
             for hz in HORIZONS:
@@ -376,14 +447,12 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
                 st.write(f"{hz}:", _fmt_pct(ups_ps_all[hz]))
         with rk_cols[2]:
             st.write("**PB – Riktkurs**")
-            st.write(_fmt_num(tpb))
+            for hz in HORIZONS:
+                st.write(f"{hz}:", _fmt_num(pb_targets.get(hz,0)))
         with rk_cols[3]:
             st.write("**PB – Uppsida**")
-            st.write(_fmt_pct(up_pb))
-        with rk_cols[4]:
-            st.write("**Viktad vy**")
-            st.write("Valt läge:", mode)
-            st.write("Poäng:", _fmt_num(score, 1))
+            for hz in HORIZONS:
+                st.write(f"{hz}:", _fmt_pct(pb_ups.get(hz,0)))
 
     with st.expander("💵 Omsättning & tillväxt", expanded=False):
         c = st.columns(4)
@@ -413,6 +482,7 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
         with c[1]:
             st.write("EV/EBITDA (ttm):", _fmt_num(row.get("EV/EBITDA (ttm)",0)))
             st.write("Book value / share:", _fmt_num(row.get("Book value / share",0)))
+            st.write("BVPS CAGR:", _fmt_pct(row.get("BVPS CAGR (%)",0)))
         with c[2]:
             st.write("P/S Q1:", _fmt_num(row.get("P/S Q1",0)))
             st.write("P/S Q2:", _fmt_num(row.get("P/S Q2",0)))
@@ -503,11 +573,13 @@ with st.sidebar:
     cad = st.number_input("CAD → SEK", key="rate_cad", value=float(pref.get("CAD", DEFAULT_RATES["CAD"])), step=0.0001, format="%.6f")
     eur = st.number_input("EUR → SEK", key="rate_eur", value=float(pref.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
 
-    def _apply_rates_to_widgets(rates: dict):
+    def _apply_rates_to_widgets_and_rerun(rates: dict):
+        # Uppdatera widget-värden och rerun för att undvika "cannot be modified..."-felet
         st.session_state["rate_usd"] = float(rates.get("USD", DEFAULT_RATES["USD"]))
         st.session_state["rate_nok"] = float(rates.get("NOK", DEFAULT_RATES["NOK"]))
         st.session_state["rate_cad"] = float(rates.get("CAD", DEFAULT_RATES["CAD"]))
         st.session_state["rate_eur"] = float(rates.get("EUR", DEFAULT_RATES["EUR"]))
+        st.rerun()
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -515,9 +587,7 @@ with st.sidebar:
             try:
                 live = fetch_live_rates()
                 st.session_state["_live_rates"] = live
-                _apply_rates_to_widgets(live)
-                st.success("Livekurser inlästa.")
-                st.rerun()
+                _apply_rates_to_widgets_and_rerun(live)
             except Exception as e:
                 st.error(f"Kunde inte hämta livekurser: {e}")
     with c2:
@@ -532,7 +602,6 @@ with st.sidebar:
             try:
                 save_rates(to_save)
                 st.success("Valutakurser sparade till Google Sheets.")
-                _apply_rates_to_widgets(to_save)
             except Exception as e:
                 st.error(f"Kunde inte spara kurser: {e}")
     with c3:
@@ -540,9 +609,7 @@ with st.sidebar:
             try:
                 saved = read_rates()
                 st.session_state.pop("_live_rates", None)
-                _apply_rates_to_widgets(saved)
-                st.success("Läste sparade kurser.")
-                st.rerun()
+                _apply_rates_to_widgets_and_rerun(saved)
             except Exception as e:
                 st.error(f"Kunde inte läsa sparade kurser: {e}")
 
@@ -554,7 +621,7 @@ with st.sidebar:
     # Datakällor vid uppdatering
     use_finvi = st.checkbox("Komplettera med Finviz", value=False, help="Fyller luckor där Yahoo saknar värden.")
     use_mstar = st.checkbox("Komplettera med Morningstar", value=False, help="Fyller kvarvarande luckor.")
-    use_sec_pb = st.checkbox("Beräkna P/B 4Q via SEC", value=True, help="Hämtar equity & shares per period från SEC och pris från Yahoo.")
+    use_sec_pb = st.checkbox("Beräkna P/B 4Q + PB-riktkurs via SEC", value=True, help="Hämtar equity & shares per period från SEC och pris från Yahoo.")
     use_stw   = st.checkbox("Hämta Stocktwits (sentiment)", value=False, help="Meddelanden 24h, bull/bear, watchlist m.m.")
 
     # Force fresh
@@ -651,7 +718,6 @@ with st.sidebar:
                     try:
                         fv = finviz_get(tkr)
                         used_sources.append("Finviz")
-                        # fyll endast om noll/blankt
                         def fill(col, key):
                             cur = float(df0.at[i, col]) if col in df0.columns else 0.0
                             val = float(fv.get(key) or 0.0)
@@ -696,11 +762,14 @@ with st.sidebar:
                     except Exception as e:
                         st.write(f"Morningstar misslyckades för {tkr}: {e}")
 
-                # --- SEC P/B historik (valfritt) ---
+                # --- SEC P/B historik + PB-riktkurser (valfritt) ---
                 if use_sec_pb:
                     try:
                         pbdata = get_pb_quarters(tkr)
                         pbs = pbdata.get("pb_quarters", [])
+                        details = pbdata.get("details", []) or []
+
+                        # P/B kvartal (4 senaste → Q1..Q4)
                         p_values = [float(x[1]) for x in pbs]
                         q = [0.0, 0.0, 0.0, 0.0]
                         for idx_, val in enumerate(reversed(p_values[-4:])):
@@ -709,6 +778,28 @@ with st.sidebar:
                         df0.at[i, "P/B Q2"] = q[1]
                         df0.at[i, "P/B Q3"] = q[2]
                         df0.at[i, "P/B Q4"] = q[3]
+
+                        # BVPS0 (nu) från SEC-details senaste, annars från Book value / share
+                        bvps0 = 0.0
+                        if details:
+                            latest = max(details, key=lambda d: d.get("date",""))
+                            bvps0 = float(latest.get("bvps") or 0.0)
+                        if bvps0 <= 0:
+                            bvps0 = float(df0.at[i, "Book value / share"]) if "Book value / share" in df0.columns else 0.0
+
+                        # BVPS-CAGR (%)
+                        g_bv = _bvps_cagr_from_sec_details(details)  # andel
+                        if g_bv != 0:
+                            df0.at[i, "BVPS CAGR (%)"] = round(g_bv * 100.0, 2)
+
+                        # PB-snitt och PB-riktkurser (Idag/1y/2y/3y)
+                        pb_avg = _pb_avg(df0.loc[i])
+                        pb_tps = pb_targets_all_from_bvps(pb_avg, bvps0, g_bv)
+                        df0.at[i, "PB Riktkurs idag"]    = pb_tps["Idag"]
+                        df0.at[i, "PB Riktkurs om 1 år"] = pb_tps["Om 1 år"]
+                        df0.at[i, "PB Riktkurs om 2 år"] = pb_tps["Om 2 år"]
+                        df0.at[i, "PB Riktkurs om 3 år"] = pb_tps["Om 3 år"]
+
                         used_sources.append("SEC")
                     except Exception as e:
                         st.write(f"SEC/PB misslyckades för {tkr}: {e}")
@@ -738,9 +829,11 @@ with st.sidebar:
             st.session_state["_df_ref"] = df0
             _save_df(df0, ws_name)
 
+
 # ---------------- Första läsning ----------------
 if "_df_ref" not in st.session_state:
     st.session_state["_df_ref"] = _load_df(st.secrets.get("WORKSHEET_NAME") or "Blad1")
+
 
 # ---------------- Flikar ----------------
 tab_data, tab_collect, tab_port, tab_suggest = st.tabs(["📄 Data", "🧩 Manuell insamling", "📦 Portfölj", "💡 Köpförslag"])
@@ -825,12 +918,18 @@ with tab_suggest:
         rows = []
         for _, r in base.iterrows():
             price = float(r.get("Aktuell kurs", 0.0))
+
+            # PS
             tps = ps_targets_all(r)
             ups_ps = upsides_from(price, tps)
-            tpb = pb_target(r)
-            up_pb = round(((tpb - price)/price*100.0), 2) if (price>0 and tpb>0) else 0.0
-            tp_sel = tps.get(horizon, 0.0)
-            up_sel = ups_ps.get(horizon, 0.0)
+            # PB
+            pb_t = pb_targets_from_row(r)
+            pb_ups = upsides_from(price, pb_t)
+
+            tp_sel_ps = tps.get(horizon, 0.0)
+            up_sel_ps = ups_ps.get(horizon, 0.0)
+            tp_sel_pb = pb_t.get(horizon, 0.0)
+            up_sel_pb = pb_ups.get(horizon, 0.0)
 
             payout = float(r.get("Payout ratio (%)", 0.0))
             yld_calc = current_yield_pct(r)
@@ -855,20 +954,20 @@ with tab_suggest:
                 "Valuta": r.get("Valuta",""),
                 "Aktuell kurs": price,
 
-                f"Riktkurs (Vald={horizon}) [PS]": tp_sel,
-                "Uppsida (Vald) [PS] %": up_sel,
+                f"Riktkurs (Vald={horizon}) [PS]": tp_sel_ps,
+                "Uppsida (Vald) [PS] %": up_sel_ps,
+                f"Riktkurs (Vald={horizon}) [PB]": tp_sel_pb,
+                "Uppsida (Vald) [PB] %": up_sel_pb,
 
                 "Riktkurs (Idag) [PS]": tps["Idag"],
                 "Riktkurs (Om 1 år) [PS]": tps["Om 1 år"],
                 "Riktkurs (Om 2 år) [PS]": tps["Om 2 år"],
                 "Riktkurs (Om 3 år) [PS]": tps["Om 3 år"],
-                "Uppsida (Idag) [PS] %": ups_ps["Idag"],
-                "Uppsida (Om 1 år) [PS] %": ups_ps["Om 1 år"],
-                "Uppsida (Om 2 år) [PS] %": ups_ps["Om 2 år"],
-                "Uppsida (Om 3 år) [PS] %": ups_ps["Om 3 år"],
 
-                "Riktkurs [PB]": tpb,
-                "Uppsida [PB] %": up_pb,
+                "Riktkurs (Idag) [PB]": pb_t["Idag"],
+                "Riktkurs (Om 1 år) [PB]": pb_t["Om 1 år"],
+                "Riktkurs (Om 2 år) [PB]": pb_t["Om 2 år"],
+                "Riktkurs (Om 3 år) [PB]": pb_t["Om 3 år"],
 
                 "Dividend yield (%)": yld_calc,
                 "Payout ratio (%)": payout,
@@ -896,7 +995,7 @@ with tab_suggest:
                 rk_basis = st.selectbox("Riktkurs-basis", ["PS", "PB"], index=0)
                 max_up = st.slider("Max uppsida (%)", 0.0, 100.0, 5.0, 0.5)
                 max_price = st.number_input("Max aktuell kurs (valfritt)", value=0.0, step=1.0)
-                ups_col = ("Uppsida (Vald) [PS] %" if rk_basis == "PS" else "Uppsida [PB] %")
+                ups_col = ("Uppsida (Vald) [PS] %" if rk_basis == "PS" else "Uppsida (Vald) [PB] %")
                 prop_f = prop[prop[ups_col] <= max_up].copy()
                 if max_price and max_price > 0:
                     prop_f = prop_f[prop_f["Aktuell kurs"] <= max_price]

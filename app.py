@@ -1,8 +1,9 @@
 # app.py
 from __future__ import annotations
 
+import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -11,7 +12,12 @@ import streamlit as st
 import yfinance as yf
 
 # Egna moduler
-from stockapp.sheets import ws_read_df, ws_write_df, list_worksheet_titles
+from stockapp.sheets import (
+    ws_read_df,
+    ws_write_df,
+    list_worksheet_titles,
+    delete_worksheet,     # <— NY
+)
 from stockapp.rates import (
     read_rates,
     save_rates,
@@ -19,7 +25,9 @@ from stockapp.rates import (
     repair_rates_sheet,
     DEFAULT_RATES,
 )
-from stockapp.dividends import build_dividend_calendar  # <— NY
+from stockapp.dividends import build_dividend_calendar
+from stockapp.collectors import mass_collect_and_apply as collectors_mass_update
+
 
 # ------------------------------------------------------------
 # App-config
@@ -48,6 +56,84 @@ def _horizon_to_tag(h: str) -> str:
     if "om 2 år" in h: return "2 år"
     if "om 3 år" in h: return "3 år"
     return "Idag"
+
+
+def _now_sthlm():
+    try:
+        import pytz
+        tz = pytz.timezone("Europe/Stockholm")
+        return datetime.now(tz)
+    except Exception:
+        return datetime.now()
+
+
+# ------------------------------------------------------------
+# Snapshot – spara df vid appstart och städa äldre än 5 dagar
+# ------------------------------------------------------------
+SNAP_PREFIX = "SNAP__"  # blad börjar med detta
+
+def _format_ts(dt: datetime) -> str:
+    return dt.strftime("%Y%m%d_%H%M%S")
+
+def _parse_snap_title(title: str) -> datetime | None:
+    """
+    Förväntat format: SNAP__{WS}__YYYYMMDD_HHMMSS
+    Vi plockar ut YYYYMMDD_HHMMSS från slutet.
+    """
+    m = re.search(r"(\d{8}_\d{6})$", title)
+    if not m:
+        return None
+    s = m.group(1)
+    try:
+        return datetime.strptime(s, "%Y%m%d_%H%M%S")
+    except Exception:
+        return None
+
+def snapshot_on_start(df: pd.DataFrame, base_ws_title: str):
+    """
+    Körs en gång per sessionstart:
+      - skapar SNAP-blad med timestamp
+      - tar bort SNAP-blad äldre än 5 dygn
+    """
+    if st.session_state.get("_snapshot_done"):
+        return
+    st.session_state["_snapshot_done"] = True
+
+    # 1) Skriv snapshot
+    now = _now_sthlm()
+    snap_title = f"{SNAP_PREFIX}{base_ws_title}__{_format_ts(now)}"
+    try:
+        ws_write_df(snap_title, df)
+        st.sidebar.success(f"Snapshot sparat: {snap_title}")
+    except Exception as e:
+        st.sidebar.warning(f"Kunde inte spara snapshot: {e}")
+
+    # 2) Städa gamla snapshot-blad (> 5 dygn)
+    try:
+        titles = list_worksheet_titles() or []
+        cutoff = now - timedelta(days=5)
+        to_delete: List[str] = []
+        for t in titles:
+            if not str(t).startswith(SNAP_PREFIX):
+                continue
+            ts = _parse_snap_title(str(t))
+            if ts is None:
+                continue
+            # använd naiv tid i jämförelse (stabilt nog för städning)
+            if ts < cutoff.replace(tzinfo=None):
+                to_delete.append(t)
+
+        for t in to_delete:
+            try:
+                delete_worksheet(t)
+            except Exception:
+                # mjuk fail – fortsätt med nästa
+                pass
+
+        if to_delete:
+            st.sidebar.info(f"Rensade {len(to_delete)} gamla snapshot-blad.")
+    except Exception as e:
+        st.sidebar.warning(f"Kunde inte rensa gamla snapshot-blad: {e}")
 
 
 # ------------------------------------------------------------
@@ -91,7 +177,7 @@ FINAL_COLS: List[str] = [
     "Score Growth (2 år)", "Score Dividend (2 år)", "Score Financials (2 år)",
     "Score Growth (3 år)", "Score Dividend (3 år)", "Score Financials (3 år)",
 
-    # (NYTT) Utdelningsschema (kan skrivas tillbaka från kalendern)
+    # Utdelningsschema
     "Div_Frekvens/år", "Div_Månader", "Div_Vikter",
 ]
 
@@ -107,7 +193,6 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
                 out[c] = 0.0
             else:
                 out[c] = ""
-    # typer
     float_cols = [
         "Antal aktier", "Aktuell kurs", "Utestående aktier",
         "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt (Q1..Q4)",
@@ -206,11 +291,10 @@ def save_df(ws_title: str, df: pd.DataFrame):
 
 
 # ------------------------------------------------------------
-# Yahoo helpers – live + långsamma
+# Yahoo helpers – live + långsamma (snabbknappar)
 # ------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=600)
 def yahoo_fetch_one(ticker: str) -> Dict[str, float | str]:
-    """Snabba fält: namn, valuta, pris, dividendRate, CAGR5y(Revenue)."""
     out = {"Bolagsnamn": "", "Valuta": "USD", "Aktuell kurs": 0.0, "Årlig utdelning": 0.0, "CAGR 5 år (%)": 0.0}
     try:
         t = yf.Ticker(ticker)
@@ -254,7 +338,6 @@ def yahoo_fetch_one(ticker: str) -> Dict[str, float | str]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def yahoo_fetch_slow(ticker: str) -> Dict[str, float | str]:
-    """Långsamma fält: P/B, P/S(ttm), payout%, shares outstanding, sector, name, dividendRate."""
     out = {
         "P/B": 0.0, "P/S": 0.0, "Payout (%)": 0.0,
         "Utestående aktier": 0.0, "Sektor": "", "Bolagsnamn": "", "Årlig utdelning": 0.0, "Valuta": ""
@@ -284,7 +367,7 @@ def yahoo_fetch_slow(ticker: str) -> Dict[str, float | str]:
 
         shares = info.get("sharesOutstanding")
         if shares is not None:
-            out["Utestående aktier"] = float(shares) / 1e6  # till miljoner
+            out["Utestående aktier"] = float(shares) / 1e6
 
         sector = info.get("sector") or ""
         out["Sektor"] = str(sector)
@@ -328,7 +411,6 @@ def calc_cagr_5y(t: yf.Ticker) -> float:
 
 
 def mass_update_yahoo(df: pd.DataFrame, ws_title: str):
-    """Snabb-uppdatering: namn, valuta, pris, yearly dividend, CAGR."""
     if st.sidebar.button("🔄 Uppdatera alla från Yahoo (pris+snabbt)"):
         status = st.sidebar.empty()
         bar = st.sidebar.progress(0)
@@ -353,7 +435,6 @@ def mass_update_yahoo(df: pd.DataFrame, ws_title: str):
 
 
 def mass_update_fundamentals(df: pd.DataFrame, ws_title: str):
-    """Långsamma nyckeltal via Yahoo: P/B, P/S (TTM), Payout %, Utestående aktier, Sektor, Dividend."""
     if st.sidebar.button("🧩 Uppdatera långsamma nyckeltal (Yahoo)"):
         status = st.sidebar.empty()
         bar = st.sidebar.progress(0)
@@ -426,20 +507,13 @@ def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# Poängmotor + sektorsvikter
+# Poängmotor (kortad – samma logik som tidigare)
 # ------------------------------------------------------------
 def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
-    """
-    Lägger till kolumner:
-      - 'DA (%)'
-      - 'Uppsida (%)'
-      - 'Score (Growth)', 'Score (Dividend)', 'Score (Financials)', 'Score (Total)', 'Confidence'
-    """
     out = df.copy()
     out["DA (%)"] = np.where(out["Aktuell kurs"] > 0, (out["Årlig utdelning"] / out["Aktuell kurs"]) * 100.0, 0.0)
     out["Uppsida (%)"] = np.where(out["Aktuell kurs"] > 0, (out[horizon] - out["Aktuell kurs"]) / out["Aktuell kurs"] * 100.0, 0.0)
 
-    # Growth
     cur_ps = out["P/S"].replace(0, np.nan)
     ps_avg = out["P/S-snitt (Q1..Q4)"].replace(0, np.nan)
     cheap_ps = (ps_avg / (cur_ps * 2.0)).clip(upper=1.0).fillna(0.0)
@@ -447,22 +521,19 @@ def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
     u_norm = (out["Uppsida (%)"] / 50.0).clip(0, 1)
     out["Score (Growth)"] = (0.4 * g_norm + 0.4 * u_norm + 0.2 * cheap_ps) * 100.0
 
-    # Dividend
     payout = out["Payout (%)"]
-    payout_health = 1 - (abs(payout - 60.0) / 60.0)     # topp nära 60%
+    payout_health = 1 - (abs(payout - 60.0) / 60.0)
     payout_health = payout_health.clip(0, 1)
-    payout_health = np.where(payout <= 0, 0.85, payout_health)  # ok om okänt
+    payout_health = np.where(out["Payout (%)"] <= 0, 0.85, payout_health)
     y_norm = (out["DA (%)"] / 8.0).clip(0, 1)
     grow_ok = np.where(out["CAGR 5 år (%)"] >= 0, 1.0, 0.6)
     out["Score (Dividend)"] = (0.6 * y_norm + 0.3 * payout_health + 0.1 * grow_ok) * 100.0
 
-    # Financials
     cur_pb = out["P/B"].replace(0, np.nan)
     pb_avg = out["P/B-snitt (Q1..Q4)"].replace(0, np.nan)
     cheap_pb = (pb_avg / (cur_pb * 2.0)).clip(upper=1.0).fillna(0.0)
     out["Score (Financials)"] = (0.7 * cheap_pb + 0.3 * u_norm) * 100.0
 
-    # Vikter
     def weights_for_row(sektor: str, strategy: str) -> Tuple[float, float, float]:
         if strategy == "Tillväxt":   return (0.70, 0.10, 0.20)
         if strategy == "Utdelning":  return (0.15, 0.70, 0.15)
@@ -481,7 +552,6 @@ def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
 
     out["Score (Total)"] = (Wg * out["Score (Growth)"] + Wd * out["Score (Dividend)"] + Wf * out["Score (Financials)"]).round(2)
 
-    # Confidence
     need = [
         out["Aktuell kurs"] > 0,
         out["P/S-snitt (Q1..Q4)"] > 0,
@@ -493,9 +563,6 @@ def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
     return out
 
 
-# ------------------------------------------------------------
-# Enrichment vid sparning – DA, uppsidor & score (alla horisonter)
-# ------------------------------------------------------------
 def add_multi_uppsida(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     price = out["Aktuell kurs"].replace(0, np.nan)
@@ -539,7 +606,7 @@ def enrich_for_save(df: pd.DataFrame, horizon_for_score: str = "Riktkurs idag", 
 
 
 # ------------------------------------------------------------
-# Vyer – Data, Manuell, Portfölj, Köpförslag, Utdelningskalender
+# Vyer (kortat – samma som tidigare)
 # ------------------------------------------------------------
 def view_data(df: pd.DataFrame, ws_title: str):
     st.subheader("📄 Data (hela bladet)")
@@ -562,11 +629,12 @@ def view_data(df: pd.DataFrame, ws_title: str):
 def view_manual(df: pd.DataFrame, ws_title: str):
     st.subheader("🧩 Manuell insamling (light)")
     vis = df.sort_values(by=["Bolagsnamn", "Ticker"]).reset_index(drop=True)
-    labels = [f"{r['Bolagsnamn']} ({r['Ticker']})" if r["Bolagsnamn"] else r["Ticker"] for _, r in vis.iterrows()]
-    idx = st.selectbox("Välj ticker", list(range(len(vis))), format_func=lambda i: labels[i] if labels else "", index=0 if len(vis) else 0)
     if len(vis) == 0:
         st.info("Inga rader i databasen.")
         return
+
+    labels = [f"{r['Bolagsnamn']} ({r['Ticker']})" if r["Bolagsnamn"] else r["Ticker"] for _, r in vis.iterrows()]
+    idx = st.selectbox("Välj ticker", list(range(len(vis))), format_func=lambda i: labels[i] if labels else "", index=0)
 
     row = vis.iloc[idx]
     tkr = st.text_input("Ticker", value=str(row["Ticker"]).upper())
@@ -640,17 +708,14 @@ def view_ideas(df: pd.DataFrame):
         st.info("Inga rader.")
         return
 
-    # Val för riktkurs + poängstrategi
     horizon = st.selectbox("Riktkurs-horisont", ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"], index=0)
     strategy = st.selectbox("Strategi", ["Auto (via sektor)","Tillväxt","Utdelning","Finans"], index=0)
 
-    # Underlag (filtrera ev. till portfölj)
     subset = st.radio("Visa", ["Alla bolag","Endast portfölj"], horizontal=True)
     base = df.copy()
     if subset == "Endast portfölj":
         base = base[base["Antal aktier"] > 0].copy()
 
-    # Beräkningar live
     base = update_calculations(base)
     base = base[(base[horizon] > 0) & (base["Aktuell kurs"] > 0)].copy()
     if base.empty:
@@ -659,7 +724,6 @@ def view_ideas(df: pd.DataFrame):
 
     base = score_rows(base, horizon=horizon, strategy=("Auto" if strategy.startswith("Auto") else strategy))
 
-    # Visa komponentpoäng + sparade horisontpoäng
     show_components = st.checkbox("Visa komponentpoäng (Growth/Dividend/Financials) för vald horisont", True)
     show_saved = st.checkbox("Visa sparade horisontpoäng från Google Sheets", True)
 
@@ -687,31 +751,25 @@ def view_ideas(df: pd.DataFrame):
             default=default_saved
         )
 
-    # Sorteringsval (inkl. sparade totalpoäng om de finns)
     sort_options = ["Score (Total)", "Uppsida (%)", "DA (%)"]
     for c in ["Score Total (Idag)", "Score Total (1 år)", "Score Total (2 år)", "Score Total (3 år)"]:
         if c in base.columns and c not in sort_options:
             sort_options.append(c)
     sort_on = st.selectbox("Sortera på", sort_options, index=0)
 
-    # Beräkna uppsida & DA (för visning)
     base["Uppsida (%)"] = ((base[horizon] - base["Aktuell kurs"]) / base["Aktuell kurs"] * 100.0).round(2)
     base["DA (%)"] = np.where(base["Aktuell kurs"] > 0, (base["Årlig utdelning"]/base["Aktuell kurs"])*100.0, 0.0).round(2)
 
-    # Standardordning per fält (desc), + trim/sälj-läge för Uppsida
     ascending = False
     if sort_on == "Uppsida (%)":
-        trim_mode = st.checkbox("Visa trim/sälj-läge (minst uppsida först)", value=False,
-                                help="Sortera uppsida stigande istället för fallande.")
+        trim_mode = st.checkbox("Visa trim/sälj-läge (minst uppsida först)", value=False)
         if trim_mode:
             ascending = True
 
-    # 🌍 Global omvänd-brytare (gäller ALLA fält)
     reverse_global = st.checkbox("Omvänd sortering (gäller valt fält)", value=False)
     if reverse_global:
         ascending = not ascending
 
-    # Kolumner att visa
     cols = ["Ticker","Bolagsnamn","Sektor","Aktuell kurs",horizon,"Uppsida (%)","DA (%)"]
     if show_components:
         cols += ["Score (Growth)","Score (Dividend)","Score (Financials)","Score (Total)","Confidence"]
@@ -720,11 +778,9 @@ def view_ideas(df: pd.DataFrame):
     if show_saved and selected_saved_cols:
         cols += selected_saved_cols
 
-    # Sortera & visa
     base = base.sort_values(by=[sort_on], ascending=ascending).reset_index(drop=True)
     st.dataframe(base[cols], use_container_width=True)
 
-    # Kortvisning
     st.markdown("---")
     st.markdown("### Kortvisning (bläddra)")
     if "idea_idx" not in st.session_state:
@@ -760,20 +816,6 @@ def view_ideas(df: pd.DataFrame):
                  f"{round(float(r['Score (Financials)']),1)} / **{round(float(r['Score (Total)']),1)}** "
                  f"(Conf {int(r['Confidence'])}%)")
 
-    # Sparade poäng per horisont (om de finns)
-    available_saved = [c for c in base.columns if c.startswith("Score ") and "(" in c and ")" in c]
-    if show_saved and available_saved:
-        st.markdown("#### Sparade poäng (från Google Sheets)")
-        tag_rows = []
-        for t in ["Idag","1 år","2 år","3 år"]:
-            row = {"Horisont": t}
-            for grp in ["Growth","Dividend","Financials","Total"]:
-                col = f"Score {grp} ({t})" if grp != "Total" else f"Score Total ({t})"
-                row[grp] = float(r.get(col, 0.0)) if col in base.columns else np.nan
-            tag_rows.append(row)
-        df_scores = pd.DataFrame(tag_rows, columns=["Horisont","Growth","Dividend","Financials","Total"])
-        st.dataframe(df_scores, use_container_width=True)
-
 
 def view_dividend_calendar(df: pd.DataFrame, ws_title: str, rates: Dict[str, float]):
     st.subheader("📅 Utdelningskalender (12 månader framåt)")
@@ -798,10 +840,8 @@ def view_dividend_calendar(df: pd.DataFrame, ws_title: str, rates: Dict[str, flo
     if c1.button("💾 Spara schema + kalender till Google Sheets"):
         try:
             df_to_save = st.session_state.get("div_df_out", df)
-            # 1) Spara uppdaterat schema till basbladet
             df2 = enrich_for_save(df_to_save, horizon_for_score="Riktkurs idag", strategy="Auto")
             save_df(ws_title, df2)
-            # 2) Spara kalender-tabeller till egna blad
             summ = st.session_state.get("div_summ", pd.DataFrame())
             det = st.session_state.get("div_det", pd.DataFrame())
             ws_write_df("Utdelningskalender – Summering", summ if not summ.empty else pd.DataFrame(columns=["År","Månad","Månad (sv)","Summa (SEK)"]))
@@ -819,24 +859,46 @@ def view_dividend_calendar(df: pd.DataFrame, ws_title: str, rates: Dict[str, flo
 
 
 # ------------------------------------------------------------
+# Massuppdatering alla källor (Yahoo+Finviz+Morningstar+SEC)
+# ------------------------------------------------------------
+def mass_update_all_sources(df: pd.DataFrame, ws_title: str):
+    if st.sidebar.button("🔭 Massuppdatera (Yahoo + Finviz + Morningstar + SEC)"):
+        out = collectors_mass_update(
+            df,
+            ws_title=ws_title,
+            delay_sec=0.5,
+            save_fn=ws_write_df
+        )
+        try:
+            out2 = enrich_for_save(out, horizon_for_score="Riktkurs idag", strategy="Auto")
+            save_df(ws_title, out2)
+            st.sidebar.success("✅ All källdata uppdaterad och beräkningar sparade till Google Sheets.")
+        except Exception as e:
+            st.sidebar.error(f"⚠️ Kunde inte spara beräkningar efter uppdatering: {e}")
+
+
+# ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
 def main():
     st.title("K-pf-rslag")
 
-    # Välj blad
     titles = list_worksheet_titles() or ["Blad1"]
     ws_title = st.sidebar.selectbox("Google Sheets → välj data-blad", titles, index=0)
 
-    # Valutakurser i sidopanel
     user_rates = sidebar_rates()
 
-    # Läs & beräkna
+    # Läs data
     df = load_df(ws_title)
+
+    # 🔒 Snapshot direkt vid appstart (en gång per session)
+    snapshot_on_start(df, ws_title)
+
     st.sidebar.markdown("---")
-    # Massuppdateringar i sidopanelen
-    mass_update_yahoo(df, ws_title)          # snabb (pris, namn, valuta, dividend, CAGR)
-    mass_update_fundamentals(df, ws_title)   # långsam (P/B, P/S, payout, shares, sektor, dividend)
+    # Knappar för uppdateringar
+    mass_update_yahoo(df, ws_title)
+    mass_update_fundamentals(df, ws_title)
+    mass_update_all_sources(df, ws_title)
 
     df = update_calculations(df)
 

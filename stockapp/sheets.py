@@ -1,76 +1,34 @@
-# stockapp/sheets.py
+"""
+Robust Google Sheets–IO utan externa beroenden (ingen gspread_dataframe).
+Ger: ws_read_df, ws_write_df, list_worksheet_titles, get_spreadsheet.
+Läser service account från st.secrets:
+- GOOGLE_CREDENTIALS  (dict eller JSON-sträng)
+- alt. GOOGLE_SHEETS: { SPREADSHEET_ID | SHEET_URL, GOOGLE_CREDENTIALS? }
+Och Spreadsheet-ID/URL:
+- SHEET_URL  eller  SPREADSHEET_ID  (även under GOOGLE_SHEETS)
+"""
+
 from __future__ import annotations
 
 import json
-import re
 import time
-from collections.abc import Mapping
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+
+# gspread + google auth
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ------------------------------------------------------------
-#  Scopes & auth – identiskt med din gamla app
-# ------------------------------------------------------------
-_SCOPES = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
 
-
-def _sa_from_secrets() -> dict:
-    """
-    Läs servicekontot från st.secrets["GOOGLE_CREDENTIALS"].
-    Stöder:
-      - AttrDict (Streamlit) / dict -> konverteras till vanlig dict
-      - JSON-sträng (hela JSON-innehållet)
-    Normaliserar private_key (\\n -> \n).
-    """
-    if "GOOGLE_CREDENTIALS" not in st.secrets:
-        raise RuntimeError("Saknar 'GOOGLE_CREDENTIALS' i secrets.")
-
-    raw = st.secrets["GOOGLE_CREDENTIALS"]
-
-    def _to_plain_dict(x):
-        if isinstance(x, Mapping):
-            return {k: _to_plain_dict(v) for k, v in x.items()}
-        return x
-
-    if isinstance(raw, str):
-        sa = json.loads(raw)
-    else:
-        sa = _to_plain_dict(raw)
-
-    pk = sa.get("private_key")
-    if isinstance(pk, str) and "\\n" in pk:
-        sa["private_key"] = pk.replace("\\n", "\n")
-
-    if not sa.get("client_email") or not sa.get("private_key"):
-        raise RuntimeError("GOOGLE_CREDENTIALS saknar 'client_email' eller 'private_key'.")
-
-    return sa
-
-
-def _client() -> gspread.Client:
-    sa = _sa_from_secrets()
-    creds = Credentials.from_service_account_info(sa, scopes=_SCOPES)
-    return gspread.authorize(creds)
-
-
-def _spreadsheet_url() -> str:
-    if "SHEET_URL" not in st.secrets:
-        raise RuntimeError("Saknar 'SHEET_URL' i secrets.")
-    return st.secrets["SHEET_URL"]
-
-
+# ---------------- Backoff-hjälpare ----------------
 def _with_backoff(func, *args, **kwargs):
+    delays = [0, 0.5, 1.0, 2.0]
     last_err = None
-    for delay in (0, 0.5, 1.0, 2.0):
-        if delay:
-            time.sleep(delay)
+    for d in delays:
+        if d:
+            time.sleep(d)
         try:
             return func(*args, **kwargs)
         except Exception as e:
@@ -78,76 +36,151 @@ def _with_backoff(func, *args, **kwargs):
     raise last_err
 
 
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.strip().lower())
-
-
-def _resolve_worksheet(sh: gspread.Spreadsheet, preferred: Optional[str]) -> gspread.Worksheet:
-    names = [ws.title for ws in sh.worksheets()]
-    if not names:
-        return sh.add_worksheet(title="Blad1", rows="100", cols="26")
-
-    if preferred and preferred in names:
-        return sh.worksheet(preferred)
-
-    if preferred:
-        p = _norm(preferred)
-        for n in names:
-            if _norm(n) == p:
-                return sh.worksheet(n)
-
-    for cand in ["Blad1", "Data", "Sheet1", "Ark1", "Blad", "Sheet", "Ark"]:
-        for n in names:
-            if _norm(n) == _norm(cand):
-                return sh.worksheet(n)
-
-    return sh.worksheets()[0]
-
-
-# ------------------------------------------------------------
-#  Publikt API – exakt vad appen anropar
-# ------------------------------------------------------------
-def list_sheet_names(spreadsheet_url: Optional[str] = None) -> List[str]:
-    cl = _client()
-    sh = _with_backoff(cl.open_by_url, spreadsheet_url or _spreadsheet_url())
-    return [ws.title for ws in sh.worksheets()]
-
-
-def get_ws(spreadsheet_url: Optional[str] = None,
-           worksheet_name: Optional[str] = None) -> gspread.Worksheet:
-    cl = _client()
-    sh = _with_backoff(cl.open_by_url, spreadsheet_url or _spreadsheet_url())
-    preferred = worksheet_name or st.secrets.get("WORKSHEET_NAME") or "Blad1"
-    return _resolve_worksheet(sh, preferred)
-
-
-def ws_read_df(ws: gspread.Worksheet) -> pd.DataFrame:
+# ---------------- Secrets-hjälpare ----------------
+def _from_secrets(*keys, default=None):
+    cur: Any = st.secrets
     try:
-        records = _with_backoff(ws.get_all_records)
-        df = pd.DataFrame(records)
-        if not df.empty:
-            return df
+        for k in keys:
+            if cur is None:
+                return default
+            cur = cur.get(k)
+        return cur if cur is not None else default
     except Exception:
-        pass
+        return default
 
-    values = _with_backoff(ws.get_all_values)
+
+def _load_credentials() -> Credentials:
+    """
+    Försöker läsa service account på flera sätt:
+    - st.secrets["GOOGLE_CREDENTIALS"]  (dict eller JSON-sträng)
+    - st.secrets["GOOGLE_SHEETS"]["GOOGLE_CREDENTIALS"]
+    - st.secrets["GOOGLE_SHEETS"]["SERVICE_ACCOUNT_JSON"]
+    - st.secrets["SERVICE_ACCOUNT_JSON"]
+    - eller toppnivå-fält: client_email + private_key under GOOGLE_CREDENTIALS
+    """
+    raw = (
+        _from_secrets("GOOGLE_CREDENTIALS")
+        or _from_secrets("GOOGLE_SHEETS", "GOOGLE_CREDENTIALS")
+        or _from_secrets("GOOGLE_SHEETS", "SERVICE_ACCOUNT_JSON")
+        or _from_secrets("SERVICE_ACCOUNT_JSON")
+    )
+    data: Dict[str, Any] = {}
+
+    if isinstance(raw, dict):
+        data = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # Kan vara env-liknande dump med \n i private_key – försök laga
+            try:
+                d2 = json.loads(raw.replace("\\n", "\n"))
+                data = d2
+            except Exception:
+                pass
+
+    # Fallback: leta toppnivå-nycklar
+    if not data:
+        ce = _from_secrets("client_email")
+        pk = _from_secrets("private_key")
+        if ce and pk:
+            data = {"client_email": ce, "private_key": pk, "token_uri": "https://oauth2.googleapis.com/token"}
+
+    if not data or "client_email" not in data or "private_key" not in data:
+        raise RuntimeError("Hittade inga service account-uppgifter (minst client_email + private_key).")
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    # Laga private_key om den är på en rad
+    if "\\n" in data.get("private_key", ""):
+        data["private_key"] = data["private_key"].replace("\\n", "\n")
+
+    return Credentials.from_service_account_info(data, scopes=scopes)
+
+
+def _get_spreadsheet_id_or_url() -> Dict[str, str]:
+    """
+    Returnerar {"type":"id"|"url", "value": "..."}.
+    Stöd:
+    - st.secrets["SHEET_URL"] eller ["SPREADSHEET_ID"]
+    - st.secrets["GOOGLE_SHEETS"]["SHEET_URL"] | ["SPREADSHEET_ID"]
+    """
+    url = (
+        _from_secrets("SHEET_URL")
+        or _from_secrets("GOOGLE_SHEETS", "SHEET_URL")
+    )
+    sid = (
+        _from_secrets("SPREADSHEET_ID")
+        or _from_secrets("GOOGLE_SHEETS", "SPREADSHEET_ID")
+    )
+    if url:
+        return {"type": "url", "value": url}
+    if sid:
+        return {"type": "id", "value": sid}
+    raise RuntimeError("Hittade inget Spreadsheet-ID/URL i secrets.")
+
+
+# ---------------- gspread-klient & Spreadsheet ----------------
+def _client() -> gspread.Client:
+    creds = _load_credentials()
+    return gspread.authorize(creds)
+
+
+def get_spreadsheet() -> gspread.Spreadsheet:
+    cli = _client()
+    ref = _get_spreadsheet_id_or_url()
+    if ref["type"] == "url":
+        return _with_backoff(cli.open_by_url, ref["value"])
+    return _with_backoff(cli.open_by_key, ref["value"])
+
+
+def list_worksheet_titles() -> List[str]:
+    try:
+        ss = get_spreadsheet()
+        return [ws.title for ws in _with_backoff(ss.worksheets)]
+    except Exception:
+        return []
+
+
+# ---------------- Läs/skriv DataFrame ----------------
+def _ensure_ws(ss: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
+    try:
+        return _with_backoff(ss.worksheet, title)
+    except Exception:
+        _with_backoff(ss.add_worksheet, title=title, rows=2000, cols=50)
+        return _with_backoff(ss.worksheet, title)
+
+
+def ws_read_df(title: str) -> pd.DataFrame:
+    ss = get_spreadsheet()
+    try:
+        ws = _with_backoff(ss.worksheet, title)
+    except Exception:
+        # Finns inte – returnera tom df
+        return pd.DataFrame()
+
+    values: List[List[str]] = _with_backoff(ws.get_all_values)
     if not values:
         return pd.DataFrame()
-    header, rows = values[0], values[1:]
-    return pd.DataFrame(rows, columns=header)
+    # Förväntar första raden = headers
+    headers = values[0]
+    rows = values[1:] if len(values) > 1 else []
+    df = pd.DataFrame(rows, columns=headers)
+    return df
 
 
-def ws_write_df(ws: gspread.Worksheet, df: pd.DataFrame) -> None:
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError("ws_write_df: df måste vara en pandas.DataFrame")
-    header = list(map(str, df.columns.tolist()))
-    body = [header] + df.astype(str).values.tolist()
+def ws_write_df(title: str, df: pd.DataFrame):
+    ss = get_spreadsheet()
+    ws = _ensure_ws(ss, title)
+
+    # Bygg body = [headers] + rows (som strängar)
+    headers = list(map(str, df.columns.tolist()))
+    rows = [[str(x) if x is not None else "" for x in row] for row in df.astype(object).values.tolist()]
+    body = [headers] + rows if headers else rows
+
+    # Clear + update
     _with_backoff(ws.clear)
-    _with_backoff(ws.update, body)
-
-
-def save_dataframe(df: pd.DataFrame,
-                   spreadsheet_url: Optional[str] = None,
-                   worksheet_name: Optional[str] = None) -> None:
-    ws = get_ws(spreadsheet_url=spreadsheet_url, worksheet_name=worksheet_name)
-    ws_write_df(ws, df)
+    if body:
+        _with_backoff(ws.update, "A1", body)

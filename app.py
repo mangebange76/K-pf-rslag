@@ -180,7 +180,7 @@ def target_price_ps(row: pd.Series, horizon: str) -> float:
     return 0.0
 
 def ps_targets_all(row: pd.Series) -> dict:
-    return {hz: target_price_ps(row, hz) for hz in HORIZONS}
+    return {hz: target_price_ps(row, hz) for hz in ["Idag","Om 1 år","Om 2 år","Om 3 år"]}
 
 # ---- PB via BVPS CAGR ----
 def _annual_years_between(d0: _dt.date, d1: _dt.date) -> float:
@@ -310,13 +310,6 @@ def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
         # Dividend yield (%) – beräkna själv (pris-känslig)
         df.at[i, "Dividend yield (%)"] = current_yield_pct(rad)
 
-        # FCF (TTM, M) härleds från ev. hel-tal (yahoo i USD) → miljoner (om redan miljoner, spelar ingen roll)
-        # Vi antar market data i samma valuta som pris. Lagrar i miljoner för konsekvens med Revenue TTM (M).
-        fcf_abs = float(rad.get("FCF (TTM, M)", 0.0))
-        if fcf_abs == 0.0:
-            # om yahoo_get gav "fcf_ttm" i absoluta tal, appen fyllde in M – inget att göra här
-            pass
-
         # Omsättning om 2/3 år – från "Omsättning nästa år"
         rev2, rev3 = _proj_from_next_year(rad)
         df.at[i, "Omsättning om 2 år"] = rev2
@@ -397,7 +390,7 @@ def score_utdelning(row: pd.Series, horizon: str) -> float:
     fcf_y = float(row.get("FCF yield (%)", 0.0))
     fcf_boost = 15.0 * _norm(fcf_y, 10.0)  # 10% FCF-yield ≈ maxboost
 
-    # Sund yield [FCF] – hur nära en attraktiv hållbar yield vi ligger
+    # Sund yield [FCF]
     sund_y = float(row.get("Sund yield (80%) [FCF]", 0.0))
     sund_boost = 15.0 * _norm(sund_y, 10.0)
 
@@ -410,7 +403,7 @@ def score_utdelning(row: pd.Series, horizon: str) -> float:
     value_up = max(up_ps, up_pb)
     value_bonus = 10.0 * _norm(value_up, 60.0)
 
-    # Risk-straff för mycket hög payout (använder valda payout)
+    # Risk-straff för mycket hög payout
     risk_penalty = 10.0 * _norm(max(0.0, payout - 100.0), 50.0)
 
     score = score_main + fcf_boost + sund_boost + value_bonus - risk_penalty
@@ -610,9 +603,6 @@ def update_all_prices(df: pd.DataFrame, worksheet_name: str, delay_sec: float = 
                 df.at[idx, "Utestående aktier (milj.)"] = float(y["shares_outstanding"]) / 1e6
             if y.get("sector"):     df.at[idx, "Sektor"] = y["sector"]
             if y.get("industry"):   df.at[idx, "Industri"] = y["industry"]
-
-            # Uppdatera FCF/utdelningsrelaterad yield on-the-fly (pris ändrat)
-            # Utdelning TTM/aktie kom i full uppdatering – här räknar vi bara yields.
         except Exception as e:
             st.write(f"⚠️ {tkr}: {e}")
 
@@ -643,28 +633,35 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("💱 Valutakurser → SEK")
 
+    # 1) Applicera köade live/sparade kurser INNAN widgets skapas
+    if "_pending_rates" in st.session_state:
+        pr = st.session_state.pop("_pending_rates")
+        st.session_state["rate_usd"] = float(pr.get("USD", DEFAULT_RATES["USD"]))
+        st.session_state["rate_nok"] = float(pr.get("NOK", DEFAULT_RATES["NOK"]))
+        st.session_state["rate_cad"] = float(pr.get("CAD", DEFAULT_RATES["CAD"]))
+        st.session_state["rate_eur"] = float(pr.get("EUR", DEFAULT_RATES["EUR"]))
+
     rates_saved = read_rates()
-    pref = st.session_state.get("_live_rates") or rates_saved
+    default_rates = {
+        "USD": float(st.session_state.get("rate_usd", rates_saved.get("USD", DEFAULT_RATES["USD"]))),
+        "NOK": float(st.session_state.get("rate_nok", rates_saved.get("NOK", DEFAULT_RATES["NOK"]))),
+        "CAD": float(st.session_state.get("rate_cad", rates_saved.get("CAD", DEFAULT_RATES["CAD"]))),
+        "EUR": float(st.session_state.get("rate_eur", rates_saved.get("EUR", DEFAULT_RATES["EUR"]))),
+    }
 
-    usd = st.number_input("USD → SEK", key="rate_usd", value=float(pref.get("USD", DEFAULT_RATES["USD"])), step=0.0001, format="%.6f")
-    nok = st.number_input("NOK → SEK", key="rate_nok", value=float(pref.get("NOK", DEFAULT_RATES["NOK"])), step=0.0001, format="%.6f")
-    cad = st.number_input("CAD → SEK", key="rate_cad", value=float(pref.get("CAD", DEFAULT_RATES["CAD"])), step=0.0001, format="%.6f")
-    eur = st.number_input("EUR → SEK", key="rate_eur", value=float(pref.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
-
-    def _apply_rates_to_widgets_and_rerun(rates: dict):
-        st.session_state["rate_usd"] = float(rates.get("USD", DEFAULT_RATES["USD"]))
-        st.session_state["rate_nok"] = float(rates.get("NOK", DEFAULT_RATES["NOK"]))
-        st.session_state["rate_cad"] = float(rates.get("CAD", DEFAULT_RATES["CAD"]))
-        st.session_state["rate_eur"] = float(rates.get("EUR", DEFAULT_RATES["EUR"]))
-        st.rerun()
+    usd = st.number_input("USD → SEK", key="rate_usd", value=default_rates["USD"], step=0.0001, format="%.6f")
+    nok = st.number_input("NOK → SEK", key="rate_nok", value=default_rates["NOK"], step=0.0001, format="%.6f")
+    cad = st.number_input("CAD → SEK", key="rate_cad", value=default_rates["CAD"], step=0.0001, format="%.6f")
+    eur = st.number_input("EUR → SEK", key="rate_eur", value=default_rates["EUR"], step=0.0001, format="%.6f")
 
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("🌐 Hämta livekurser"):
             try:
-                live = fetch_live_rates()
-                st.session_state["_live_rates"] = live
-                _apply_rates_to_widgets_and_rerun(live)
+                live = fetch_live_rates()  # {"USD":..., "NOK":..., ... , "_source": "..."}
+                st.session_state["_pending_rates"] = live
+                st.session_state["_rates_source"] = live.get("_source", "ECB")
+                st.rerun()
             except Exception as e:
                 st.error(f"Kunde inte hämta livekurser: {e}")
     with c2:
@@ -685,8 +682,9 @@ with st.sidebar:
         if st.button("↻ Läs sparade kurser"):
             try:
                 saved = read_rates()
-                st.session_state.pop("_live_rates", None)
-                _apply_rates_to_widgets_and_rerun(saved)
+                st.session_state["_pending_rates"] = saved
+                st.session_state.pop("_rates_source", None)
+                st.rerun()
             except Exception as e:
                 st.error(f"Kunde inte läsa sparade kurser: {e}")
 

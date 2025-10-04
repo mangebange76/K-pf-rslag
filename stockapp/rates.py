@@ -1,20 +1,13 @@
-"""
-Valutakurser: läs/spara mot ett separat blad samt hämta live från Yahoo Finance.
-Exponerar: read_rates, save_rates, fetch_live_rates, repair_rates_sheet, DEFAULT_RATES
-Kräver stockapp.sheets.get_spreadsheet()
-"""
-
+# stockapp/rates.py
 from __future__ import annotations
 
 import time
-from typing import Dict, List
+from typing import Dict
 
-import pandas as pd
 import streamlit as st
 
 from stockapp.sheets import get_spreadsheet, _with_backoff
 
-# yfinance används för livekurser
 try:
     import yfinance as yf
 except Exception:
@@ -38,7 +31,7 @@ def _ensure_rates_ws():
     except Exception:
         _with_backoff(ss.add_worksheet, title=RATES_SHEET_NAME, rows=20, cols=5)
         ws = _with_backoff(ss.worksheet, RATES_SHEET_NAME)
-        _with_backoff(ws.update, "A1", [["Valuta", "Kurs"]])
+        _with_backoff(ws.update, "A1", [["Valuta", "Kurs"]], value_input_option="RAW")
     return ws
 
 
@@ -53,10 +46,15 @@ def read_rates() -> Dict[str, float]:
             if not cur:
                 continue
             try:
-                out[cur] = float(val)
+                v = float(val)
+                # normalisera uppenbart fel (tex 9369999886 pga lokal-tolkning)
+                if v > 1000:  # ingen rimlig SEK-kurs för USD/NOK/CAD/EUR
+                    # prova att skala ner om det ser ut som tusentalssammanslagning
+                    while v > 1000:
+                        v /= 1000.0
+                out[cur] = float(v)
             except Exception:
                 pass
-        # lägg in standarder för saknade
         for k, v in DEFAULT_RATES.items():
             out.setdefault(k, float(v))
         return out
@@ -69,26 +67,21 @@ def save_rates(rates: Dict[str, float]):
     body = [["Valuta", "Kurs"]]
     for k in ["USD", "NOK", "CAD", "EUR", "SEK"]:
         v = float(rates.get(k, DEFAULT_RATES.get(k, 1.0)))
-        body.append([k, str(v)])
+        body.append([k, f"{v:.6f}"])
     _with_backoff(ws.clear)
-    _with_backoff(ws.update, "A1", body)
+    # RAW så att 9.37 förblir "9.37" i cellen oavsett lokal
+    _with_backoff(ws.update, "A1", body, value_input_option="RAW")
 
 
 def fetch_live_rates() -> Dict[str, float]:
-    """
-    Hämtar USD/NOK/CAD/EUR → SEK från Yahoo:
-      USDSEK=X, NOKSEK=X, CADSEK=X, EURSEK=X
-    """
     if yf is None:
         raise RuntimeError("yfinance saknas i miljön.")
-
     pairs = {
         "USD": "USDSEK=X",
         "NOK": "NOKSEK=X",
         "CAD": "CADSEK=X",
         "EUR": "EURSEK=X",
     }
-
     out: Dict[str, float] = {"SEK": 1.0}
     for cur, symbol in pairs.items():
         price = None
@@ -106,10 +99,9 @@ def fetch_live_rates() -> Dict[str, float]:
         except Exception:
             price = None
         if price is None:
-            # behåll default om misslyckas
             price = DEFAULT_RATES.get(cur, 1.0)
         out[cur] = float(price)
-        time.sleep(0.2)  # snäll throttling
+        time.sleep(0.2)
     return out
 
 
@@ -117,25 +109,16 @@ def repair_rates_sheet():
     ws = _ensure_rates_ws()
     values = _with_backoff(ws.get_all_values)
     if not values:
-        _with_backoff(ws.update, "A1", [["Valuta", "Kurs"]])
+        _with_backoff(ws.update, "A1", [["Valuta", "Kurs"]], value_input_option="RAW")
         return
-
     header = [h.strip().lower() for h in values[0]]
-    need_header = False
     if "valuta" not in header or "kurs" not in header:
-        need_header = True
-
-    if need_header:
-        # skriv om hela bladet: header + bevarade rader om möjligt
         rows = values[1:]
         fixed = [["Valuta", "Kurs"]]
-        # försök hitta två kolumner i gamla rader
         for r in rows:
-            if not r:
-                continue
-            cur = (r[0] if len(r) >= 1 else "").strip() or ""
-            val = (r[1] if len(r) >= 2 else "").strip() or ""
+            cur = (r[0] if len(r) >= 1 else "").strip()
+            val = (r[1] if len(r) >= 2 else "").strip()
             if cur:
                 fixed.append([cur, val])
         _with_backoff(ws.clear)
-        _with_backoff(ws.update, "A1", fixed)
+        _with_backoff(ws.update, "A1", fixed, value_input_option="RAW")

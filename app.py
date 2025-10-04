@@ -42,6 +42,13 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _horizon_to_tag(h: str) -> str:
+    if "om 1 år" in h: return "1 år"
+    if "om 2 år" in h: return "2 år"
+    if "om 3 år" in h: return "3 år"
+    return "Idag"
+
+
 # ------------------------------------------------------------
 # Kolumnschema
 # ------------------------------------------------------------
@@ -68,6 +75,20 @@ FINAL_COLS: List[str] = [
 
     # Övrigt
     "CAGR 5 år (%)", "Senast manuellt uppdaterad",
+
+    # (dynamiska/visuella score-kolumner – skrivs även till ark)
+    "DA (%)",
+    "Uppsida idag (%)", "Uppsida 1 år (%)", "Uppsida 2 år (%)", "Uppsida 3 år (%)",
+    "Score (Growth)", "Score (Dividend)", "Score (Financials)", "Score (Total)", "Confidence",
+
+    # Sparade totalpoäng per horisont
+    "Score Total (Idag)", "Score Total (1 år)", "Score Total (2 år)", "Score Total (3 år)",
+
+    # Sparade komponentpoäng per horisont
+    "Score Growth (Idag)", "Score Dividend (Idag)", "Score Financials (Idag)",
+    "Score Growth (1 år)", "Score Dividend (1 år)", "Score Financials (1 år)",
+    "Score Growth (2 år)", "Score Dividend (2 år)", "Score Financials (2 år)",
+    "Score Growth (3 år)", "Score Dividend (3 år)", "Score Financials (3 år)",
 ]
 
 
@@ -75,7 +96,7 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in FINAL_COLS:
         if c not in out.columns:
-            if any(k in c.lower() for k in ["kurs", "omsättning", "p/s", "p/b", "utdelning", "cagr", "aktier", "riktkurs", "payout"]):
+            if any(k in c.lower() for k in ["kurs", "omsättning", "p/s", "p/b", "utdelning", "cagr", "aktier", "riktkurs", "payout", "score", "uppsida", "da", "confidence"]):
                 out[c] = 0.0
             else:
                 out[c] = ""
@@ -87,6 +108,13 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
         "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
         "Årlig utdelning","Payout (%)","CAGR 5 år (%)",
+        "DA (%)", "Uppsida idag (%)","Uppsida 1 år (%)","Uppsida 2 år (%)","Uppsida 3 år (%)",
+        "Score (Growth)","Score (Dividend)","Score (Financials)","Score (Total)","Confidence",
+        "Score Total (Idag)", "Score Total (1 år)", "Score Total (2 år)", "Score Total (3 år)",
+        "Score Growth (Idag)", "Score Dividend (Idag)", "Score Financials (Idag)",
+        "Score Growth (1 år)", "Score Dividend (1 år)", "Score Financials (1 år)",
+        "Score Growth (2 år)", "Score Dividend (2 år)", "Score Financials (2 år)",
+        "Score Growth (3 år)", "Score Dividend (3 år)", "Score Financials (3 år)",
     ]
     for c in float_cols:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
@@ -373,7 +401,7 @@ def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# Enrichment vid sparning – DA, uppsidor för alla horisonter & score
+# Enrichment vid sparning – DA, uppsidor & score (alla horisonter)
 # ------------------------------------------------------------
 def add_multi_uppsida(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -391,12 +419,45 @@ def add_multi_uppsida(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def compute_scores_all_horizons(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
+    """
+    Beräknar komponentpoäng (Growth/Dividend/Financials) + Total för samtliga horisonter
+    och lägger in dem som egna kolumner:
+      Score Growth (Idag/1 år/2 år/3 år), Score Dividend (...), Score Financials (...),
+      Score Total (Idag/1 år/2 år/3 år).
+    """
+    out = df.copy()
+    mapping = [
+        ("Riktkurs idag",   "Idag"),
+        ("Riktkurs om 1 år","1 år"),
+        ("Riktkurs om 2 år","2 år"),
+        ("Riktkurs om 3 år","3 år"),
+    ]
+    strat = "Auto" if str(strategy).startswith("Auto") else strategy
+    for horizon, tag in mapping:
+        tmp = score_rows(out, horizon=horizon, strategy=strat)
+        out[f"Score Growth ({tag})"]      = tmp["Score (Growth)"].round(2)
+        out[f"Score Dividend ({tag})"]    = tmp["Score (Dividend)"].round(2)
+        out[f"Score Financials ({tag})"]  = tmp["Score (Financials)"].round(2)
+        out[f"Score Total ({tag})"]       = tmp["Score (Total)"].round(2)
+    return out
+
+
 def enrich_for_save(df: pd.DataFrame, horizon_for_score: str = "Riktkurs idag", strategy: str = "Auto") -> pd.DataFrame:
-    """Gör alla beräkningar + score och returnerar ett DF redo att skrivas till Sheets."""
+    """
+    Gör alla beräkningar + uppsidor + poäng.
+    Lägger dessutom in Score Total + komponentpoäng (Growth/Dividend/Financials) för samtliga horisonter.
+    Returnerar DF redo att skrivas till Google Sheets.
+    """
+    # Grundberäkningar
     df2 = update_calculations(df)
     df2 = add_multi_uppsida(df2)
-    # Score baseras på vald horisont (standard 'Riktkurs idag')
-    df2 = score_rows(df2, horizon=horizon_for_score, strategy=("Auto" if strategy.startswith("Auto") else strategy))
+
+    # Behåll baspoäng-kolumnerna för vald horisont i appen
+    df2 = score_rows(df2, horizon=horizon_for_score, strategy=("Auto" if str(strategy).startswith("Auto") else strategy))
+
+    # Lägg till Score Total + komponentpoäng för ALLA horisonter som egna kolumner
+    df2 = compute_scores_all_horizons(df2, strategy=("Auto" if str(strategy).startswith("Auto") else strategy))
     return df2
 
 
@@ -503,14 +564,17 @@ def view_ideas(df: pd.DataFrame):
         st.info("Inga rader.")
         return
 
+    # Val för riktkurs + poängstrategi
     horizon = st.selectbox("Riktkurs-horisont", ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"], index=0)
     strategy = st.selectbox("Strategi", ["Auto (via sektor)","Tillväxt","Utdelning","Finans"], index=0)
 
+    # Underlag (filtrera ev. till portfölj)
     subset = st.radio("Visa", ["Alla bolag","Endast portfölj"], horizontal=True)
     base = df.copy()
     if subset == "Endast portfölj":
         base = base[base["Antal aktier"] > 0].copy()
 
+    # Beräkningar live
     base = update_calculations(base)
     base = base[(base[horizon] > 0) & (base["Aktuell kurs"] > 0)].copy()
     if base.empty:
@@ -519,26 +583,87 @@ def view_ideas(df: pd.DataFrame):
 
     base = score_rows(base, horizon=horizon, strategy=("Auto" if strategy.startswith("Auto") else strategy))
 
-    sort_on = st.radio("Sortera på", ["Score (Total)", "Uppsida (%)", "DA (%)"], horizontal=True)
-    base = base.sort_values(by=[sort_on], ascending=False).reset_index(drop=True)
+    # Visa komponentpoäng + sparade horisontpoäng
+    show_components = st.checkbox("Visa komponentpoäng (Growth/Dividend/Financials) för vald horisont", True)
+    show_saved = st.checkbox("Visa sparade horisontpoäng från Google Sheets", True)
 
-    st.dataframe(
-        base[["Ticker","Bolagsnamn","Sektor","Aktuell kurs",horizon,"Uppsida (%)",
-              "DA (%)","Score (Growth)","Score (Dividend)","Score (Financials)","Score (Total)","Confidence"]],
-        use_container_width=True
-    )
+    tag = _horizon_to_tag(horizon)
+    saved_cols_all = [
+        "Score Total (Idag)", "Score Total (1 år)", "Score Total (2 år)", "Score Total (3 år)",
+        "Score Growth (Idag)", "Score Dividend (Idag)", "Score Financials (Idag)",
+        "Score Growth (1 år)", "Score Dividend (1 år)", "Score Financials (1 år)",
+        "Score Growth (2 år)", "Score Dividend (2 år)", "Score Financials (2 år)",
+        "Score Growth (3 år)", "Score Dividend (3 år)", "Score Financials (3 år)",
+    ]
+    available_saved = [c for c in saved_cols_all if c in base.columns]
 
+    default_saved = [f"Score Total ({tag})"]
+    for group in ["Growth","Dividend","Financials"]:
+        colname = f"Score {group} ({tag})"
+        if colname in available_saved:
+            default_saved.append(colname)
+
+    selected_saved_cols = []
+    if show_saved and available_saved:
+        selected_saved_cols = st.multiselect(
+            "Välj sparade score-kolumner att visa",
+            options=available_saved,
+            default=default_saved
+        )
+
+    # Sorteringsval (inkl. sparade totalpoäng om de finns)
+    sort_options = ["Score (Total)", "Uppsida (%)", "DA (%)"]
+    for c in ["Score Total (Idag)", "Score Total (1 år)", "Score Total (2 år)", "Score Total (3 år)"]:
+        if c in base.columns and c not in sort_options:
+            sort_options.append(c)
+    sort_on = st.selectbox("Sortera på", sort_options, index=0)
+
+    # Beräkna uppsida & DA (för visning)
+    base["Uppsida (%)"] = ((base[horizon] - base["Aktuell kurs"]) / base["Aktuell kurs"] * 100.0).round(2)
+    base["DA (%)"] = np.where(base["Aktuell kurs"] > 0, (base["Årlig utdelning"]/base["Aktuell kurs"])*100.0, 0.0).round(2)
+
+    # Standardordning per fält (desc), + trim/sälj-läge för Uppsida
+    ascending = False
+    if sort_on == "Uppsida (%)":
+        trim_mode = st.checkbox("Visa trim/sälj-läge (minst uppsida först)", value=False,
+                                help="Sortera uppsida stigande istället för fallande.")
+        if trim_mode:
+            ascending = True
+
+    # 🌍 Global omvänd-brytare (gäller ALLA fält)
+    reverse_global = st.checkbox("Omvänd sortering (gäller valt fält)", value=False)
+    if reverse_global:
+        ascending = not ascending
+
+    # Kolumner att visa
+    cols = ["Ticker","Bolagsnamn","Sektor","Aktuell kurs",horizon,"Uppsida (%)","DA (%)"]
+    if show_components:
+        cols += ["Score (Growth)","Score (Dividend)","Score (Financials)","Score (Total)","Confidence"]
+    else:
+        cols += ["Score (Total)","Confidence"]
+    if show_saved and selected_saved_cols:
+        cols += selected_saved_cols
+
+    # Sortera & visa
+    base = base.sort_values(by=[sort_on], ascending=ascending).reset_index(drop=True)
+    st.dataframe(base[cols], use_container_width=True)
+
+    # Kortvisning
     st.markdown("---")
     st.markdown("### Kortvisning (bläddra)")
     if "idea_idx" not in st.session_state:
         st.session_state["idea_idx"] = 0
-    st.session_state["idea_idx"] = st.number_input("Visa rad #", min_value=0, max_value=max(0, len(base)-1),
-                                                   value=st.session_state["idea_idx"], step=1)
+    st.session_state["idea_idx"] = st.number_input(
+        "Visa rad #", min_value=0, max_value=max(0, len(base)-1),
+        value=st.session_state["idea_idx"], step=1
+    )
+
     r = base.iloc[st.session_state["idea_idx"]]
     st.subheader(f"{r['Bolagsnamn']} ({r['Ticker']})")
+
     c1, c2 = st.columns(2)
     with c1:
-        st.write(f"- **Sektor:** {r['Sektor'] or '—'}")
+        st.write(f"- **Sektor:** {r.get('Sektor','—')}")
         st.write(f"- **Aktuell kurs:** {round(float(r['Aktuell kurs']),2)} {r['Valuta']}")
         st.write(f"- **Riktkurs idag:** {round(float(r['Riktkurs idag']),2)} {r['Valuta']}")
         st.write(f"- **Riktkurs om 1 år:** {round(float(r['Riktkurs om 1 år']),2)} {r['Valuta']}")
@@ -554,9 +679,23 @@ def view_ideas(df: pd.DataFrame):
         st.write(f"- **Payout:** {round(float(r['Payout (%)']),2)} %")
         st.write(f"- **DA (egen):** {round(float(r['DA (%)']),2)} %")
         st.write(f"- **CAGR 5 år:** {round(float(r['CAGR 5 år (%)']),2)} %")
-        st.write(f"- **Score – Growth/Div/Fin/Total:** {round(float(r['Score (Growth)']),1)} / "
-                 f"{round(float(r['Score (Dividend)']),1)} / {round(float(r['Score (Financials)']),1)} / "
-                 f"**{round(float(r['Score (Total)']),1)}** (Conf {int(r['Confidence'])}%)")
+        st.write(f"- **Score – Growth / Dividend / Financials / Total:** "
+                 f"{round(float(r['Score (Growth)']),1)} / {round(float(r['Score (Dividend)']),1)} / "
+                 f"{round(float(r['Score (Financials)']),1)} / **{round(float(r['Score (Total)']),1)}** "
+                 f"(Conf {int(r['Confidence'])}%)")
+
+    # Sparade poäng per horisont (om de finns)
+    if show_saved and available_saved:
+        st.markdown("#### Sparade poäng (från Google Sheets)")
+        tag_rows = []
+        for t in ["Idag","1 år","2 år","3 år"]:
+            row = {"Horisont": t}
+            for grp in ["Growth","Dividend","Financials","Total"]:
+                col = f"Score {grp} ({t})" if grp != "Total" else f"Score Total ({t})"
+                row[grp] = float(r.get(col, 0.0)) if col in base.columns else np.nan
+            tag_rows.append(row)
+        df_scores = pd.DataFrame(tag_rows, columns=["Horisont","Growth","Dividend","Financials","Total"])
+        st.dataframe(df_scores, use_container_width=True)
 
 
 # ------------------------------------------------------------

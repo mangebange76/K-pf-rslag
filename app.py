@@ -23,7 +23,7 @@ from stockapp.fetchers.sec import get_pb_quarters  # SEC-P/B 4 kvartal
 
 # ---------------- Schema ----------------
 FINAL_COLS = [
-    "Ticker", "Bolagsnamn", "Valuta", "Aktuell kurs",
+    "Ticker", "Bolagsnamn", "Sektor", "Valuta", "Aktuell kurs",
     "Utestående aktier (milj.)", "Market Cap",
     "P/S (TTM)", "P/B", "EV/EBITDA (ttm)",
     "Årlig utdelning", "Dividend yield (%)", "Payout ratio (%)",
@@ -83,7 +83,7 @@ def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
     for c in NUMERIC_COLS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    for c in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad"]:
+    for c in ["Ticker","Bolagsnamn","Sektor","Valuta","Senast manuellt uppdaterad"]:
         if c in df.columns:
             df[c] = df[c].astype(str)
     return df
@@ -117,6 +117,7 @@ def _pb_avg(row: pd.Series) -> float:
     vals = [float(row.get(k, 0.0)) for k in ["P/B Q1","P/B Q2","P/B Q3","P/B Q4"] if float(row.get(k,0.0))>0]
     return float(np.mean(vals)) if vals else 0.0
 
+# ---- Prognos av omsättning (sparas) från "Nästa år" via CAGR5 + dämpning
 def _proj_from_next_year(row: pd.Series) -> tuple[float, float]:
     """
     Prognosera 'Omsättning om 2 år' och 'Omsättning om 3 år' från 'Omsättning nästa år'
@@ -176,6 +177,17 @@ def upsides_from(price: float, targets: dict) -> dict:
     for hz, tp in targets.items():
         out[hz] = round(((tp - price)/price*100.0), 2) if (price>0 and tp>0) else 0.0
     return out
+
+def sund_utdelning_80(row: pd.Series) -> float:
+    """
+    Beräkna 'sund utdelning' givet mål payout 80%.
+    Ex: dividend_rate=1.00, payout=128% -> sund = 1.00 * (0.80 / 1.28) = 0.625
+    """
+    div = float(row.get("Årlig utdelning", 0.0))
+    p = float(row.get("Payout ratio (%)", 0.0))
+    if div > 0 and p > 0:
+        return round(div * (0.80 / (p/100.0)), 4)
+    return 0.0
 
 
 # ---------------- Beräkningar + persist ----------------
@@ -267,7 +279,7 @@ def score_utdelning(row: pd.Series, horizon: str) -> float:
     yld = current_yield_pct(row)
     payout = float(row.get("Payout ratio (%)", 0.0))
 
-    base_ratio = DIV_BASE_YIELD / DIV_BASE_PAYOUT
+    base_ratio = DIV_BASE_YIELD / DIV_BASE_PAYOUT  # 15/80 = 0.1875
     p = _clamp(payout, DIV_MIN_PAYOUT, DIV_MAX_PAYOUT)
     ratio = (yld / p) if p > 0 else 0.0
     score_main = 100.0 * _clamp(ratio / base_ratio, 0.0, 1.0)
@@ -426,6 +438,10 @@ with st.sidebar:
             st.cache_data.clear()
             st.rerun()
 
+    src = st.session_state.get("_rates_source")
+    if src:
+        st.caption(f"Källa för livekurser: {src}")
+
     st.markdown("---")
     use_sec_pb = st.checkbox("Beräkna P/B 4Q via SEC", value=True, help="Hämtar equity & shares per period från SEC och pris från Yahoo.")
 
@@ -515,16 +531,19 @@ with st.sidebar:
 
                 # --- SEC P/B historik (valfritt) ---
                 if use_sec_pb:
-                    pbdata = get_pb_quarters(tkr)
-                    pbs = pbdata.get("pb_quarters", [])
-                    p_values = [float(x[1]) for x in pbs]
-                    q = [0.0, 0.0, 0.0, 0.0]
-                    for idx, val in enumerate(reversed(p_values[-4:])):
-                        q[idx] = round(val, 2)
-                    df0.at[i, "P/B Q1"] = q[0]
-                    df0.at[i, "P/B Q2"] = q[1]
-                    df0.at[i, "P/B Q3"] = q[2]
-                    df0.at[i, "P/B Q4"] = q[3]
+                    try:
+                        pbdata = get_pb_quarters(tkr)
+                        pbs = pbdata.get("pb_quarters", [])
+                        p_values = [float(x[1]) for x in pbs]
+                        q = [0.0, 0.0, 0.0, 0.0]
+                        for idx_, val in enumerate(reversed(p_values[-4:])):
+                            q[idx_] = round(val, 2)
+                        df0.at[i, "P/B Q1"] = q[0]
+                        df0.at[i, "P/B Q2"] = q[1]
+                        df0.at[i, "P/B Q3"] = q[2]
+                        df0.at[i, "P/B Q4"] = q[3]
+                    except Exception as e:
+                        st.write(f"SEC/PB misslyckades för {tkr}: {e}")
 
                 status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
                 bar.progress((i+1)/total)
@@ -677,7 +696,7 @@ with tab_suggest:
                 "Dividend yield (%)": yld_calc,
                 "Payout ratio (%)": payout,
                 "Just. yield (80%)": adj_yield_80,
-                "Sund utd (80%)": round((float(r.get("Årlig utdelning",0.0))*(0.80/(payout/100.0)),4),4) if (float(r.get("Årlig utdelning",0.0))>0 and payout>0) else 0.0,
+                "Sund utd (80%)": sund_utdelning_80(r),
 
                 # ---- Tillväxt/marginaler
                 "Revenue growth (%)": float(r.get("Revenue growth (%)", 0.0)),

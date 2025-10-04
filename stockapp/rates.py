@@ -1,201 +1,160 @@
-# stockapp/rates.py
 from __future__ import annotations
 
-import math
 import time
-from typing import Dict, Tuple
+from typing import Dict
 
 import pandas as pd
 import streamlit as st
 
-# HTTP och sista fallback via yfinance
-import requests
+from stockapp.sheets import get_ws
 
-try:
-    import yfinance as yf  # används bara som sista fallback
-except Exception:
-    yf = None  # type: ignore
-
-from .sheets import get_ws, ws_read_df, save_dataframe
-
-# ----------------------------- Konstanter -----------------------------
-
+# === Standardkurser (fallback) ===
 DEFAULT_RATES: Dict[str, float] = {
-    "USD": 10.00,
-    "NOK": 1.00,
-    "CAD": 7.50,
-    "EUR": 11.00,
-    "SEK": 1.00,
+    "USD": 10.0,
+    "NOK": 1.0,
+    "CAD": 7.5,
+    "EUR": 11.0,
+    "SEK": 1.0,
 }
 
-RATES_SHEET_NAME = st.secrets.get("RATES_SHEET_NAME", "Valutakurser")
+# Var sparar vi kurserna?
+RATES_SHEET_NAME = st.secrets.get("RATES_WORKSHEET_NAME", "Valutakurser")
 
-CURRENCIES = ("USD", "NOK", "CAD", "EUR")  # alltid till SEK
+# ---------------- Hjälpare ----------------
+def _with_backoff(func, *args, **kwargs):
+    """Exponential backoff för API 429/5xx."""
+    delays = [0.0, 0.5, 1.0, 2.0, 4.0]
+    last_err = None
+    for d in delays:
+        if d:
+            time.sleep(d)
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            msg = str(e).lower()
+            # backoff främst för rate limit/transienta fel
+            if any(x in msg for x in ["429", "quota", "rate limit", "backendError".lower(), "timed out", "deadline"]):
+                last_err = e
+                continue
+            raise
+    if last_err:
+        raise last_err
 
-
-# ----------------------------- Hjälpare ------------------------------
-
-def _round6(x: float) -> float:
-    try:
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return 0.0
-        return float(f"{float(x):.6f}")
-    except Exception:
-        return 0.0
-
-
-def _normalize_rates(d: Dict[str, float]) -> Dict[str, float]:
-    out = {k: _round6(float(v)) for k, v in d.items() if k}
+def _normalize_rates(raw: Dict[str, float]) -> Dict[str, float]:
+    out = {}
+    for k in ["USD", "NOK", "CAD", "EUR", "SEK"]:
+        try:
+            out[k] = float(raw.get(k, DEFAULT_RATES[k]))
+        except Exception:
+            out[k] = DEFAULT_RATES[k]
+    # säkerställ SEK = 1.0
     out["SEK"] = 1.0
     return out
 
-
-# --------------------------- Läs/Spara i Sheet -----------------------
-
-def _ensure_rates_sheet() -> None:
-    """Skapar bladet 'Valutakurser' om det saknas."""
-    try:
-        ws = get_ws(worksheet_name=RATES_SHEET_NAME)
-        df = ws_read_df(ws)
-        if df is None or df.empty:
-            save_rates(DEFAULT_RATES)
-    except Exception:
-        # Skapa nytt blad med defaultvärden
-        save_rates(DEFAULT_RATES)
-
-
+# ---------------- Läs & spara till Google Sheets ----------------
+@st.cache_data(ttl=3600, show_spinner=False)  # cachea i 1h för att undvika 429 på read
 def read_rates() -> Dict[str, float]:
-    """Läser kurser från Google Sheet. Skapar bladet vid behov."""
+    """
+    Läser valutakurser från bladet 'Valutakurser' (eller namn i secrets:RATES_WORKSHEET_NAME).
+    Format: två kolumner "Valuta" | "Kurs"
+    Returnerar dict som alltid innehåller USD/NOK/CAD/EUR/SEK.
+    """
     try:
-        _ensure_rates_sheet()
-        ws = get_ws(worksheet_name=RATES_SHEET_NAME)
-        df = ws_read_df(ws)
-        rates: Dict[str, float] = {}
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            # Stöd både "Valuta/Kurs" och eventuellt "Currency/Rate"
-            val_col = "Valuta" if "Valuta" in df.columns else ("Currency" if "Currency" in df.columns else None)
-            kurs_col = "Kurs" if "Kurs" in df.columns else ("Rate" if "Rate" in df.columns else None)
-            if val_col and kurs_col:
-                for _, r in df.iterrows():
-                    k = str(r.get(val_col, "")).upper().strip()
-                    v = str(r.get(kurs_col, "")).replace(",", ".").strip()
-                    try:
-                        rates[k] = float(v)
-                    except Exception:
-                        pass
-        # Fyll upp med default om något saknas
-        for c in (*CURRENCIES, "SEK"):
-            rates.setdefault(c, DEFAULT_RATES[c])
-        return _normalize_rates(rates)
+        ws = get_ws(worksheet_name=RATES_SHEET_NAME)  # kan skapa bladet om det saknas
+        # Läs allt i ett anrop
+        rows = _with_backoff(ws.get_all_records)
+        if not rows:
+            # Om bladet finns men tomt – initiera rubriker
+            _with_backoff(ws.update, [["Valuta", "Kurs"]])
+            return DEFAULT_RATES.copy()
+
+        out = {}
+        for r in rows:
+            cur = str(r.get("Valuta", "")).upper().strip()
+            val = str(r.get("Kurs", "")).replace(",", ".").strip()
+            try:
+                out[cur] = float(val)
+            except Exception:
+                pass
+
+        return _normalize_rates(out)
     except Exception:
+        # På fel – returnera default (hellre än att spräcka appen)
         return DEFAULT_RATES.copy()
 
-
 def save_rates(rates: Dict[str, float]) -> None:
-    """Sparar kurser till Google Sheet."""
+    """
+    Skriver kurs-tabellen i ETT batch-anrop för att minimera read-tryck.
+    Raderar ej cache selektivt => vi kör st.cache_data.clear() för enkelhet.
+    """
+    data = _normalize_rates(rates)
+    body = [["Valuta", "Kurs"]]
+    for k in ["USD", "NOK", "CAD", "EUR", "SEK"]:
+        body.append([k, float(data[k])])
+
+    ws = get_ws(worksheet_name=RATES_SHEET_NAME)
+    # Gör gärna i två snabba writes (clear + update). Vissa klienter gör read internt,
+    # men detta är ändå minimalt.
+    _with_backoff(ws.clear)
+    _with_backoff(ws.update, body)
+
+    # Invalidera cache så nästa read hämtar färskt, men undviker spamming
     try:
-        norm = _normalize_rates(rates)
-        df = pd.DataFrame(
-            {"Valuta": ["USD", "NOK", "CAD", "EUR", "SEK"],
-             "Kurs":   [norm["USD"], norm["NOK"], norm["CAD"], norm["EUR"], 1.0]}
-        )
-        save_dataframe(df, worksheet_name=RATES_SHEET_NAME)
-    except Exception as e:
-        # Vi låter appen visa ev. fel i sidopanelen; här tyst fail
-        raise e
+        st.cache_data.clear()
+    except Exception:
+        pass
 
-
-# ----------------------------- Live-källor ---------------------------
-
-def _fetch_frankfurter() -> Tuple[Dict[str, float], str]:
+# ---------------- Live-kurser (utan extra API-nycklar) ----------------
+def _get_fx_yahoo(symbol: str) -> float:
     """
-    Frankfurter (ECB-data). Ingen nyckel behövs.
-    Exempel: https://api.frankfurter.app/latest?from=USD&to=SEK
+    Hämtar FX via yfinance (symbol som 'USDSEK=X').
+    Returnerar float eller raise.
     """
-    base_url = "https://api.frankfurter.app/latest"
-    out: Dict[str, float] = {}
-    for cur in CURRENCIES:
-        params = {"from": cur, "to": "SEK"}
-        r = requests.get(base_url, params=params, timeout=10)
-        r.raise_for_status()
-        js = r.json()
-        rate = float(js.get("rates", {}).get("SEK", 0.0))
-        if rate <= 0:
-            raise ValueError(f"Frankfurter gav 0 för {cur}/SEK")
-        out[cur] = rate
-    return _normalize_rates(out), "frankfurter.app"
+    import yfinance as yf
 
+    t = yf.Ticker(symbol)
+    price = None
+    # försök snabb väg
+    try:
+        info = t.fast_info
+        price = info.get("lastPrice", None)
+    except Exception:
+        price = None
+    # fallback: history 1d
+    if price is None:
+        try:
+            h = t.history(period="1d")
+            if not h.empty and "Close" in h:
+                price = float(h["Close"].iloc[-1])
+        except Exception:
+            price = None
+    if price is None:
+        # sista försök regular info
+        try:
+            info2 = t.info or {}
+            price = info2.get("regularMarketPrice", None)
+        except Exception:
+            price = None
+    if price is None:
+        raise RuntimeError(f"Kunde inte hämta kurs för {symbol}")
+    return float(price)
 
-def _fetch_erapi() -> Tuple[Dict[str, float], str]:
+def fetch_live_rates() -> Dict[str, float]:
     """
-    ER-API (gratis, ingen nyckel). Ex: https://open.er-api.com/v6/latest/USD
+    Hämtar live USD/NOK/CAD/EUR mot SEK via Yahoo Finance FX.
+    Returnerar dict med "_source" för visning.
     """
-    base_url = "https://open.er-api.com/v6/latest/"
-    out: Dict[str, float] = {}
-    for cur in CURRENCIES:
-        r = requests.get(base_url + cur, timeout=10)
-        r.raise_for_status()
-        js = r.json()
-        if js.get("result") != "success":
-            raise ValueError(f"ER-API fel för {cur}")
-        rate = float(js.get("rates", {}).get("SEK", 0.0))
-        if rate <= 0:
-            raise ValueError(f"ER-API gav 0 för {cur}/SEK")
-        out[cur] = rate
-    return _normalize_rates(out), "open.er-api.com"
-
-
-def _fetch_yfinance() -> Tuple[Dict[str, float], str]:
-    """
-    Sista fallback via yfinance på valutapar: USDSEK=X, NOKSEK=X, CADSEK=X, EURSEK=X
-    Hämtar senaste stängning om realtidspris saknas.
-    """
-    if yf is None:
-        raise RuntimeError("yfinance ej installerat")
-
     pairs = {
         "USD": "USDSEK=X",
         "NOK": "NOKSEK=X",
         "CAD": "CADSEK=X",
         "EUR": "EURSEK=X",
     }
-    out: Dict[str, float] = {}
-    for cur, ticker in pairs.items():
-        t = yf.Ticker(ticker)
-        price = None
-        try:
-            info = t.fast_info if hasattr(t, "fast_info") else {}
-            price = float(getattr(info, "last_price", None) or info.get("last_price") or 0.0)
-        except Exception:
-            price = None
-        if not price:
-            hist = t.history(period="5d")
-            if not hist.empty:
-                price = float(hist["Close"].iloc[-1])
-        if not price or price <= 0:
-            raise ValueError(f"yfinance pris saknas för {ticker}")
-        out[cur] = price
-        time.sleep(0.2)  # snäll paus
-    return _normalize_rates(out), "yfinance"
-    
-
-# ----------------------------- Publik API ----------------------------
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_live_rates() -> Dict[str, float]:
-    """
-    Försök i ordning: Frankfurter → ER-API → yfinance.
-    Cache: 1 h. Returnerar dict med USD/NOK/CAD/EUR/SEK.
-    Kastar Exception om alla källor faller.
-    """
-    errors = []
-    for fn in (_fetch_frankfurter, _fetch_erapi, _fetch_yfinance):
-        try:
-            data, src = fn()
-            # Lägg källa i session för debug/info
-            st.session_state["_rates_source"] = src
-            return data
-        except Exception as e:
-            errors.append(f"{fn.__name__}: {e}")
-            continue
-    raise RuntimeError("Kunde inte hämta livekurser från någon källa:\n" + "\n".join(errors))
+    out = {}
+    for k, sym in pairs.items():
+        # var snäll mot rate-limits vid upprepade klick
+        time.sleep(0.15)
+        out[k] = _get_fx_yahoo(sym)
+    out["SEK"] = 1.0
+    out["_source"] = "Yahoo Finance FX"
+    return out

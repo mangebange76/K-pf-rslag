@@ -31,11 +31,14 @@ FINAL_COLS = [
     "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
     # P/B historik (SEC)
     "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
-    # Kompatibilitet med äldre modell
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+    # PS-modellen & omsättningar
+    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier", "CAGR 5 år (%)", "P/S-snitt", "Senast manuellt uppdaterad",
+    # Portfölj
+    "Antal aktier",
+    # Övrigt
+    "CAGR 5 år (%)", "Senast manuellt uppdaterad",
     # Råfält för EV/EBITDA-strategi
     "_y_ev_now", "_y_ebitda_now",
 ]
@@ -47,12 +50,26 @@ NUMERIC_COLS = [
     "Revenue TTM (M)", "Revenue growth (%)", "Book value / share",
     "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
     "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
+    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier", "CAGR 5 år (%)", "P/S-snitt",
+    "Antal aktier", "CAGR 5 år (%)",
     "_y_ev_now", "_y_ebitda_now",
 ]
+
+# ---- Dividend scoring baseline ----
+DIV_BASE_YIELD = 15.0   # % yield som ger full pott vid baseline
+DIV_BASE_PAYOUT = 80.0  # % payout som baseline
+DIV_MIN_PAYOUT = 30.0   # clamp (stabilitet)
+DIV_MAX_PAYOUT = 200.0  # clamp (stabilitet)
+
+# ---- Stödkonstanter för vyer ----
+HORIZONS = ["Idag", "Om 1 år", "Om 2 år", "Om 3 år"]
+
+
+# ---------------- Hjälpare ----------------
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -71,19 +88,134 @@ def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].astype(str)
     return df
 
+def current_yield_pct(row: pd.Series) -> float:
+    """
+    Beräkna Dividend Yield (%) från Årlig utdelning och Aktuell kurs.
+    Fallback: använd befintlig "Dividend yield (%)" (t.ex. från Yahoo) om
+    beräkningen inte är möjlig.
+    """
+    try:
+        div = float(row.get("Årlig utdelning", 0.0))
+        price = float(row.get("Aktuell kurs", 0.0))
+        if div > 0 and price > 0:
+            return round(100.0 * div / price, 2)
+    except Exception:
+        pass
+    return float(row.get("Dividend yield (%)", 0.0))
+
+def _ps_avg(row: pd.Series) -> float:
+    pss = float(row.get("P/S-snitt", 0.0))
+    if pss > 0:
+        return pss
+    vals = [float(row.get(k, 0.0)) for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"] if float(row.get(k,0.0))>0]
+    return float(np.mean(vals)) if vals else 0.0
+
+def _pb_avg(row: pd.Series) -> float:
+    pbs = float(row.get("P/B-snitt (Q1..Q4)", 0.0))
+    if pbs > 0:
+        return pbs
+    vals = [float(row.get(k, 0.0)) for k in ["P/B Q1","P/B Q2","P/B Q3","P/B Q4"] if float(row.get(k,0.0))>0]
+    return float(np.mean(vals)) if vals else 0.0
+
+def _proj_from_next_year(row: pd.Series) -> tuple[float, float]:
+    """
+    Prognosera 'Omsättning om 2 år' och 'Omsättning om 3 år' från 'Omsättning nästa år'
+    med CAGR5 och avtagande tillväxt:
+      g1 = clamp(CAGR5, [-20%, +50%])
+      rev2 = next_year * (1 + g1)
+      rev3 = rev2      * (1 + g1*0.7)
+    Dessa värden SKRIVS till databasen av update_calculations().
+    """
+    next_year = float(row.get("Omsättning nästa år", 0.0))
+    cagr5 = float(row.get("CAGR 5 år (%)", 0.0)) / 100.0
+    g1 = _clamp(cagr5, -0.20, 0.50)  # säkerhetsklamp
+    if next_year <= 0:
+        return 0.0, 0.0
+    rev2 = round(next_year * (1.0 + g1), 2)
+    rev3 = round(rev2 * (1.0 + g1*0.7), 2)
+    return rev2, rev3
+
+def _revenue_for_horizon(row: pd.Series, horizon: str) -> float:
+    """
+    Omsättning per horisont. 'Idag' och 'Om 1 år' är manuella.
+    'Om 2/3 år' beräknas från 'Omsättning nästa år' via _proj_from_next_year().
+    """
+    if horizon == "Idag":
+        return float(row.get("Omsättning idag", 0.0))
+    if horizon == "Om 1 år":
+        return float(row.get("Omsättning nästa år", 0.0))
+    rev2, rev3 = _proj_from_next_year(row)
+    if horizon == "Om 2 år":
+        return rev2
+    if horizon == "Om 3 år":
+        return rev3
+    return 0.0
+
+def target_price_ps(row: pd.Series, horizon: str) -> float:
+    ps = _ps_avg(row)
+    rev_m = _revenue_for_horizon(row, horizon)
+    shares_m = float(row.get("Utestående aktier (milj.)", 0.0))
+    if ps > 0 and rev_m > 0 and shares_m > 0:
+        return round((ps * rev_m) / shares_m, 2)
+    return 0.0
+
+def ps_targets_all(row: pd.Series) -> dict:
+    """PS-riktkurser för alla horisonter enligt reglerna ovan."""
+    out = {}
+    for hz in HORIZONS:
+        out[hz] = target_price_ps(row, hz)
+    return out
+
+def pb_target(row: pd.Series) -> float:
+    pb = _pb_avg(row)
+    bvps = float(row.get("Book value / share", 0.0))
+    return round(pb * bvps, 2) if (pb>0 and bvps>0) else 0.0
+
+def upsides_from(price: float, targets: dict) -> dict:
+    out = {}
+    for hz, tp in targets.items():
+        out[hz] = round(((tp - price)/price*100.0), 2) if (price>0 and tp>0) else 0.0
+    return out
+
+
+# ---------------- Beräkningar + persist ----------------
 def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Uppdaterar och SKRIVER in:
+      - P/S-snitt och P/B-snitt
+      - Dividend yield (%) (egen beräkning, fallback Yahoo)
+      - Omsättning om 2/3 år (beräknad från 'Omsättning nästa år' mha CAGR5 + dämpning)
+      - Riktkurs idag / om 1 / om 2 / om 3 år (PS-baserade enligt formeln)
+    Returnerar uppdaterad DataFrame (ring _save_df efter denna vid behov).
+    """
     if df.empty: return df
     for i, rad in df.iterrows():
-        # P/S-snitt från manuella Q1..Q4 (om använda)
+        # P/S-snitt
         ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
         ps_clean = [float(x) for x in ps_vals if float(x) > 0]
-        df.at[i, "P/S-snitt"] = round(np.mean(ps_clean), 2) if ps_clean else 0.0
+        df.at[i, "P/S-snitt"] = round(np.mean(ps_clean), 2) if ps_clean else float(rad.get("P/S-snitt", 0.0))
 
-        # P/B-snitt från SEC-kvartal
+        # P/B-snitt
         pbs = [rad.get("P/B Q1", 0), rad.get("P/B Q2", 0), rad.get("P/B Q3", 0), rad.get("P/B Q4", 0)]
         pb_clean = [float(x) for x in pbs if float(x) > 0]
-        df.at[i, "P/B-snitt (Q1..Q4)"] = round(np.mean(pb_clean), 2) if pb_clean else 0.0
+        df.at[i, "P/B-snitt (Q1..Q4)"] = round(np.mean(pb_clean), 2) if pb_clean else float(rad.get("P/B-snitt (Q1..Q4)", 0.0))
+
+        # Dividend yield (%) – beräkna själv (pris-känslig)
+        df.at[i, "Dividend yield (%)"] = current_yield_pct(rad)
+
+        # Omsättning om 2/3 år – ALLTID beräknad från "Omsättning nästa år" (sparas)
+        rev2, rev3 = _proj_from_next_year(rad)
+        df.at[i, "Omsättning om 2 år"] = rev2
+        df.at[i, "Omsättning om 3 år"] = rev3
+
+        # Riktkurser (PS) – ALLTID beräknade (sparas)
+        df.at[i, "Riktkurs idag"]    = target_price_ps(df.loc[i], "Idag")
+        df.at[i, "Riktkurs om 1 år"] = target_price_ps(df.loc[i], "Om 1 år")
+        df.at[i, "Riktkurs om 2 år"] = target_price_ps(df.loc[i], "Om 2 år")
+        df.at[i, "Riktkurs om 3 år"] = target_price_ps(df.loc[i], "Om 3 år")
+
     return df
+
 
 # ---------------- I/O Sheets ----------------
 def _load_df(worksheet_name: str | None) -> pd.DataFrame:
@@ -95,159 +227,93 @@ def _load_df(worksheet_name: str | None) -> pd.DataFrame:
         df = pd.DataFrame()
     df = ensure_columns(df)
     df = to_numeric(df)
+    # räkna & skriv in beräknade fält i sessionen (sparas först vid Spara vy / uppdateringsknappar)
+    df = update_calculations(df)
     return df
 
 def _save_df(df: pd.DataFrame, worksheet_name: str | None) -> None:
+    # säkerställ att alla beräknade fält är uppdaterade innan vi sparar
+    df = update_calculations(df.copy())
     try:
         save_dataframe(df, worksheet_name=worksheet_name)
         st.success("Sparat till Google Sheets.")
     except Exception as e:
         st.warning(f"⚠️ Kunde inte spara: {e}")
 
-# ---------------- Målpris-hjälpare ----------------
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
 
-def target_price_growth(row: pd.Series, ps_target: float) -> float:
-    rev_m = float(row.get("Revenue TTM (M)", 0.0))
-    gr_pct = float(row.get("Revenue growth (%)", 0.0))
-    sh_m  = float(row.get("Utestående aktier (milj.)", 0.0))
-    if rev_m <= 0 or sh_m <= 0 or ps_target <= 0:
-        return 0.0
-    g = clamp(gr_pct / 100.0, -0.20, 0.50)
-    rev_next_m = rev_m * (1.0 + g)
-    return (ps_target * rev_next_m) / sh_m
+# ---------------- Scoring (poäng) ----------------
+def _norm(val: float, top: float) -> float:
+    if top <= 0: return 0.0
+    return _clamp(val / top, 0.0, 1.0)
 
-def target_price_dividend(row: pd.Series, target_yield_pct: float) -> float:
-    div = float(row.get("Årlig utdelning", 0.0))
-    yld = target_yield_pct / 100.0
-    if div <= 0 or yld <= 0:
-        return 0.0
-    return div / yld
+def score_tillvaxt(row: pd.Series, horizon: str) -> float:
+    price = float(row.get("Aktuell kurs", 0.0))
+    tps = target_price_ps(row, horizon)
+    ps_up = ((tps - price) / price * 100.0) if price > 0 and tps > 0 else 0.0
+    g = float(row.get("Revenue growth (%)", 0.0))
+    gm = float(row.get("Gross margin (%)", 0.0))
+    payout = float(row.get("Payout ratio (%)", 0.0))
 
-def target_price_ev_ebitda(row: pd.Series, target_multiple: float) -> float:
-    ev_now = float(row.get("_y_ev_now", 0.0))
-    ebitda_now = float(row.get("_y_ebitda_now", 0.0))
-    mcap_now = float(row.get("Market Cap", 0.0))
-    sh_m = float(row.get("Utestående aktier (milj.)", 0.0))
-    if ebitda_now <= 0 or ev_now <= 0 or mcap_now <= 0 or sh_m <= 0 or target_multiple <= 0:
-        return 0.0
-    ev_target = target_multiple * ebitda_now
-    equity_target = mcap_now + (ev_target - ev_now)
-    return (equity_target / (sh_m * 1e6)) if sh_m > 0 else 0.0
+    s_ps    = _norm(ps_up, 100.0)
+    s_g     = _norm(g, 40.0)
+    s_gm    = _norm(gm, 60.0)
+    penalty = _norm(max(0.0, payout - 80), 40.0)
 
-def target_price_pb(row: pd.Series, pb_target: float) -> float:
-    bvps = float(row.get("Book value / share", 0.0))
-    if bvps <= 0 or pb_target <= 0:
-        return 0.0
-    return pb_target * bvps
+    score = 100.0 * (0.55*s_ps + 0.25*s_g + 0.15*s_gm + 0.05*(1-penalty))
+    return round(score, 1)
 
-def target_price_pb_avg(row: pd.Series) -> float:
-    pb_avg = float(row.get("P/B-snitt (Q1..Q4)", 0.0))
-    if pb_avg <= 0:
-        vals = [float(row.get(k, 0.0)) for k in ["P/B Q1","P/B Q2","P/B Q3","P/B Q4"] if float(row.get(k,0.0))>0]
-        pb_avg = np.mean(vals) if vals else 0.0
-    return target_price_pb(row, pb_avg)
+def score_utdelning(row: pd.Series, horizon: str) -> float:
+    # Pris-känslig DA
+    yld = current_yield_pct(row)
+    payout = float(row.get("Payout ratio (%)", 0.0))
 
-# ---------------- Hälsa-check ----------------
-def confidence_for_row(row: pd.Series, strategy: str) -> tuple[int, str]:
-    missing, notes = [], []
+    base_ratio = DIV_BASE_YIELD / DIV_BASE_PAYOUT
+    p = _clamp(payout, DIV_MIN_PAYOUT, DIV_MAX_PAYOUT)
+    ratio = (yld / p) if p > 0 else 0.0
+    score_main = 100.0 * _clamp(ratio / base_ratio, 0.0, 1.0)
 
-    def need(field: str):
-        v = row.get(field, None)
-        ok = False
-        try:
-            ok = (v is not None) and (float(v) != 0)
-        except Exception:
-            ok = bool(v)
-        if not ok:
-            missing.append(field)
+    # Liten värdebonus
+    price = float(row.get("Aktuell kurs", 0.0))
+    t_ps = target_price_ps(row, horizon)
+    up_ps = ((t_ps - price) / price * 100.0) if (price > 0 and t_ps > 0) else 0.0
+    t_pb = pb_target(row)
+    up_pb = ((t_pb - price) / price * 100.0) if (price > 0 and t_pb > 0) else 0.0
+    value_up = max(up_ps, up_pb)
+    value_bonus = 10.0 * _norm(value_up, 60.0)
 
-    if strategy == "Tillväxt (P/S)":
-        req = ["P/S (TTM)","Revenue TTM (M)","Revenue growth (%)","Utestående aktier (milj.)","Aktuell kurs"]
-        for f in req: need(f)
-        if float(row.get("Gross margin (%)",0)) <= 0: notes.append("saknar gross margin")
-    elif strategy == "Utdelning":
-        req = ["Årlig utdelning","Aktuell kurs"]
-        for f in req: need(f)
-        pr = float(row.get("Payout ratio (%)",0))
-        if pr>0:
-            if pr>100: notes.append("payout >100%")
-            elif pr>80: notes.append("payout >80%")
-        else:
-            notes.append("saknar payout ratio")
-    elif strategy == "EV/EBITDA":
-        req = ["_y_ev_now","_y_ebitda_now","Market Cap","Utestående aktier (milj.)","Aktuell kurs"]
-        for f in req: need(f)
-        if float(row.get("EV/EBITDA (ttm)",0))<=0: notes.append("saknar EV/EBITDA")
-    elif strategy == "P/B (Finans)":
-        req = ["P/B","Book value / share","Aktuell kurs"]
-        for f in req: need(f)
-    else:  # "P/B (4Q-snitt)"
-        req = ["P/B Q1","P/B Q2","P/B Q3","P/B Q4","Book value / share","Aktuell kurs"]
-        for f in req: need(f)
+    # Risk-straff för mycket hög payout
+    risk_penalty = 10.0 * _norm(max(0.0, payout - 100.0), 50.0)
 
-    total = len(req)
-    have = total - len(missing)
-    conf = int(round(100 * have / total)) if total>0 else 0
-    if missing:
-        notes.append("saknar: " + ", ".join(missing))
-    return conf, "; ".join(notes)
+    score = score_main + value_bonus - risk_penalty
+    return round(_clamp(score, 0.0, 100.0), 1)
 
-# ---------------- Förslagstabell ----------------
-def proposal_table(df: pd.DataFrame, strategy: str,
-                   ps_target: float, div_target_yield: float,
-                   ev_ebitda_target: float, pb_target: float,
-                   rates: dict) -> pd.DataFrame:
-    if df.empty: return pd.DataFrame()
-    tmp = df.copy()
+def score_finans_pb(row: pd.Series, horizon: str) -> float:
+    price = float(row.get("Aktuell kurs", 0.0))
+    tpb = pb_target(row)
+    pb_up = ((tpb - price) / price * 100.0) if price > 0 and tpb > 0 else 0.0
 
-    if strategy == "Tillväxt (P/S)":
-        tmp["Målpris"] = tmp.apply(lambda r: target_price_growth(r, ps_target), axis=1)
-    elif strategy == "Utdelning":
-        tmp["Målpris"] = tmp.apply(lambda r: target_price_dividend(r, div_target_yield), axis=1)
-    elif strategy == "EV/EBITDA":
-        tmp["Målpris"] = tmp.apply(lambda r: target_price_ev_ebitda(r, ev_ebitda_target), axis=1)
-    elif strategy == "P/B (4Q-snitt)":
-        tmp["Målpris"] = tmp.apply(target_price_pb_avg, axis=1)
-    else:
-        tmp["Målpris"] = tmp.apply(lambda r: target_price_pb(r, pb_target), axis=1)
+    nm = float(row.get("Net margin (%)", 0.0))
+    payout = float(row.get("Payout ratio (%)", 0.0))
 
-    tmp["Uppsida (%)"] = np.where(tmp["Aktuell kurs"] > 0,
-                                  (tmp["Målpris"] - tmp["Aktuell kurs"]) / tmp["Aktuell kurs"] * 100.0,
-                                  0.0)
+    s_pb    = _norm(pb_up, 80.0)
+    s_nm    = _norm(nm, 25.0)
+    payout_bonus = 1.0 - _norm(max(0.0, payout - 80), 40.0)
 
-    tmp["Växelkurs"] = tmp["Valuta"].apply(lambda v: rates.get(str(v).upper(), 1.0))
-    tmp["Kurs (SEK)"] = (tmp["Aktuell kurs"] * tmp["Växelkurs"]).round(2)
-    tmp["Målpris (SEK)"] = (tmp["Målpris"] * tmp["Växelkurs"]).round(2)
+    score = 100.0 * (0.65*s_pb + 0.20*s_nm + 0.15*payout_bonus)
+    return round(score, 1)
 
-    conf_list, notes_list = [], []
-    for _, r in tmp.iterrows():
-        c, n = confidence_for_row(r, strategy)
-        conf_list.append(c); notes_list.append(n)
-    tmp["Confidence (%)"] = conf_list
-    tmp["Notiser"] = notes_list
-    tmp["Hälsa"] = tmp["Confidence (%)"].apply(lambda x: "🟢" if x>=85 else ("🟡" if x>=60 else "🔴"))
+def infer_mode_from_sector(sector: str) -> str:
+    s = (sector or "").lower()
+    if any(x in s for x in ["bank", "financial", "insurance", "finans"]):
+        return "Finans (P/B)"
+    if any(x in s for x in ["utility", "telecom", "real estate", "staples", "försörjning", "fastigheter"]):
+        return "Utdelning"
+    return "Tillväxt"
 
-    common = ["Hälsa","Confidence (%)","Notiser","Ticker","Bolagsnamn","Valuta",
-              "Aktuell kurs","Kurs (SEK)","Målpris","Målpris (SEK)","Uppsida (%)"]
-    if strategy == "Tillväxt (P/S)":
-        cols = common + ["P/S (TTM)", "Revenue TTM (M)", "Revenue growth (%)", "Utestående aktier (milj.)", "Gross margin (%)"]
-    elif strategy == "Utdelning":
-        cols = common + ["Årlig utdelning","Dividend yield (%)","Payout ratio (%)"]
-    elif strategy == "EV/EBITDA":
-        cols = common + ["EV/EBITDA (ttm)","Market Cap","Utestående aktier (milj.)"]
-    elif strategy == "P/B (4Q-snitt)":
-        cols = common + ["P/B Q1","P/B Q2","P/B Q3","P/B Q4","P/B-snitt (Q1..Q4)","Book value / share"]
-    else:
-        cols = common + ["P/B","Book value / share"]
-
-    tmp = tmp.sort_values(by=["Confidence (%)","Uppsida (%)"], ascending=[False, False])
-    return tmp[[c for c in cols if c in tmp.columns]].reset_index(drop=True)
 
 # ---------------- Prisuppdatering (alla) ----------------
 def update_all_prices(df: pd.DataFrame, worksheet_name: str, delay_sec: float = 0.5) -> pd.DataFrame:
-    """Hämtar aktuell kurs (samt namn/valuta/MCAP om tillgängligt) för alla tickers och sparar till Sheets."""
+    """Hämtar aktuell kurs (samt namn/valuta/MCAP om tillgängligt) för alla tickers och SPARAR inkl. projektioner + riktkurser."""
     if df.empty:
         st.warning("Ingen data i vyn.")
         return df
@@ -292,11 +358,14 @@ def update_all_prices(df: pd.DataFrame, worksheet_name: str, delay_sec: float = 
         bar.progress((i+1)/total)
         time.sleep(delay_sec)
 
+    # Beräkna och skriv in proj + riktkurser
+    df = update_calculations(df)
     # spara och uppdatera sessionen
     st.session_state["_df_ref"] = df
     _save_df(df, worksheet_name)
-    st.success("✅ Aktiekurser uppdaterade och sparade till Google Sheets.")
+    st.success("✅ Aktiekurser + projektioner + riktkurser uppdaterade och sparade.")
     return df
+
 
 # ---------------- Sidopanel ----------------
 with st.sidebar:
@@ -316,14 +385,17 @@ with st.sidebar:
 
     # 1) läs sparade från sheet
     rates_saved = read_rates()
-
-    # 2) om vi redan hämtat live denna session – använd dem som förval i fälten
+    # 2) förval = antingen live som vi lagt i state, eller sparade
     pref = st.session_state.get("_live_rates") or rates_saved
 
-    usd = st.number_input("USD → SEK", key="rate_usd", value=float(pref.get("USD", DEFAULT_RATES["USD"])), step=0.0001, format="%.6f")
-    nok = st.number_input("NOK → SEK", key="rate_nok", value=float(pref.get("NOK", DEFAULT_RATES["NOK"])), step=0.0001, format="%.6f")
-    cad = st.number_input("CAD → SEK", key="rate_cad", value=float(pref.get("CAD", DEFAULT_RATES["CAD"])), step=0.0001, format="%.6f")
-    eur = st.number_input("EUR → SEK", key="rate_eur", value=float(pref.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
+    usd = st.number_input("USD → SEK", key="rate_usd",
+                          value=float(pref.get("USD", DEFAULT_RATES["USD"])), step=0.0001, format="%.6f")
+    nok = st.number_input("NOK → SEK", key="rate_nok",
+                          value=float(pref.get("NOK", DEFAULT_RATES["NOK"])), step=0.0001, format="%.6f")
+    cad = st.number_input("CAD → SEK", key="rate_cad",
+                          value=float(pref.get("CAD", DEFAULT_RATES["CAD"])), step=0.0001, format="%.6f")
+    eur = st.number_input("EUR → SEK", key="rate_eur",
+                          value=float(pref.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
 
     def _rates_from_widgets():
         return {"USD": st.session_state.rate_usd,
@@ -337,13 +409,9 @@ with st.sidebar:
         if st.button("🌐 Hämta livekurser"):
             try:
                 live = fetch_live_rates()
-                # fyll fälten direkt
-                st.session_state.rate_usd = float(live["USD"])
-                st.session_state.rate_nok = float(live["NOK"])
-                st.session_state.rate_cad = float(live["CAD"])
-                st.session_state.rate_eur = float(live["EUR"])
                 st.session_state["_live_rates"] = live
-                st.success("Livekurser inlästa i fälten.")
+                st.success("Livekurser inlästa.")
+                st.rerun()
             except Exception as e:
                 st.error(f"Kunde inte hämta livekurser: {e}")
 
@@ -425,7 +493,7 @@ with st.sidebar:
                     ("pb", "P/B"),
                     ("ev_ebitda", "EV/EBITDA (ttm)"),
                     ("dividend_rate", "Årlig utdelning"),
-                    ("dividend_yield_pct", "Dividend yield (%)"),
+                    ("dividend_yield_pct", "Dividend yield (%)"),  # skrivs över i update_calculations
                     ("payout_ratio_pct", "Payout ratio (%)"),
                     ("book_value_per_share", "Book value / share"),
                     ("gross_margins_pct", "Gross margin (%)"),
@@ -434,7 +502,7 @@ with st.sidebar:
                 ]:
                     df0.at[i, dst_col] = float(y.get(src_key) or 0.0)
 
-                # Rå EV & EBITDA (för EV/EBITDA-strategi)
+                # Rå EV & EBITDA
                 df0.at[i, "_y_ev_now"] = float(y.get("enterprise_value") or 0.0)
                 df0.at[i, "_y_ebitda_now"] = float(y.get("ebitda") or 0.0)
 
@@ -460,8 +528,9 @@ with st.sidebar:
 
                 status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
                 bar.progress((i+1)/total)
-                time.sleep(0.5)  # snäll paus även här
+                time.sleep(0.5)  # snäll paus
 
+            # Beräkna och skriv prognoser + riktkurser
             df0 = update_calculations(df0)
             st.session_state["_df_ref"] = df0
             _save_df(df0, ws_name)
@@ -487,8 +556,8 @@ with tab_collect:
         df_in = st.session_state.get("_df_ref", pd.DataFrame())
         df_out = manual_collect_view(df_in)
         if isinstance(df_out, pd.DataFrame) and not df_out.equals(df_in):
-            st.session_state["_df_ref"] = df_out
-            st.success("Uppdaterade sessionens data.")
+            st.session_state["_df_ref"] = update_calculations(df_out.copy())
+            st.success("Uppdaterade sessionens data (inkl. projektioner + riktkurser).")
 
 with tab_port:
     df = st.session_state.get("_df_ref", pd.DataFrame())
@@ -522,78 +591,147 @@ with tab_suggest:
     if df.empty:
         st.info("Ingen data.")
     else:
-        st.subheader("Strategi & parametrar")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        strategy = c1.selectbox("Strategi", ["Tillväxt (P/S)", "Utdelning", "EV/EBITDA", "P/B (Finans)", "P/B (4Q-snitt)"])
-        ps_target = c2.slider("PS-mål (Tillväxt)", 1.0, 15.0, 6.0, 0.5)
-        div_target = c3.slider("Målyield % (Utdelning)", 2.0, 10.0, 4.0, 0.1)
-        ev_target = c4.slider("EV/EBITDA-mål", 6.0, 20.0, 12.0, 0.5)
-        pb_target = c5.slider("P/B-mål (Finans)", 0.5, 2.5, 1.2, 0.1)
+        st.subheader("Regelstyrda köpförslag")
 
-        st.markdown("---")
-        rates = read_rates()
-        base_table = proposal_table(
-            df, strategy,
-            ps_target=ps_target,
-            div_target_yield=div_target,
-            ev_ebitda_target=ev_target,
-            pb_target=pb_target,
-            rates=rates
-        )
+        c1, c2, c3 = st.columns(3)
+        mode = c1.selectbox("Typ", ["Auto (bransch)", "Tillväxt", "Utdelning", "Finans (P/B)"])
+        horizon = c2.selectbox("Riktkurs baseras på", HORIZONS, index=0)  # standard: Idag
+        min_score = c3.slider("Min. Poäng (endast Poäng-läget)", 0, 100, 60, 1)
 
-        if base_table.empty:
-            st.info("Inget målpris kunde beräknas – saknas nyckeltal för valda bolag/strategi.")
+        # Sektorfilter och endast innehav
+        if "Sektor" in df.columns:
+            sectors_all = sorted([s for s in df["Sektor"].astype(str).unique() if s and s != "nan"])
+            selected_sectors = st.multiselect("Filtrera sektor(er)", sectors_all, default=sectors_all)
         else:
-            # ---- Filter ----
-            st.subheader("Filter")
-            f1, f2, f3 = st.columns([1,1,1])
+            selected_sectors = []
+        only_holdings = st.checkbox("Visa endast innehav (Antal aktier > 0)", value=False)
 
-            only_green = f1.checkbox("Visa endast 🟢 (≥85%)", value=False)
-            min_conf = f2.slider("Min. Confidence (%)", 0, 100, 60, 5)
-            min_up = f3.slider("Min. uppsida (%)", 0.0, 200.0, 10.0, 1.0)
+        # Basurval
+        base = df.copy()
+        if selected_sectors and "Sektor" in base.columns:
+            base = base[base["Sektor"].isin(selected_sectors)].copy()
+        if only_holdings and "Antal aktier" in base.columns:
+            base = base[base["Antal aktier"] > 0].copy()
 
-            # Sektor (om kolumnen finns i ursprungstabellen)
-            sector_map = {}
-            if "Sektor" in df.columns:
-                try:
-                    sector_map = df.set_index("Ticker")["Sektor"].astype(str).to_dict()
-                    base_table["Sektor"] = base_table["Ticker"].map(sector_map)
-                    sektorer = sorted([s for s in base_table["Sektor"].dropna().unique() if str(s).strip() != ""])
-                    sel_sektorer = st.multiselect("Sektor", sektorer, default=sektorer)
-                except Exception:
-                    sel_sektorer = []
+        # Bygg tabell
+        rows = []
+        for _, r in base.iterrows():
+            price = float(r.get("Aktuell kurs", 0.0))
+
+            # ---- alla riktkurser (PS) och uppsidor (PS)
+            tps = ps_targets_all(r)                 # dict per horisont
+            ups_ps = upsides_from(price, tps)       # dict per horisont
+
+            # ---- PB-riktkurs och uppsida (PB)
+            tpb = pb_target(r)
+            up_pb = round(((tpb - price)/price*100.0), 2) if (price>0 and tpb>0) else 0.0
+
+            # ---- vald horisont (PS-fokus)
+            tp_sel = tps.get(horizon, 0.0)
+            up_sel = ups_ps.get(horizon, 0.0)
+
+            # ---- utdelning (pris-känslig yield + helper)
+            payout = float(r.get("Payout ratio (%)", 0.0))
+            yld_calc = current_yield_pct(r)
+            adj_yield_80 = round(yld_calc * (DIV_BASE_PAYOUT / payout), 2) if (yld_calc>0 and payout>0) else 0.0
+
+            # ---- poäng beroende på mode
+            m = mode
+            if m.startswith("Auto"):
+                m = infer_mode_from_sector(r.get("Sektor", ""))
+
+            if m == "Tillväxt":
+                score = score_tillvaxt(r, horizon)
+            elif m == "Utdelning":
+                score = score_utdelning(r, horizon)
+            else:  # Finans (P/B)
+                score = score_finans_pb(r, horizon)
+
+            rows.append({
+                "Typ": m,
+                "Ticker": r.get("Ticker",""),
+                "Bolagsnamn": r.get("Bolagsnamn",""),
+                "Sektor": r.get("Sektor","") if "Sektor" in r else "",
+                "Valuta": r.get("Valuta",""),
+                "Aktuell kurs": price,
+
+                # ---- Vald horisont (fokus)
+                f"Riktkurs (Vald={horizon}) [PS]": tp_sel,
+                "Uppsida (Vald) [PS] %": up_sel,
+
+                # ---- Alla PS-riktkurser & uppsidor
+                "Riktkurs (Idag) [PS]": tps["Idag"],
+                "Riktkurs (Om 1 år) [PS]": tps["Om 1 år"],
+                "Riktkurs (Om 2 år) [PS]": tps["Om 2 år"],
+                "Riktkurs (Om 3 år) [PS]": tps["Om 3 år"],
+                "Uppsida (Idag) [PS] %": ups_ps["Idag"],
+                "Uppsida (Om 1 år) [PS] %": ups_ps["Om 1 år"],
+                "Uppsida (Om 2 år) [PS] %": ups_ps["Om 2 år"],
+                "Uppsida (Om 3 år) [PS] %": ups_ps["Om 3 år"],
+
+                # ---- PB
+                "Riktkurs [PB]": tpb,
+                "Uppsida [PB] %": up_pb,
+
+                # ---- Utdelning
+                "Dividend yield (%)": yld_calc,
+                "Payout ratio (%)": payout,
+                "Just. yield (80%)": adj_yield_80,
+                "Sund utd (80%)": round((float(r.get("Årlig utdelning",0.0))*(0.80/(payout/100.0)),4),4) if (float(r.get("Årlig utdelning",0.0))>0 and payout>0) else 0.0,
+
+                # ---- Tillväxt/marginaler
+                "Revenue growth (%)": float(r.get("Revenue growth (%)", 0.0)),
+                "Gross margin (%)": float(r.get("Gross margin (%)", 0.0)),
+                "Net margin (%)": float(r.get("Net margin (%)", 0.0)),
+
+                # ---- Poäng
+                "Poäng": score,
+            })
+
+        prop = pd.DataFrame(rows)
+        if prop.empty:
+            st.info("Inga förslag – saknas data för urvalet.")
+        else:
+            # Välj filter-läge
+            mode_filter = st.radio("Filtrera på", ["Poäng", "Endast riktkurs"], horizontal=True)
+
+            if mode_filter == "Poäng":
+                prop_f = prop[prop["Poäng"] >= min_score].copy()
+                prop_f = prop_f.sort_values(by=["Poäng", "Uppsida (Vald) [PS] %"],
+                                            ascending=[False, False]).reset_index(drop=True)
             else:
-                sel_sektorer = []
+                st.markdown("**Riktkurs-filter (standard: Idag)**")
+                rk_basis = st.selectbox(
+                    "Riktkurs-basis", ["PS", "PB"], index=0,
+                    help="PS: riktkurs = P/S-snitt × Omsättning(horisont) / Utestående aktier. "
+                         "PB: riktkurs = P/B-snitt × Book value / share."
+                )
+                max_up = st.slider("Max uppsida (%)", 0.0, 100.0, 5.0, 0.5,
+                                   help="Visa bara bolag där uppsidan är begränsad (≤ detta värde).")
+                max_price = st.number_input("Max aktuell kurs (valfritt)", value=0.0, step=1.0,
+                                            help="0 = ignorera prisfilter. Annars visa bara aktier ≤ detta pris.")
 
-            # Tillämpa filter
-            filt = base_table.copy()
-            if only_green:
-                filt = filt[filt["Confidence (%)"] >= 85]
-            else:
-                filt = filt[filt["Confidence (%)"] >= min_conf]
+                ups_col = ("Uppsida (Vald) [PS] %" if rk_basis == "PS" else "Uppsida [PB] %")
+                prop_f = prop[prop[ups_col] <= max_up].copy()
+                if max_price and max_price > 0:
+                    prop_f = prop_f[prop_f["Aktuell kurs"] <= max_price]
+                prop_f = prop_f.sort_values(by=[ups_col], ascending=True).reset_index(drop=True)
+                if "Poäng" in prop_f.columns:
+                    prop_f = prop_f.drop(columns=["Poäng"])
 
-            filt = filt[filt["Uppsida (%)"] >= min_up]
-
-            if "Sektor" in filt.columns and sel_sektorer:
-                filt = filt[filt["Sektor"].isin(sel_sektorer)]
-
-            filt = filt.reset_index(drop=True)
-
-            st.caption(f"Visar {len(filt)}/{len(base_table)} rader efter filter.")
-            st.dataframe(filt, use_container_width=True)
+            st.caption(f"Visar {len(prop_f)}/{len(prop)} förslag efter filter.")
+            st.dataframe(prop_f, use_container_width=True)
 
             st.markdown("---")
             csave, cdl = st.columns([1,1])
-
             with csave:
                 if st.button("💾 Spara förslag till Google Sheet"):
                     try:
                         sheet_name = f"Förslag-{pd.Timestamp.now().strftime('%Y%m%d-%H%M')}"
-                        save_dataframe(filt, worksheet_name=sheet_name)
+                        save_dataframe(prop_f, worksheet_name=sheet_name)
                         st.success(f"Sparat i blad: **{sheet_name}**")
                     except Exception as e:
                         st.error(f"Kunde inte spara förslagen: {e}")
-
             with cdl:
-                csv_bytes = filt.to_csv(index=False).encode("utf-8-sig")
+                csv_bytes = prop_f.to_csv(index=False).encode("utf-8-sig")
                 st.download_button("⬇️ Ladda ned CSV", data=csv_bytes, file_name="förslag.csv", mime="text/csv")

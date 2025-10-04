@@ -1,194 +1,138 @@
 # stockapp/fetchers/stocktwits.py
 from __future__ import annotations
 
-import math
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
-import requests
+import pandas as pd
 import streamlit as st
-from datetime import datetime, timezone, timedelta
 
 try:
-    from dateutil import parser as dtparser  # robust parsedatum
+    import requests
 except Exception:
-    dtparser = None  # type: ignore
+    requests = None  # type: ignore
 
-# ------------------------- Konfiguration -------------------------
 
-UA = st.secrets.get("STOCKTWITS_USER_AGENT") or (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+BASE = "https://api.stocktwits.com/api/2"
+UA = st.secrets.get("STW_USER_AGENT") or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 )
-STREAM_URL = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
-SHOW_URL   = "https://api.stocktwits.com/api/2/symbols/show/{ticker}.json"
+TIMEOUT = 20
+PAGE_LIMIT = 5          # max antal API-sidor vi hämtar (för att inte bli tunga)
+SLEEP_BETWEEN = 0.6     # artigt delay mellan sid-hämtningar
 
 
-# -------------------------- Hjälpfunktioner -----------------------
-
-def _safe_int(x) -> int:
-    try:
-        if x is None:
-            return 0
-        i = int(x)
-        return i if i >= 0 else 0
-    except Exception:
-        return 0
-
-def _safe_float(x) -> float:
-    try:
-        f = float(x)
-        if math.isnan(f) or math.isinf(f):
-            return 0.0
-        return f
-    except Exception:
-        return 0.0
-
-def _parse_created_at(s: str) -> Optional[datetime]:
-    """
-    Stocktwits created_at t.ex: 'Mon, 05 Oct 2015 18:45:00 -0400'
-    Försök med dateutil, annars med strptime.
-    Returnerar UTC-aware datetime.
-    """
-    if not s:
+def _get(url: str, params: Optional[dict] = None) -> Optional[dict]:
+    if requests is None:
         return None
     try:
-        if dtparser:
-            d = dtparser.parse(s)
-        else:
-            # Fallback: Mon, 05 Oct 2015 18:45:00 -0400
-            d = datetime.strptime(s, "%a, %d %b %Y %H:%M:%S %z")
-        return d.astimezone(timezone.utc)
+        r = requests.get(url, params=params or {}, headers={"User-Agent": UA}, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
-
-def _within_last_hours(d: datetime, hours: int = 24) -> bool:
-    try:
-        now = datetime.now(timezone.utc)
-        return (now - d) <= timedelta(hours=hours)
-    except Exception:
-        return False
-
-
-# --------------------------- API-funktioner -----------------------
-
-def _fetch_stream_page(ticker: str, max_id: Optional[int] = None) -> Dict[str, Any]:
-    params: Dict[str, Any] = {}
-    if max_id is not None:
-        params["max"] = int(max_id)
-    headers = {"User-Agent": UA}
-    url = STREAM_URL.format(ticker=ticker.upper().strip())
-    r = requests.get(url, params=params, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-def _fetch_symbol_show(ticker: str) -> Dict[str, Any]:
-    headers = {"User-Agent": UA}
-    url = SHOW_URL.format(ticker=ticker.upper().strip())
-    r = requests.get(url, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.json()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_symbol_summary(ticker: str, pages: int = 3, sleep_between: float = 0.3) -> Dict[str, Any]:
+def get_symbol_summary(ticker: str) -> Dict[str, Any]:
     """
-    Sammanfattning för en symbol:
+    Sammanfattning för en Stocktwits-symbol (senaste 24h):
       - stw_messages_24h
       - stw_bull_24h
       - stw_bear_24h
-      - stw_bull_ratio  (bull/(bull+bear))
+      - stw_bull_ratio
       - stw_watchlist_count
       - stw_avg_msgs_per_hour_24h
-      - last_message_at (ISO)
-    Läser upp till 'pages' sidor från streams/symbol (paginering via 'max').
+      - last_message_at (ISO8601)
     """
-    tkr = ticker.upper().strip()
-    total_msgs_24h = 0
-    bull_24h = 0
-    bear_24h = 0
-    last_message_at: Optional[datetime] = None
+    out: Dict[str, Any] = {
+        "stw_messages_24h": 0,
+        "stw_bull_24h": 0,
+        "stw_bear_24h": 0,
+        "stw_bull_ratio": 0.0,
+        "stw_watchlist_count": 0,
+        "stw_avg_msgs_per_hour_24h": 0.0,
+        "last_message_at": "",
+    }
 
-    # --------- Hämta stream-sidor ----------
-    next_max: Optional[int] = None
-    for _ in range(max(1, pages)):
+    symbol = (ticker or "").strip().upper()
+    if not symbol or requests is None:
+        return out
+
+    now = pd.Timestamp.utcnow()
+    cutoff = now - pd.Timedelta(hours=24)
+
+    # --- 1) Watchlist count ---
+    sym_json = _get(f"{BASE}/symbols/{symbol}.json")
+    if isinstance(sym_json, dict):
         try:
-            js = _fetch_stream_page(tkr, max_id=next_max)
+            sym = sym_json.get("symbol") or {}
+            out["stw_watchlist_count"] = int(sym.get("watchlist_count", 0) or 0)
         except Exception:
+            pass
+
+    # --- 2) Meddelanden (paginera bakåt tills äldre än 24h eller PAGE_LIMIT nåtts) ---
+    total_msgs = 0
+    bull = 0
+    bear = 0
+    last_dt = None
+
+    max_id = None
+    for _ in range(PAGE_LIMIT):
+        params = {}
+        if max_id:
+            params["max"] = max_id
+
+        data = _get(f"{BASE}/streams/symbol/{symbol}.json", params=params)
+        if not isinstance(data, dict):
             break
 
-        msgs: List[Dict[str, Any]] = js.get("messages", []) or []
+        msgs = data.get("messages") or []
         if not msgs:
             break
 
-        # uppdatera next_max för äldre meddelanden
-        oldest_id = None
         for m in msgs:
-            mid = _safe_int(m.get("id"))
-            if mid and (oldest_id is None or mid < oldest_id):
-                oldest_id = mid
-        if oldest_id:
-            next_max = oldest_id - 1
+            # created_at: "2025-01-18T15:31:02Z"
+            try:
+                c_at = pd.to_datetime(m.get("created_at"), utc=True)
+            except Exception:
+                continue
 
-        # summera 24h
-        found_any_recent = False
-        for m in msgs:
-            ts = _parse_created_at(m.get("created_at", ""))
-            if ts:
-                if (last_message_at is None) or (ts > last_message_at):
-                    last_message_at = ts
-                if _within_last_hours(ts, 24):
-                    found_any_recent = True
-                    total_msgs_24h += 1
-                    sentiment = (m.get("entities") or {}).get("sentiment") or m.get("sentiment") or {}
-                    # vissa poster har 'basic' {'bullish': True/False}, andra har 'sentiment': {'basic': 'Bullish'/'Bearish'}
-                    if isinstance(sentiment, dict):
-                        basic = sentiment.get("basic")
-                        if isinstance(basic, str):
-                            s = basic.lower()
-                            if "bull" in s:
-                                bull_24h += 1
-                            elif "bear" in s:
-                                bear_24h += 1
-                        else:
-                            # ibland boolean flags
-                            if sentiment.get("bullish") is True:
-                                bull_24h += 1
-                            if sentiment.get("bearish") is True:
-                                bear_24h += 1
+            if last_dt is None or c_at > last_dt:
+                last_dt = c_at
 
-        # Om inga nya inom 24h i denna sida, avbryt tidigt
-        if not found_any_recent:
+            if c_at < cutoff:
+                # vi är utanför 24h-fönstret; avsluta paginering helt
+                msgs = []  # empty to break outer
+                break
+
+            total_msgs += 1
+            # sentiment
+            sent = (((m.get("entities") or {}).get("sentiment") or {}).get("basic") or "").lower()
+            if sent == "bullish":
+                bull += 1
+            elif sent == "bearish":
+                bear += 1
+
+        # sätt nästa max (paginering bakåt)
+        try:
+            last_id = int(msgs[-1]["id"]) if msgs else None
+        except Exception:
+            last_id = None
+
+        if last_id is None or (msgs == []):
             break
 
-        time.sleep(sleep_between)
+        # nästa sida
+        max_id = last_id - 1
+        time.sleep(SLEEP_BETWEEN)
 
-    # --------- Hämta show (watchlist_count m.m.) ----------
-    watchlist_count = 0
-    try:
-        js2 = _fetch_symbol_show(tkr)
-        # struktur: {"symbol": {"id":..., "symbol":"AMD", "watchlist_count": 123456, ...}}
-        sym = js2.get("symbol") or {}
-        watchlist_count = _safe_int(sym.get("watchlist_count"))
-        # fallback: visa i vissa svar ligger i sym.get("watchlist") eller liknande
-        if not watchlist_count:
-            watchlist_count = _safe_int(sym.get("watchlist"))
-    except Exception:
-        pass
+    out["stw_messages_24h"] = int(total_msgs)
+    out["stw_bull_24h"] = int(bull)
+    out["stw_bear_24h"] = int(bear)
+    out["stw_bull_ratio"] = round((bull / total_msgs * 100.0), 2) if total_msgs > 0 else 0.0
+    out["stw_avg_msgs_per_hour_24h"] = round(total_msgs / 24.0, 2) if total_msgs > 0 else 0.0
+    out["last_message_at"] = (last_dt.isoformat() if last_dt is not None else "")
 
-    # bull-ratio
-    denom = bull_24h + bear_24h
-    bull_ratio = (bull_24h / denom * 100.0) if denom > 0 else 0.0
-
-    avg_msgs_per_hour = (total_msgs_24h / 24.0) if total_msgs_24h > 0 else 0.0
-
-    return {
-        "stw_messages_24h": int(total_msgs_24h),
-        "stw_bull_24h": int(bull_24h),
-        "stw_bear_24h": int(bear_24h),
-        "stw_bull_ratio": round(bull_ratio, 2),
-        "stw_watchlist_count": int(watchlist_count),
-        "stw_avg_msgs_per_hour_24h": round(avg_msgs_per_hour, 3),
-        "last_message_at": last_message_at.isoformat() if last_message_at else "",
-        "source": "stocktwits",
-    }
+    return out

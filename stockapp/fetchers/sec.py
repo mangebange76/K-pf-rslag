@@ -2,172 +2,225 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import streamlit as st
 
-# SEC kräver User-Agent
-_UA = st.secrets.get("SEC_USER_AGENT", "yourname@example.com")
+try:
+    import yfinance as yf
+except Exception:
+    yf = None  # type: ignore
 
-HEADERS = {
-    "User-Agent": _UA,
-    "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov",
-}
+# ------- Konfiguration -------
+UA = st.secrets.get("SEC_USER_AGENT") or (
+    "Mozilla/5.0 (compatible; KpfRslag/1.0; +https://example.com)"
+)
 
-TTL_SECS = 60 * 60  # 1h cache
+SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
+# ------- Hjälpare -------
 
-def _pad_cik(cik: int | str) -> str:
-    s = str(cik).strip()
-    return s.zfill(10)
+def _is_quarter_item(it: dict) -> bool:
+    """Filtrera kvartsvisa observationer (Q1..Q4 eller 10-Q/10-K för Q4)."""
+    fp = (it.get("fp") or "").upper()
+    form = (it.get("form") or "").upper()
+    if fp in {"Q1", "Q2", "Q3", "Q4"}:
+        return True
+    if "10-Q" in form:
+        return True
+    if "10-K" in form and fp in {"FY", "Q4"}:
+        return True
+    return False
 
-
-@st.cache_data(ttl=TTL_SECS, show_spinner=False)
-def _ticker_to_cik(ticker: str) -> str:
-    """
-    Mappar ticker -> CIK via officiella listan.
-    Hämtas en gång och cacheas.
-    """
+def _parse_date(s: str) -> Optional[dt.date]:
     try:
-        r = requests.get("https://www.sec.gov/files/company_tickers.json", headers={"User-Agent": _UA}, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        # data är en dict med index som nycklar
-        t = ticker.upper()
-        for _, row in data.items():
-            if str(row.get("ticker", "")).upper() == t:
-                return _pad_cik(row.get("cik_str"))
+        return dt.date.fromisoformat(s)
     except Exception:
-        pass
-    return ""
+        return None
 
-
-def _closest_price_on_date(ticker: str, date_str: str) -> float:
-    """
-    Hämtar närmaste stängningskurs (±3 dagar) runt 'date_str' via Yahoo query2.
-    Vi använder Yahoo's snabba endpoint för pris-historik.
-    """
+def _safe_float(x) -> float:
     try:
-        d = dt.datetime.fromisoformat(date_str)
+        return float(x) if x is not None else 0.0
     except Exception:
         return 0.0
 
-    start = int((d - dt.timedelta(days=3)).timestamp())
-    end = int((d + dt.timedelta(days=3)).timestamp())
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {"period1": start, "period2": end, "interval": "1d"}
-    r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    js = r.json()
-    closes = (js.get("chart", {}).get("result", [{}])[0]
-              .get("indicators", {}).get("quote", [{}])[0].get("close", []))
-    # ta sista icke-None
-    for v in reversed(closes or []):
-        if v is not None:
-            try:
-                return float(v)
-            except Exception:
-                pass
-    return 0.0
+def _nearest_price_on_or_after(ticker: str, date: dt.date) -> float:
+    """Hämta stängningspris närmast på/efter 'date' (fallback närmast före)."""
+    if yf is None or not ticker:
+        return 0.0
+    try:
+        t = yf.Ticker(ticker)
+        start = date - dt.timedelta(days=5)
+        end = date + dt.timedelta(days=15)
+        hist = t.history(start=start.isoformat(), end=end.isoformat(), auto_adjust=False)
+        if hist.empty:
+            return 0.0
+        # först datum >= end-date
+        sub = hist[hist.index.date >= date]
+        if not sub.empty:
+            return float(sub["Close"].iloc[0])
+        # annars sista före
+        return float(hist["Close"].iloc[-1])
+    except Exception:
+        return 0.0
 
+def _pick_equity_tag(facts: dict) -> Tuple[str, str]:
+    """Välj bästa equity-tag och enhet. Prova inkluderande NCI först."""
+    candidates = [
+        ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "USD"),
+        ("StockholdersEquity", "USD"),
+        ("CommonStockholdersEquity", "USD"),
+        ("TotalPartnersCapital", "USD"),  # partnerships fallback
+    ]
+    for tag, unit in candidates:
+        node = facts.get("us-gaap", {}).get(tag, {})
+        if node.get("units", {}).get(unit):
+            return tag, unit
+    return "", ""
 
-def _pick_facts(facts: Dict[str, Any], keys: List[str]) -> List[Dict[str, Any]]:
-    """Plocka ut alla perioder för första nyckel som finns."""
-    for k in keys:
-        node = facts.get("us-gaap", {}).get(k)
-        if not node:
+def _pick_shares_tag(facts: dict) -> Tuple[str, str]:
+    """Välj bästa shares-tag och enhet (period-end, ej W/A)."""
+    candidates = [
+        ("CommonStockSharesOutstanding", "shares"),
+        ("EntityCommonStockSharesOutstanding", "shares"),
+        ("CommonSharesOutstanding", "shares"),
+    ]
+    for tag, unit in candidates:
+        node = facts.get("us-gaap", {}).get(tag, {})
+        if node.get("units", {}).get(unit):
+            return tag, unit
+    return "", ""
+
+def _extract_series(facts: dict, tag: str, unit: str) -> List[Tuple[dt.date, float]]:
+    """Plocka ut (end_date, value) för given tag/unit, kvartsfiltrerad, senaste först."""
+    items = facts.get("us-gaap", {}).get(tag, {}).get("units", {}).get(unit, []) or []
+    out: List[Tuple[dt.date, float]] = []
+    for it in items:
+        end = _parse_date(it.get("end", ""))
+        if not end:
             continue
-        # Föredra kvartalsvisa ("Q") från 'units'
-        for unit, arr in (node.get("units") or {}).items():
-            # Equity är i USD, shares i shares
-            if not isinstance(arr, list):
-                continue
-            return arr  # returnera första träffens alla observationer
-    return []
+        if not _is_quarter_item(it):
+            continue
+        val = _safe_float(it.get("val"))
+        if val == 0.0:
+            continue
+        out.append((end, val))
+    # sortera på datum, senaste först
+    out.sort(key=lambda x: x[0], reverse=True)
+    # deduplikation per datum (ibland flera dimensioner/frames samma end)
+    seen = set()
+    uniq: List[Tuple[dt.date, float]] = []
+    for d, v in out:
+        if d not in seen:
+            uniq.append((d, v))
+            seen.add(d)
+    return uniq
 
+# ------- SEC API -------
 
-@st.cache_data(ttl=TTL_SECS, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
+def _sec_ticker_map() -> Dict[str, Dict[str, Any]]:
+    """Ticker → {cik, title}. Endast US-filers finns här."""
+    r = requests.get(SEC_TICKER_MAP_URL, headers={"User-Agent": UA}, timeout=30)
+    r.raise_for_status()
+    data = r.json()  # {"0": {"cik_str":..., "ticker":"A", "title":"Agilent"} , ...}
+    out: Dict[str, Dict[str, Any]] = {}
+    for _, v in data.items():
+        t = str(v.get("ticker", "")).upper()
+        if not t:
+            continue
+        out[t] = {"cik": str(v.get("cik_str", "")).zfill(10), "title": v.get("title", "")}
+    return out
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_company_facts(cik: str) -> dict:
+    url = SEC_COMPANYFACTS_URL.format(cik=cik)
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+# ------- Publika funktioner -------
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_pb_quarters(ticker: str) -> Dict[str, Any]:
     """
-    Beräknar P/B för de senaste upp till 4 kvartalen:
-      P/B = (stängningskurs vid periodens slut) / (Equity / Antal aktier)
+    Beräkna P/B för de senaste upp till 4 kvartalen:
+      1) SEC us-gaap:Equity-tag (USD) + CommonStockSharesOutstanding (shares)
+      2) BVPS = Equity / Shares
+      3) Pris via yfinance nära rapportdatum
+      4) PB = Price / BVPS
+
     Returnerar:
-      {"pb_quarters": [(ISO-datum, pb-float), ...], "warnings": [str,...]}
+      {
+        "pb_quarters": [(YYYY-MM-DD, pb), ...],  # senaste först, max 4
+        "details": [
+            {"date": "...", "equity": ..., "shares": ..., "bvps": ..., "price": ..., "pb": ...},
+            ...
+        ],
+        "source": "sec+yf",
+        "cik": "0000320193",
+        "company": "Apple Inc."
+      }
+
+    Obs:
+      * Fungerar i praktiken för US-bolag som rapporterar till SEC.
+      * För icke-US tickers returneras tom lista.
     """
-    out: Dict[str, Any] = {"pb_quarters": [], "warnings": []}
-    try:
-        cik = _ticker_to_cik(ticker)
-        if not cik:
-            out["warnings"].append("Hittade ingen CIK för tickern.")
-            return out
+    tkr = ticker.upper().strip()
+    mapping = _sec_ticker_map()
+    if tkr not in mapping:
+        return {"pb_quarters": [], "details": [], "source": "sec+yf", "cik": "", "company": ""}
 
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+    cik = mapping[tkr]["cik"]
+    company = mapping[tkr]["title"]
 
-        # Hämta equity och aktier
-        # Equity: StockholdersEquity eller inkl NCI
-        eq_arr = _pick_facts(data.get("facts", {}), [
-            "StockholdersEquity",
-            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-        ])
-        sh_arr = _pick_facts(data.get("facts", {}), [
-            "CommonStockSharesOutstanding",
-            "EntityCommonStockSharesOutstanding",
-            "WeightedAverageNumberOfDilutedSharesOutstanding",
-            "WeightedAverageNumberOfSharesOutstandingBasic",
-        ])
+    facts = _get_company_facts(cik).get("facts", {})
+    if not facts:
+        return {"pb_quarters": [], "details": [], "source": "sec+yf", "cik": cik, "company": company}
 
-        if not eq_arr or not sh_arr:
-            out["warnings"].append("Saknar equity/aktier i SEC-facts.")
-            return out
+    eq_tag, eq_unit = _pick_equity_tag(facts)
+    sh_tag, sh_unit = _pick_shares_tag(facts)
+    if not eq_tag or not sh_tag:
+        return {"pb_quarters": [], "details": [], "source": "sec+yf", "cik": cik, "company": company}
 
-        # Gör om till dict med datum -> värde (ta senaste observation per datum)
-        def to_map(arr):
-            m = {}
-            for item in arr:
-                d = item.get("end")
-                v = item.get("val")
-                if d and v is not None:
-                    m[d] = float(v)
-            return m
+    eq_series = _extract_series(facts, eq_tag, eq_unit)
+    sh_series = _extract_series(facts, sh_tag, sh_unit)
+    if not eq_series or not sh_series:
+        return {"pb_quarters": [], "details": [], "source": "sec+yf", "cik": cik, "company": company}
 
-        eq_map = to_map(eq_arr)
-        sh_map = to_map(sh_arr)
+    # matcha per kvartalsdatum: ta shares med minsta datumdiff
+    details: List[Dict[str, Any]] = []
+    for d_eq, eq in eq_series[:12]:  # kolla bakåt upp till ~3 år
+        # närmast shares-punkt
+        near_sh = min(sh_series, key=lambda x: abs((x[0] - d_eq).days))
+        sh = _safe_float(near_sh[1]) if near_sh else 0.0
+        if eq <= 0 or sh <= 0:
+            continue
+        bvps = eq / sh  # USD
+        price = _nearest_price_on_or_after(tkr, d_eq)
+        if price <= 0 or bvps <= 0:
+            continue
+        pb = price / bvps
+        details.append({
+            "date": d_eq.isoformat(),
+            "equity": round(eq, 2),
+            "shares": round(sh, 2),
+            "bvps": round(bvps, 4),
+            "price": round(price, 4),
+            "pb": round(pb, 2),
+        })
 
-        # Intersektion av datum
-        common_dates = sorted(set(eq_map.keys()) & set(sh_map.keys()))
-        if not common_dates:
-            out["warnings"].append("Hittade inga gemensamma datum mellan equity och aktier.")
-            return out
+    # de 4 senaste
+    details.sort(key=lambda x: x["date"], reverse=True)
+    details = details[:4]
+    pb_quarters = [(d["date"], d["pb"]) for d in details]
 
-        pairs: List[Tuple[str, float]] = []
-        # Vi tar de senaste kvartalen (max 6, sen klipper vi till 4 med pris)
-        for d in reversed(common_dates[-8:]):
-            equity = float(eq_map[d])
-            shares = float(sh_map[d])
-            if equity <= 0 or shares <= 0:
-                continue
-            bvps = equity / shares
-            price = _closest_price_on_date(ticker, d)
-            if price <= 0 or bvps <= 0:
-                continue
-            pb = price / bvps
-            pairs.append((d, round(pb, 2)))
-            if len(pairs) >= 4:
-                break
-
-        out["pb_quarters"] = pairs
-        if not pairs:
-            out["warnings"].append("Kunde inte beräkna P/B för någon kvartalsperiod.")
-        return out
-
-    except requests.HTTPError as he:
-        out["warnings"].append(f"HTTP-fel från SEC: {he}")
-        return out
-    except Exception as e:
-        out["warnings"].append(f"Fel vid SEC-hämtning: {e}")
-        return out
+    return {
+        "pb_quarters": pb_quarters,
+        "details": details,
+        "source": "sec+yf",
+        "cik": cik,
+        "company": company,
+    }

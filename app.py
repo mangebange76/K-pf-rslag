@@ -1,4 +1,4 @@
-# app.py
+# app.py  (DEL 1/6)
 from __future__ import annotations
 
 import time
@@ -26,7 +26,6 @@ from stockapp.fetchers.finviz import get_overview as finviz_get
 from stockapp.fetchers.morningstar import get_overview as ms_get
 from stockapp.fetchers.stocktwits import get_symbol_summary as stw_get
 
-
 # ---------------- Schema ----------------
 FINAL_COLS = [
     "Ticker", "Bolagsnamn", "Sektor", "Industri", "Valuta", "Aktuell kurs",
@@ -35,24 +34,35 @@ FINAL_COLS = [
     "Årlig utdelning", "Dividend yield (%)", "Payout ratio (%)",
     "Revenue TTM (M)", "Revenue growth (%)", "Book value / share",
     "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
+
+    # FCF (NYTT)
+    "FCF (TTM, M)", "FCF yield (%)", "Payout (FCF) (%)", "Utdelning TTM/aktie",
+    "Sund utd (80%) [FCF]", "Sund yield (80%) [FCF]",
+
     # P/B historik (SEC)
     "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
     # PB-riktkurser (NYTT)
     "PB Riktkurs idag", "PB Riktkurs om 1 år", "PB Riktkurs om 2 år", "PB Riktkurs om 3 år",
     "BVPS CAGR (%)",
-    # PS-modellen & omsättningar
+
+    # PS-modellen & omsättningar (manuellt + prognos)
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+
     # Portfölj
     "Antal aktier",
+
     # Övrigt
     "CAGR 5 år (%)", "Senast manuellt uppdaterad",
+
     # Råfält för EV/EBITDA-strategi
     "_y_ev_now", "_y_ebitda_now",
+
     # Stocktwits (om hämtat)
     "STW meddelanden 24h", "STW bull 24h", "STW bear 24h",
     "STW bull ratio (%)", "STW bevakare", "STW meddelanden/h (24h)", "STW senast",
+
     # Info
     "Senast uppdaterad källa",
 ]
@@ -63,14 +73,22 @@ NUMERIC_COLS = [
     "Årlig utdelning", "Dividend yield (%)", "Payout ratio (%)",
     "Revenue TTM (M)", "Revenue growth (%)", "Book value / share",
     "Gross margin (%)", "Operating margin (%)", "Net margin (%)",
+
+    # FCF (NYTT)
+    "FCF (TTM, M)", "FCF yield (%)", "Payout (FCF) (%)", "Utdelning TTM/aktie",
+    "Sund utd (80%) [FCF]", "Sund yield (80%) [FCF]",
+
     "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
     "PB Riktkurs idag", "PB Riktkurs om 1 år", "PB Riktkurs om 2 år", "PB Riktkurs om 3 år",
     "BVPS CAGR (%)",
+
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
+
     "Antal aktier", "CAGR 5 år (%)",
     "_y_ev_now", "_y_ebitda_now",
+
     "STW meddelanden 24h", "STW bull 24h", "STW bear 24h",
     "STW bull ratio (%)", "STW bevakare", "STW meddelanden/h (24h)",
 ]
@@ -84,8 +102,8 @@ DIV_MAX_PAYOUT = 200.0  # clamp
 # ---- Stödkonstanter för vyer ----
 HORIZONS = ["Idag", "Om 1 år", "Om 2 år", "Om 3 år"]
 
+# app.py  (DEL 2/6)
 
-# ---------------- Hjälpare ----------------
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -210,8 +228,10 @@ def pb_targets_all_from_bvps(pb_avg: float, bvps0: float, g_bv: float) -> dict:
 
 def pb_targets_from_row(row: pd.Series) -> dict:
     """Använd sparade PB-riktkurser om de finns – annars försök räkna 'Idag' från P/B * BVPS."""
-    have_all = all(float(row.get(f"PB Riktkurs {hz}", 0.0)) > 0 for hz in ["idag", "om 1 år", "om 2 år", "om 3 år"])
-    if have_all:
+    have = all(float(row.get(k, 0.0)) > 0 for k in [
+        "PB Riktkurs idag", "PB Riktkurs om 1 år", "PB Riktkurs om 2 år", "PB Riktkurs om 3 år"
+    ])
+    if have:
         return {
             "Idag": float(row.get("PB Riktkurs idag", 0.0)),
             "Om 1 år": float(row.get("PB Riktkurs om 1 år", 0.0)),
@@ -229,11 +249,28 @@ def pb_targets_from_row(row: pd.Series) -> dict:
 def upsides_from(price: float, targets: dict) -> dict:
     return {hz: (round(((tp - price)/price*100.0), 2) if (price>0 and tp>0) else 0.0) for hz, tp in targets.items()}
 
-def sund_utdelning_80(row: pd.Series) -> float:
+# ---- Sund utdelning (EPS-baserad & FCF-baserad) ----
+def sund_utdelning_80_eps(row: pd.Series) -> float:
     div = float(row.get("Årlig utdelning", 0.0))
     p = float(row.get("Payout ratio (%)", 0.0))
     if div > 0 and p > 0:
         return round(div * (0.80 / (p/100.0)), 4)
+    return 0.0
+
+def sund_utdelning_80_fcf(row: pd.Series) -> float:
+    """Utdelning/aktie justerad till 80% FCF-payout, baserad på Utdelning TTM/aktie och Payout (FCF) (%)."""
+    d_ttm = float(row.get("Utdelning TTM/aktie", 0.0))
+    p_fcf = float(row.get("Payout (FCF) (%)", 0.0))
+    if d_ttm > 0 and p_fcf > 0:
+        return round(d_ttm * (0.80 / (p_fcf/100.0)), 4)
+    return 0.0
+
+def sund_yield_80_fcf(row: pd.Series) -> float:
+    """Sund yield(%) = Sund utd (80%) [FCF] / pris."""
+    price = float(row.get("Aktuell kurs", 0.0))
+    su = sund_utdelning_80_fcf(row)
+    if price > 0 and su > 0:
+        return round(100.0 * su / price, 2)
     return 0.0
 
 # --- Format-hjälpare ---
@@ -255,8 +292,8 @@ def _fmt_pct(v, nd=2):
     except Exception:
         return "—"
 
+# app.py  (DEL 3/6)
 
-# ---------------- Beräkningar + persist ----------------
 def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     for i, rad in df.iterrows():
@@ -273,6 +310,13 @@ def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
         # Dividend yield (%) – beräkna själv (pris-känslig)
         df.at[i, "Dividend yield (%)"] = current_yield_pct(rad)
 
+        # FCF (TTM, M) härleds från ev. hel-tal (yahoo i USD) → miljoner (om redan miljoner, spelar ingen roll)
+        # Vi antar market data i samma valuta som pris. Lagrar i miljoner för konsekvens med Revenue TTM (M).
+        fcf_abs = float(rad.get("FCF (TTM, M)", 0.0))
+        if fcf_abs == 0.0:
+            # om yahoo_get gav "fcf_ttm" i absoluta tal, appen fyllde in M – inget att göra här
+            pass
+
         # Omsättning om 2/3 år – från "Omsättning nästa år"
         rev2, rev3 = _proj_from_next_year(rad)
         df.at[i, "Omsättning om 2 år"] = rev2
@@ -283,8 +327,12 @@ def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
         df.at[i, "Riktkurs om 1 år"] = target_price_ps(df.loc[i], "Om 1 år")
         df.at[i, "Riktkurs om 2 år"] = target_price_ps(df.loc[i], "Om 2 år")
         df.at[i, "Riktkurs om 3 år"] = target_price_ps(df.loc[i], "Om 3 år")
-    return df
 
+        # Sund FCF-baserad utd + yield
+        df.at[i, "Sund utd (80%) [FCF]"]   = sund_utdelning_80_fcf(df.loc[i])
+        df.at[i, "Sund yield (80%) [FCF]"] = sund_yield_80_fcf(df.loc[i])
+
+    return df
 
 # ---------------- I/O Sheets ----------------
 def _load_df(worksheet_name: str | None) -> pd.DataFrame:
@@ -307,7 +355,6 @@ def _save_df(df: pd.DataFrame, worksheet_name: str | None) -> None:
     except Exception as e:
         st.warning(f"⚠️ Kunde inte spara: {e}")
 
-
 # ---------------- Scoring (poäng) ----------------
 def _norm(val: float, top: float) -> float:
     if top <= 0: return 0.0
@@ -319,26 +366,42 @@ def score_tillvaxt(row: pd.Series, horizon: str) -> float:
     ps_up = ((tps - price) / price * 100.0) if price > 0 and tps > 0 else 0.0
     g = float(row.get("Revenue growth (%)", 0.0))
     gm = float(row.get("Gross margin (%)", 0.0))
-    payout = float(row.get("Payout ratio (%)", 0.0))
+    payout_eps = float(row.get("Payout ratio (%)", 0.0))
+    payout_penalty = _norm(max(0.0, payout_eps - 80), 40.0)
 
     s_ps    = _norm(ps_up, 100.0)
     s_g     = _norm(g, 40.0)
     s_gm    = _norm(gm, 60.0)
-    penalty = _norm(max(0.0, payout - 80), 40.0)
 
-    score = 100.0 * (0.55*s_ps + 0.25*s_g + 0.15*s_gm + 0.05*(1-penalty))
+    score = 100.0 * (0.60*s_ps + 0.25*s_g + 0.10*s_gm + 0.05*(1 - payout_penalty))
     return round(score, 1)
 
 def score_utdelning(row: pd.Series, horizon: str) -> float:
+    """
+    Prioriterar FCF-payout om tillgänglig, annars EPS-payout.
+    Bonus för hög FCF-yield och för 'sund yield (80%) [FCF]'.
+    Liten värdeboost om riktkurs (PS/PB) indikerar uppsida.
+    """
     yld = current_yield_pct(row)
-    payout = float(row.get("Payout ratio (%)", 0.0))
 
-    base_ratio = DIV_BASE_YIELD / DIV_BASE_PAYOUT  # 15/80 = 0.1875
+    payout_fcf = float(row.get("Payout (FCF) (%)", 0.0))
+    payout_eps = float(row.get("Payout ratio (%)", 0.0))
+    payout = payout_fcf if payout_fcf > 0 else payout_eps
+
+    base_ratio = DIV_BASE_YIELD / DIV_BASE_PAYOUT  # 15/80
     p = _clamp(payout, DIV_MIN_PAYOUT, DIV_MAX_PAYOUT)
     ratio = (yld / p) if p > 0 else 0.0
     score_main = 100.0 * _clamp(ratio / base_ratio, 0.0, 1.0)
 
-    # Värdebonus
+    # FCF-yield (värde)
+    fcf_y = float(row.get("FCF yield (%)", 0.0))
+    fcf_boost = 15.0 * _norm(fcf_y, 10.0)  # 10% FCF-yield ≈ maxboost
+
+    # Sund yield [FCF] – hur nära en attraktiv hållbar yield vi ligger
+    sund_y = float(row.get("Sund yield (80%) [FCF]", 0.0))
+    sund_boost = 15.0 * _norm(sund_y, 10.0)
+
+    # Värdebonus utifrån uppsida (PS/PB)
     price = float(row.get("Aktuell kurs", 0.0))
     t_ps = target_price_ps(row, horizon)
     up_ps = ((t_ps - price) / price * 100.0) if (price > 0 and t_ps > 0) else 0.0
@@ -347,10 +410,10 @@ def score_utdelning(row: pd.Series, horizon: str) -> float:
     value_up = max(up_ps, up_pb)
     value_bonus = 10.0 * _norm(value_up, 60.0)
 
-    # Risk-straff för mycket hög payout
+    # Risk-straff för mycket hög payout (använder valda payout)
     risk_penalty = 10.0 * _norm(max(0.0, payout - 100.0), 50.0)
 
-    score = score_main + value_bonus - risk_penalty
+    score = score_main + fcf_boost + sund_boost + value_bonus - risk_penalty
     return round(_clamp(score, 0.0, 100.0), 1)
 
 def score_finans_pb(row: pd.Series, horizon: str) -> float:
@@ -360,7 +423,9 @@ def score_finans_pb(row: pd.Series, horizon: str) -> float:
     pb_up = ((tpb - price) / price * 100.0) if price > 0 and tpb > 0 else 0.0
 
     nm = float(row.get("Net margin (%)", 0.0))
-    payout = float(row.get("Payout ratio (%)", 0.0))
+    payout_fcf = float(row.get("Payout (FCF) (%)", 0.0))
+    payout_eps = float(row.get("Payout ratio (%)", 0.0))
+    payout = payout_fcf if payout_fcf > 0 else payout_eps
 
     s_pb    = _norm(pb_up, 80.0)
     s_nm    = _norm(nm, 25.0)
@@ -377,8 +442,8 @@ def infer_mode_from_sector(sector: str) -> str:
         return "Utdelning"
     return "Tillväxt"
 
+# app.py  (DEL 4/6)
 
-# ---------------- Kortvy-render ----------------
 def _get_score_for_mode(row: pd.Series, mode: str, horizon: str) -> float:
     m = mode
     if m.startswith("Auto"):
@@ -411,9 +476,13 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
     pb_ups = upsides_from(price, pb_targets)
 
     yld_calc = current_yield_pct(row)
-    payout = float(row.get("Payout ratio (%)", 0.0))
-    adj_yield = yld_calc * (DIV_BASE_PAYOUT / payout) if (yld_calc>0 and payout>0) else 0.0
-    sund = sund_utdelning_80(row)
+
+    payout_eps = float(row.get("Payout ratio (%)", 0.0))
+    payout_fcf = float(row.get("Payout (FCF) (%)", 0.0))
+
+    adj_yield_eps = yld_calc * (DIV_BASE_PAYOUT / payout_eps) if (yld_calc>0 and payout_eps>0) else 0.0
+    sund_u_fcf = sund_utdelning_80_fcf(row)
+    sund_y_fcf = sund_yield_80_fcf(row)
 
     score = _get_score_for_mode(row, mode, horizon)
 
@@ -465,13 +534,20 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
         with c2[1]: st.write("Revenue growth:", _fmt_pct(row.get("Revenue growth (%)",0)))
         with c2[2]: st.write("CAGR 5 år:", _fmt_pct(row.get("CAGR 5 år (%)",0)))
 
-    with st.expander("💸 Utdelning", expanded=False):
+    with st.expander("💸 Utdelning & FCF", expanded=False):
         c = st.columns(4)
-        with c[0]: st.write("Årlig utdelning:", _fmt_num(row.get("Årlig utdelning",0), 4))
-        with c[1]: st.write("Dividend yield (ber.):", _fmt_pct(yld_calc))
-        with c[2]: st.write("Payout ratio:", _fmt_pct(payout))
-        with c[3]: st.write("Just. yield (80%):", _fmt_pct(adj_yield))
-        st.write("Sund utd (80%):", _fmt_num(sund, 4))
+        with c[0]:
+            st.write("Årlig utdelning:", _fmt_num(row.get("Årlig utdelning",0), 4))
+            st.write("Utd TTM/aktie:", _fmt_num(row.get("Utdelning TTM/aktie",0), 4))
+        with c[1]:
+            st.write("Dividend yield (ber.):", _fmt_pct(yld_calc))
+            st.write("Payout EPS:", _fmt_pct(payout_eps))
+        with c[2]:
+            st.write("Payout (FCF):", _fmt_pct(payout_fcf))
+            st.write("FCF yield:", _fmt_pct(row.get("FCF yield (%)",0)))
+        with c[3]:
+            st.write("Sund utd (80%) [FCF]:", _fmt_num(sund_u_fcf, 4))
+            st.write("Sund yield (80%) [FCF]:", _fmt_pct(sund_y_fcf))
 
     with st.expander("📊 Marginaler & värdering", expanded=False):
         c = st.columns(4)
@@ -506,7 +582,6 @@ def render_company_card(row: pd.Series, horizon: str, mode: str):
     with st.expander("ℹ️ Källor", expanded=False):
         st.write(row.get("Senast uppdaterad källa",""))
 
-
 # ---------------- Prisuppdatering (alla) ----------------
 def update_all_prices(df: pd.DataFrame, worksheet_name: str, delay_sec: float = 0.5) -> pd.DataFrame:
     if df.empty:
@@ -535,6 +610,9 @@ def update_all_prices(df: pd.DataFrame, worksheet_name: str, delay_sec: float = 
                 df.at[idx, "Utestående aktier (milj.)"] = float(y["shares_outstanding"]) / 1e6
             if y.get("sector"):     df.at[idx, "Sektor"] = y["sector"]
             if y.get("industry"):   df.at[idx, "Industri"] = y["industry"]
+
+            # Uppdatera FCF/utdelningsrelaterad yield on-the-fly (pris ändrat)
+            # Utdelning TTM/aktie kom i full uppdatering – här räknar vi bara yields.
         except Exception as e:
             st.write(f"⚠️ {tkr}: {e}")
 
@@ -548,8 +626,8 @@ def update_all_prices(df: pd.DataFrame, worksheet_name: str, delay_sec: float = 
     st.success("✅ Aktiekurser + projektioner + riktkurser uppdaterade och sparade.")
     return df
 
+# app.py  (DEL 5/6)
 
-# ---------------- Sidopanel ----------------
 with st.sidebar:
     st.header("Google Sheets")
     blad = []
@@ -574,7 +652,6 @@ with st.sidebar:
     eur = st.number_input("EUR → SEK", key="rate_eur", value=float(pref.get("EUR", DEFAULT_RATES["EUR"])), step=0.0001, format="%.6f")
 
     def _apply_rates_to_widgets_and_rerun(rates: dict):
-        # Uppdatera widget-värden och rerun för att undvika "cannot be modified..."-felet
         st.session_state["rate_usd"] = float(rates.get("USD", DEFAULT_RATES["USD"]))
         st.session_state["rate_nok"] = float(rates.get("NOK", DEFAULT_RATES["NOK"]))
         st.session_state["rate_cad"] = float(rates.get("CAD", DEFAULT_RATES["CAD"]))
@@ -671,7 +748,7 @@ with st.sidebar:
 
                 used_sources = []
 
-                # --- Yahoo (bas) ---
+                # --- Yahoo (bas + FCF) ---
                 try:
                     y = yahoo_get(tkr)
                     used_sources.append("Yahoo")
@@ -705,11 +782,21 @@ with st.sidebar:
                     df0.at[i, "_y_ev_now"] = float(y.get("enterprise_value") or 0.0)
                     df0.at[i, "_y_ebitda_now"] = float(y.get("ebitda") or 0.0)
 
+                    # Revenue
                     rev_ttm = float(y.get("revenue_ttm") or 0.0)
                     if rev_ttm > 0:
                         df0.at[i, "Revenue TTM (M)"] = rev_ttm / 1e6
                     df0.at[i, "Revenue growth (%)"] = float(y.get("revenue_growth_pct") or 0.0)
                     df0.at[i, "CAGR 5 år (%)"] = float(y.get("cagr5_pct") or 0.0)
+
+                    # FCF-fält (NYTT)
+                    fcf_ttm = float(y.get("fcf_ttm") or 0.0)
+                    if fcf_ttm != 0.0:
+                        df0.at[i, "FCF (TTM, M)"] = fcf_ttm / 1e6
+                    df0.at[i, "FCF yield (%)"]   = float(y.get("fcf_yield_pct") or 0.0)
+                    df0.at[i, "Utdelning TTM/aktie"] = float(y.get("dividends_ttm_ps") or 0.0)
+                    df0.at[i, "Payout (FCF) (%)"]    = float(y.get("payout_fcf_pct") or 0.0)
+
                 except Exception as e:
                     st.write(f"Yahoo misslyckades för {tkr}: {e}")
 
@@ -829,11 +916,11 @@ with st.sidebar:
             st.session_state["_df_ref"] = df0
             _save_df(df0, ws_name)
 
+# app.py  (DEL 6/6)
 
 # ---------------- Första läsning ----------------
 if "_df_ref" not in st.session_state:
     st.session_state["_df_ref"] = _load_df(st.secrets.get("WORKSHEET_NAME") or "Blad1")
-
 
 # ---------------- Flikar ----------------
 tab_data, tab_collect, tab_port, tab_suggest = st.tabs(["📄 Data", "🧩 Manuell insamling", "📦 Portfölj", "💡 Köpförslag"])
@@ -931,9 +1018,12 @@ with tab_suggest:
             tp_sel_pb = pb_t.get(horizon, 0.0)
             up_sel_pb = pb_ups.get(horizon, 0.0)
 
-            payout = float(r.get("Payout ratio (%)", 0.0))
+            payout_eps = float(r.get("Payout ratio (%)", 0.0))
+            payout_fcf = float(r.get("Payout (FCF) (%)", 0.0))
             yld_calc = current_yield_pct(r)
-            adj_yield_80 = round(yld_calc * (DIV_BASE_PAYOUT / payout), 2) if (yld_calc>0 and payout>0) else 0.0
+            adj_yield_80_eps = round(yld_calc * (DIV_BASE_PAYOUT / payout_eps), 2) if (yld_calc>0 and payout_eps>0) else 0.0
+            sund_u_80_fcf = sund_utdelning_80_fcf(r)
+            sund_y_80_fcf = sund_yield_80_fcf(r)
 
             m = mode
             if m.startswith("Auto"):
@@ -970,9 +1060,14 @@ with tab_suggest:
                 "Riktkurs (Om 3 år) [PB]": pb_t["Om 3 år"],
 
                 "Dividend yield (%)": yld_calc,
-                "Payout ratio (%)": payout,
-                "Just. yield (80%)": adj_yield_80,
-                "Sund utd (80%)": sund_utdelning_80(r),
+                "Payout ratio (%)": payout_eps,
+                "Payout (FCF) (%)": payout_fcf,
+                "Utdelning TTM/aktie": float(r.get("Utdelning TTM/aktie", 0.0)),
+                "Just. yield (80%) [EPS]": adj_yield_80_eps,
+                "Sund utd (80%) [FCF]": sund_u_80_fcf,
+                "Sund yield (80%) [FCF]": sund_y_80_fcf,
+                "FCF (TTM, M)": float(r.get("FCF (TTM, M)", 0.0)),
+                "FCF yield (%)": float(r.get("FCF yield (%)", 0.0)),
 
                 "Revenue growth (%)": float(r.get("Revenue growth (%)", 0.0)),
                 "Gross margin (%)": float(r.get("Gross margin (%)", 0.0)),

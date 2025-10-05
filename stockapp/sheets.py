@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import time
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 import streamlit as st
 
-# gspread och google creds
+# 3p
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -15,13 +16,8 @@ except Exception:
     Credentials = None  # type: ignore
 
 
-# ------------------------------------------------------------
-# Backoff-hjälpare
-# ------------------------------------------------------------
+# ---------------- Backoff ----------------
 def _with_backoff(func, *args, **kwargs):
-    """
-    Kör en funktion med mild backoff för att hantera sporadiska 429/5xx från Sheets API.
-    """
     delays = [0.0, 0.5, 1.0, 2.0]
     last_err = None
     for d in delays:
@@ -31,39 +27,65 @@ def _with_backoff(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             last_err = e
-    raise last_err if last_err else RuntimeError("Okänt fel i _with_backoff")
+    raise last_err if last_err else RuntimeError("Okänt fel vid Google Sheets-anrop.")
 
 
-# ------------------------------------------------------------
-# Autentisering / Spreadsheet-hantering
-# ------------------------------------------------------------
+# ---------------- Credentials / klient ----------------
 def _load_credentials():
     """
-    Läser service-account creds från st.secrets["GOOGLE_CREDENTIALS"] (dict/JSON) och
-    returnerar en Credentials-instans.
+    Läser service account-uppgifter från secrets, accepterar:
+      - st.secrets["GOOGLE_CREDENTIALS"] som dict ELLER JSON-sträng
+      - fallback-nycklar: "google_credentials", "gcp_service_account"
+    Fixar privata nyckelns radbrytningar och validerar nödvändiga fält.
     """
     if Credentials is None:
         raise RuntimeError("google-auth saknas i miljön.")
-    raw = st.secrets.get("GOOGLE_CREDENTIALS")
+
+    raw = (
+        st.secrets.get("GOOGLE_CREDENTIALS")
+        or st.secrets.get("google_credentials")
+        or st.secrets.get("gcp_service_account")
+    )
     if not raw:
-        raise RuntimeError("Hittade inga service account-uppgifter i secrets (GOOGLE_CREDENTIALS).")
-    # Kan vara JSON-sträng eller dict
+        raise RuntimeError(
+            "GOOGLE_CREDENTIALS saknas i secrets. Lägg in hela service account JSON:en "
+            "(antingen som dict i .streamlit/secrets.toml eller som JSON-sträng)."
+        )
+
+    # Sträng → försök JSON-läsa
     if isinstance(raw, str):
-        import json
         try:
             data = json.loads(raw)
-        except Exception:
-            raise RuntimeError("GOOGLE_CREDENTIALS fanns men kunde inte tolkas.")
+        except Exception as e:
+            raise RuntimeError(
+                f"GOOGLE_CREDENTIALS kunde inte tolkas som JSON-sträng ({e})."
+            )
     elif isinstance(raw, dict):
-        data = raw
+        data = dict(raw)
     else:
         raise RuntimeError("GOOGLE_CREDENTIALS kunde inte tolkas.")
+
+    # Fixa private_key radbrytningar
+    pk = data.get("private_key")
+    if isinstance(pk, str):
+        data["private_key"] = pk.replace("\\n", "\n")
+
+    # Validera
+    missing = [k for k in ("client_email", "private_key") if not data.get(k)]
+    if missing:
+        raise RuntimeError(
+            f"Service account saknar fält: {', '.join(missing)}. "
+            "Kontrollera att du klistrat in HELA JSON-nyckeln."
+        )
 
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    return Credentials.from_service_account_info(data, scopes=scope)
+    try:
+        return Credentials.from_service_account_info(data, scopes=scope)
+    except Exception as e:
+        raise RuntimeError(f"Kunde inte skapa Google-credentials: {e}")
 
 
 def _client():
@@ -75,24 +97,24 @@ def _client():
 
 def _spreadsheet():
     """
-    Returnerar gspread Spreadsheet (öppnad via URL i st.secrets['SHEET_URL']).
-    Exponeras för andra moduler.
+    Öppnar spreadsheet via URL (SHEET_URL) eller key (SHEET_ID) från secrets.
     """
     url = st.secrets.get("SHEET_URL")
-    if not url:
-        raise RuntimeError("SHEET_URL saknas i secrets.")
+    key = st.secrets.get("SHEET_ID")
+    if not url and not key:
+        raise RuntimeError("SHEET_URL eller SHEET_ID saknas i secrets.")
+
     cli = _client()
-    return _with_backoff(cli.open_by_url, url)
+    if url:
+        return _with_backoff(cli.open_by_url, url)
+    return _with_backoff(cli.open_by_key, key)
 
 
 def get_spreadsheet():
-    """Alias som används av appen."""
     return _spreadsheet()
 
 
-# ------------------------------------------------------------
-# Hjälpare för headers / trimming
-# ------------------------------------------------------------
+# ---------------- Headerhjälp ----------------
 def _trim_trailing_empty(seq: List[str]) -> List[str]:
     out = list(seq)
     while out and (out[-1] is None or str(out[-1]).strip() == ""):
@@ -101,14 +123,11 @@ def _trim_trailing_empty(seq: List[str]) -> List[str]:
 
 
 def _sheet_headers(ws) -> List[str]:
-    """
-    Läser första raden (rad 1) som headers. Trimmar tomma släpande celler.
-    """
     row1 = _with_backoff(ws.row_values, 1) or []
     headers = [str(x).strip() for x in row1]
     headers = _trim_trailing_empty(headers)
     if not headers:
-        raise RuntimeError("Arket saknar header-rad (rad 1 är tom).")
+        raise RuntimeError("Arket saknar header-rad (rad 1).")
     return headers
 
 
@@ -129,77 +148,50 @@ def delete_worksheet(title: str) -> None:
         pass
 
 
-# ------------------------------------------------------------
-# Läs / Skriv DataFrame
-# ------------------------------------------------------------
+# ---------------- Läs / skriv DataFrame ----------------
 def ws_read_df(title: str) -> pd.DataFrame:
     """
-    Läser ett blad till DataFrame, med kolumnordning exakt som arket har.
-    Tar bort helt tomma rader; fyller saknade celler med "".
+    Läser ett blad till DataFrame i exakt arket’s kolumnordning.
+    Slänger helt tomma rader; fyller saknade celler med "".
     """
     ss = get_spreadsheet()
     ws = _with_backoff(ss.worksheet, title)
 
-    # Läs hela matrisen en gång (snabbare vid breda ark)
     vals: List[List[str]] = _with_backoff(ws.get_all_values)
     if not vals:
         return pd.DataFrame()
 
-    # Hämta header exakt som arket använder
     headers = _sheet_headers(ws)
-
-    # Skapa DataFrame med header-längd
     data_rows = vals[1:] if len(vals) > 1 else []
+
     norm_rows: List[List[str]] = []
     for r in data_rows:
-        r = r[:len(headers)] + [""] * max(0, len(headers) - len(r))
-        # är hela raden tom?
+        r = r[: len(headers)] + [""] * max(0, len(headers) - len(r))
         if all((str(x).strip() == "") for x in r):
             continue
         norm_rows.append(r)
 
-    df = pd.DataFrame(norm_rows, columns=headers)
-
-    # Trimma helt tomma kolumner längst till höger (ifall man råkat skriva extra)
-    # (men bara om de inte ingår i header – vilket de inte gör här)
-    return df
+    return pd.DataFrame(norm_rows, columns=headers)
 
 
 def ws_write_df(title: str, df: pd.DataFrame) -> None:
     """
-    Skriver en DataFrame till ett blad men *alltid* i arket’s kolumnordning.
-    Kolumner som finns i arket men saknas i DF fylls med "", så inget förskjuts.
-    DF-kolumner som inte finns i arket ignoreras (för att undvika misspass).
+    Skriver DF till bladet i arket’s headerordning.
+    Saknade kolumner fylls med tomt, extra DF-kolumner ignoreras (så inget förskjuts).
     """
     ss = get_spreadsheet()
     ws = _with_backoff(ss.worksheet, title)
-
     headers = _sheet_headers(ws)
 
-    # Bygg body med exakt headerordning
-    body: List[List[str]] = []
-    body.append(headers)
-
-    # Om DF har färre kolumner än headern: fyll saknade med ""
-    # Om DF har fler: ignorera de extra – skriv *inte* dem (undviker förskjutning)
+    body: List[List[str]] = [headers]
     for _, row in df.iterrows():
         out_row: List[str] = []
         for h in headers:
             v = row[h] if h in df.columns else ""
-            # Gör om till str så vi inte får mixed types-problem
             if pd.isna(v):
                 v = ""
             out_row.append(str(v))
         body.append(out_row)
 
-    # Rensa och skriv
     _with_backoff(ws.clear)
     _with_backoff(ws.update, body)
-
-
-# Bekväm wrapper som appen använder
-def list_worksheet_titles_safe() -> List[str]:
-    try:
-        return list_worksheet_titles()
-    except Exception:
-        return []

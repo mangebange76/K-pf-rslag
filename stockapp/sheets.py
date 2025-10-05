@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import time
-from typing import List
+from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -30,54 +32,111 @@ def _with_backoff(func, *args, **kwargs):
     raise last_err if last_err else RuntimeError("Okänt fel vid Google Sheets-anrop.")
 
 
-# ---------------- Credentials / klient ----------------
-def _load_credentials():
-    """
-    Läser service account-uppgifter från secrets, accepterar:
-      - st.secrets["GOOGLE_CREDENTIALS"] som dict ELLER JSON-sträng
-      - fallback-nycklar: "google_credentials", "gcp_service_account"
-    Fixar privata nyckelns radbrytningar och validerar nödvändiga fält.
-    """
-    if Credentials is None:
-        raise RuntimeError("google-auth saknas i miljön.")
+# ---------------- Credential helpers ----------------
+def _json_from_str(s: str) -> dict:
+    try:
+        return json.loads(s)
+    except Exception as e:
+        raise RuntimeError(f"Kunde inte JSON-tolka credentials-sträng ({e}).")
 
+
+def _json_from_b64(s: str) -> dict:
+    try:
+        raw = base64.b64decode(s)
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Kunde inte BASE64-avkoda credentials ({e}).")
+
+
+def _json_from_path(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Kunde inte läsa credentials-fil ({e}).")
+
+
+def _fix_private_key_newlines(data: dict) -> dict:
+    pk = data.get("private_key")
+    if isinstance(pk, str):
+        data["private_key"] = pk.replace("\\n", "\n")
+    return data
+
+
+def _build_minimal_dict_from_separate_keys() -> dict | None:
+    email = st.secrets.get("SHEETS_CLIENT_EMAIL")
+    pkey  = st.secrets.get("SHEETS_PRIVATE_KEY")
+    if not email or not pkey:
+        return None
+    return _fix_private_key_newlines({
+        "type": "service_account",
+        "project_id": st.secrets.get("SHEETS_PROJECT_ID", ""),
+        "private_key_id": st.secrets.get("SHEETS_PRIVATE_KEY_ID", ""),
+        "private_key": pkey,
+        "client_email": email,
+        "client_id": st.secrets.get("SHEETS_CLIENT_ID", ""),
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": st.secrets.get("SHEETS_CLIENT_X509_CERT_URL", ""),
+    })
+
+
+def _load_credentials_dict() -> Tuple[dict, str]:
+    """
+    Försöker läsa service account-JSON från flera källor (i ordning):
+      1) GOOGLE_CREDENTIALS / google_credentials / gcp_service_account (dict eller JSON-sträng)
+      2) GOOGLE_CREDENTIALS_B64 (base64 av JSON)
+      3) GOOGLE_CREDENTIALS_PATH (fil på disk)
+      4) separata nycklar SHEETS_CLIENT_EMAIL + SHEETS_PRIVATE_KEY
+    Returnerar (json_dict, källa_str).
+    """
+    # 1) Direkt i secrets (dict eller JSON-sträng)
     raw = (
         st.secrets.get("GOOGLE_CREDENTIALS")
         or st.secrets.get("google_credentials")
         or st.secrets.get("gcp_service_account")
     )
-    if not raw:
-        raise RuntimeError(
-            "GOOGLE_CREDENTIALS saknas i secrets. Lägg in hela service account JSON:en "
-            "(antingen som dict i .streamlit/secrets.toml eller som JSON-sträng)."
-        )
+    if raw:
+        if isinstance(raw, dict):
+            return _fix_private_key_newlines(dict(raw)), "secrets:dict"
+        if isinstance(raw, str):
+            return _fix_private_key_newlines(_json_from_str(raw)), "secrets:json_str"
+        raise RuntimeError("GOOGLE_CREDENTIALS fanns men hade okänt format (varken dict eller str).")
 
-    # Sträng → försök JSON-läsa
-    if isinstance(raw, str):
-        try:
-            data = json.loads(raw)
-        except Exception as e:
-            raise RuntimeError(
-                f"GOOGLE_CREDENTIALS kunde inte tolkas som JSON-sträng ({e})."
-            )
-    elif isinstance(raw, dict):
-        data = dict(raw)
-    else:
-        raise RuntimeError("GOOGLE_CREDENTIALS kunde inte tolkas.")
+    # 2) BASE64
+    b64 = st.secrets.get("GOOGLE_CREDENTIALS_B64")
+    if b64:
+        return _fix_private_key_newlines(_json_from_b64(b64)), "secrets:b64"
 
-    # Fixa private_key radbrytningar
-    pk = data.get("private_key")
-    if isinstance(pk, str):
-        data["private_key"] = pk.replace("\\n", "\n")
+    # 3) PATH
+    path = st.secrets.get("GOOGLE_CREDENTIALS_PATH")
+    if path:
+        return _fix_private_key_newlines(_json_from_path(path)), "file:path"
 
-    # Validera
+    # 4) Separerade nycklar
+    sep = _build_minimal_dict_from_separate_keys()
+    if sep:
+        return sep, "separate_keys"
+
+    raise RuntimeError(
+        "Hittade inga service account-uppgifter. "
+        "Använd någon av: GOOGLE_CREDENTIALS (dict/str), GOOGLE_CREDENTIALS_B64, "
+        "GOOGLE_CREDENTIALS_PATH eller SHEETS_CLIENT_EMAIL + SHEETS_PRIVATE_KEY."
+    )
+
+
+def _validate_creds(data: dict) -> None:
     missing = [k for k in ("client_email", "private_key") if not data.get(k)]
     if missing:
-        raise RuntimeError(
-            f"Service account saknar fält: {', '.join(missing)}. "
-            "Kontrollera att du klistrat in HELA JSON-nyckeln."
-        )
+        raise RuntimeError(f"Service account saknar fält: {', '.join(missing)}.")
 
+
+def _load_credentials():
+    if Credentials is None:
+        raise RuntimeError("google-auth saknas i miljön.")
+    data, _ = _load_credentials_dict()
+    _validate_creds(data)
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
@@ -95,6 +154,7 @@ def _client():
     return gspread.authorize(creds)
 
 
+# ---------------- Spreadsheet open ----------------
 def _spreadsheet():
     """
     Öppnar spreadsheet via URL (SHEET_URL) eller key (SHEET_ID) från secrets.
@@ -103,7 +163,6 @@ def _spreadsheet():
     key = st.secrets.get("SHEET_ID")
     if not url and not key:
         raise RuntimeError("SHEET_URL eller SHEET_ID saknas i secrets.")
-
     cli = _client()
     if url:
         return _with_backoff(cli.open_by_url, url)
@@ -112,6 +171,34 @@ def _spreadsheet():
 
 def get_spreadsheet():
     return _spreadsheet()
+
+
+# ---------------- Diagnostics ----------------
+def creds_debug_summary() -> str:
+    """
+    Ger en kort, sanitiserad diagnos om hur credentials hittades och ser ut (utan att exponera hemligheter).
+    """
+    try:
+        data, source = _load_credentials_dict()
+        email = str(data.get("client_email", ""))
+        pk = str(data.get("private_key", ""))
+        has_pk = bool(pk)
+        has_nl = "\\n" in pk or "\n" in pk
+        return f"Källa: {source} | client_email: {bool(email)} | private_key: {has_pk} | radbrytningar i nyckel: {has_nl}"
+    except Exception as e:
+        return f"Creds: FEL – {e}"
+
+
+def test_connection() -> Tuple[bool, str]:
+    """
+    Testar att creds kan laddas och att spreadsheet går att öppna.
+    """
+    try:
+        ss = get_spreadsheet()
+        _ = [ws.title for ws in ss.worksheets()]
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
 
 
 # ---------------- Headerhjälp ----------------

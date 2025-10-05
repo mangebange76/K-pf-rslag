@@ -1,10 +1,10 @@
-# app.py
+# app.py (Del 1/4)
 from __future__ import annotations
 
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,52 +13,36 @@ import yfinance as yf
 
 # Egna moduler
 from stockapp.sheets import (
-    ws_read_df,
-    ws_write_df,
-    list_worksheet_titles,
-    delete_worksheet,
+    ws_read_df, ws_write_df, list_worksheet_titles, delete_worksheet
 )
 from stockapp.rates import (
-    read_rates,
-    save_rates,
-    fetch_live_rates,
-    repair_rates_sheet,
-    DEFAULT_RATES,
+    read_rates, save_rates, fetch_live_rates, repair_rates_sheet, DEFAULT_RATES
 )
 from stockapp.dividends import build_dividend_calendar
-from stockapp.collectors import mass_collect_and_apply as collectors_mass_update
 
+# (Valfritt) direkta fetchers för enskild uppdatering i Manuell-insamling
+try:
+    from stockapp.fetchers.yahoo import get_all as y_overview
+except Exception:
+    y_overview = None
+try:
+    from stockapp.fetchers.finviz import get_overview as fz_overview
+except Exception:
+    fz_overview = None
+try:
+    from stockapp.fetchers.morningstar import get_overview as ms_overview
+except Exception:
+    ms_overview = None
+try:
+    from stockapp.fetchers.sec import get_pb_quarters as sec_pb_quarters
+except Exception:
+    sec_pb_quarters = None
 
-# ------------------------------------------------------------
-# App-config
-# ------------------------------------------------------------
 st.set_page_config(page_title="K-pf-rslag", layout="wide")
 
 
-# ------------------------------------------------------------
-# Hjälpare
-# ------------------------------------------------------------
-def now_stamp() -> str:
-    try:
-        import pytz
-        tz = pytz.timezone("Europe/Stockholm")
-        return datetime.now(tz).strftime("%Y-%m-%d")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
-
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def _horizon_to_tag(h: str) -> str:
-    if "om 1 år" in h: return "1 år"
-    if "om 2 år" in h: return "2 år"
-    if "om 3 år" in h: return "3 år"
-    return "Idag"
-
-
-def _now_sthlm():
+# ---------- tids-hjälpare ----------
+def _now_sthlm() -> datetime:
     try:
         import pytz
         tz = pytz.timezone("Europe/Stockholm")
@@ -66,38 +50,29 @@ def _now_sthlm():
     except Exception:
         return datetime.now()
 
+def now_stamp() -> str:
+    return _now_sthlm().strftime("%Y-%m-%d")
 
-# ------------------------------------------------------------
-# Snapshot – spara df vid appstart och städa äldre än 5 dagar
-# ------------------------------------------------------------
-SNAP_PREFIX = "SNAP__"  # blad börjar med detta
+
+# ---------- Snapshot-setup ----------
+SNAP_PREFIX = "SNAP__"
 
 def _format_ts(dt: datetime) -> str:
     return dt.strftime("%Y%m%d_%H%M%S")
 
-def _parse_snap_title(title: str) -> datetime | None:
-    """
-    SNAP__{WS}__YYYYMMDD_HHMMSS → plocka ut timestamp.
-    """
-    m = re.search(r"(\d{8}_\d{6})$", title)
+def _parse_snap_title(title: str) -> Optional[datetime]:
+    m = re.search(r"(\d{8}_\d{6})$", str(title))
     if not m:
         return None
-    s = m.group(1)
     try:
-        return datetime.strptime(s, "%Y%m%d_%H%M%S")
+        return datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
     except Exception:
         return None
 
 def snapshot_on_start(df: pd.DataFrame, base_ws_title: str):
-    """
-    Körs en gång per sessionstart:
-      - skapar SNAP-blad med timestamp
-      - tar bort SNAP-blad äldre än 5 dygn
-    """
     if st.session_state.get("_snapshot_done"):
         return
     st.session_state["_snapshot_done"] = True
-
     now = _now_sthlm()
     snap_title = f"{SNAP_PREFIX}{base_ws_title}__{_format_ts(now)}"
     try:
@@ -106,66 +81,58 @@ def snapshot_on_start(df: pd.DataFrame, base_ws_title: str):
     except Exception as e:
         st.sidebar.warning(f"Kunde inte spara snapshot: {e}")
 
-    # Städa gamla (>5 dygn)
+    # Rensa äldre än 5 dagar
     try:
         titles = list_worksheet_titles() or []
         cutoff = now - timedelta(days=5)
-        to_delete: List[str] = []
         for t in titles:
             if not str(t).startswith(SNAP_PREFIX):
                 continue
-            ts = _parse_snap_title(str(t))
-            if ts is None:
-                continue
-            if ts < cutoff.replace(tzinfo=None):
-                to_delete.append(t)
-        for t in to_delete:
-            try:
-                delete_worksheet(t)
-            except Exception:
-                pass
-        if to_delete:
-            st.sidebar.info(f"Rensade {len(to_delete)} gamla snapshot-blad.")
+            ts = _parse_snap_title(t)
+            if ts and ts < cutoff.replace(tzinfo=None):
+                try:
+                    delete_worksheet(t)
+                except Exception:
+                    pass
     except Exception as e:
         st.sidebar.warning(f"Kunde inte rensa gamla snapshot-blad: {e}")
 
 
-# ------------------------------------------------------------
-# Kolumnschema
-# ------------------------------------------------------------
+# ---------- Kolumnschema ----------
 FINAL_COLS: List[str] = [
     # Bas
     "Ticker", "Bolagsnamn", "Sektor", "Valuta",
     "Antal aktier", "GAV (SEK)", "Aktuell kurs",
     "Utestående aktier",  # miljoner
 
-    # P/S
+    # Multiplar (P/S & P/B inkl kvartal och snitt)
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt (Q1..Q4)",
-
-    # P/B
     "P/B", "P/B Q1", "P/B Q2", "P/B Q3", "P/B Q4", "P/B-snitt (Q1..Q4)",
 
     # Omsättning (M)
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
 
-    # Riktkurser (valuta)
+    # Riktkurser (bolagets valuta)
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
 
     # Utdelning
     "Årlig utdelning", "Payout (%)",
 
     # Övrigt
-    "CAGR 5 år (%)", "Senast manuellt uppdaterad",
+    "CAGR 5 år (%)",
 
-    # Dynamiska/visuella score-kolumner
-    "DA (%)",
-    "Uppsida idag (%)", "Uppsida 1 år (%)", "Uppsida 2 år (%)", "Uppsida 3 år (%)",
+    # Tidsstämplar (NYTT)
+    "Senast manuellt uppdaterad",      # M
+    "Senast auto uppdaterad",          # A (fetchers/kurs)
+    "Auto källa",                      # text om källa senast auto
+    "Senast beräknad",                 # B (beräkningar)
+
+    # Visning/score
+    "DA (%)", "Uppsida idag (%)", "Uppsida 1 år (%)", "Uppsida 2 år (%)", "Uppsida 3 år (%)",
     "Score (Growth)", "Score (Dividend)", "Score (Financials)", "Score (Total)", "Confidence",
 
-    # Sparade totalpoäng per horisont
+    # Sparade score per horisont
     "Score Total (Idag)", "Score Total (1 år)", "Score Total (2 år)", "Score Total (3 år)",
-
-    # Sparade komponentpoäng per horisont
     "Score Growth (Idag)", "Score Dividend (Idag)", "Score Financials (Idag)",
     "Score Growth (1 år)", "Score Dividend (1 år)", "Score Financials (1 år)",
     "Score Growth (2 år)", "Score Dividend (2 år)", "Score Financials (2 år)",
@@ -175,18 +142,19 @@ FINAL_COLS: List[str] = [
     "Div_Frekvens/år", "Div_Månader", "Div_Vikter",
 ]
 
-
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in FINAL_COLS:
         if c not in out.columns:
             if any(k in c.lower() for k in [
                 "kurs","omsättning","p/s","p/b","utdelning","cagr","aktier",
-                "riktkurs","payout","score","uppsida","da","confidence","frekvens","gav"
+                "riktkurs","payout","score","uppsida","da","confidence",
+                "frekvens","gav"
             ]):
                 out[c] = 0.0
             else:
                 out[c] = ""
+    # typer
     float_cols = [
         "Antal aktier", "GAV (SEK)", "Aktuell kurs", "Utestående aktier",
         "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt (Q1..Q4)",
@@ -194,28 +162,28 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
         "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
         "Årlig utdelning","Payout (%)","CAGR 5 år (%)",
-        "DA (%)", "Uppsida idag (%)","Uppsida 1 år (%)","Uppsida 2 år (%)","Uppsida 3 år (%)",
+        "DA (%)","Uppsida idag (%)","Uppsida 1 år (%)","Uppsida 2 år (%)","Uppsida 3 år (%)",
         "Score (Growth)","Score (Dividend)","Score (Financials)","Score (Total)","Confidence",
-        "Score Total (Idag)", "Score Total (1 år)", "Score Total (2 år)", "Score Total (3 år)",
-        "Score Growth (Idag)", "Score Dividend (Idag)", "Score Financials (Idag)",
-        "Score Growth (1 år)", "Score Dividend (1 år)", "Score Financials (1 år)",
-        "Score Growth (2 år)", "Score Dividend (2 år)", "Score Financials (2 år)",
-        "Score Growth (3 år)", "Score Dividend (3 år)", "Score Financials (3 år)",
+        "Score Total (Idag)","Score Total (1 år)","Score Total (2 år)","Score Total (3 år)",
+        "Score Growth (Idag)","Score Dividend (Idag)","Score Financials (Idag)",
+        "Score Growth (1 år)","Score Dividend (1 år)","Score Financials (1 år)",
+        "Score Growth (2 år)","Score Dividend (2 år)","Score Financials (2 år)",
+        "Score Growth (3 år)","Score Dividend (3 år)","Score Financials (3 år)",
         "Div_Frekvens/år",
     ]
     for c in float_cols:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
-    for c in ["Ticker","Bolagsnamn","Sektor","Valuta","Senast manuellt uppdaterad","Div_Månader","Div_Vikter"]:
+
+    for c in ["Ticker","Bolagsnamn","Sektor","Valuta","Auto källa","Senast manuellt uppdaterad","Senast auto uppdaterad","Senast beräknad","Div_Månader","Div_Vikter"]:
         if c in out.columns:
             out[c] = out[c].astype(str)
         else:
             out[c] = ""
     return out
 
+# app.py (Del 2/4)
 
-# ------------------------------------------------------------
-# Sidopanel – valutakurser
-# ------------------------------------------------------------
+# ---------- Sidopanel: valutakurser ----------
 def sidebar_rates() -> Dict[str, float]:
     st.sidebar.subheader("💱 Valutakurser → SEK")
 
@@ -269,196 +237,22 @@ def sidebar_rates() -> Dict[str, float]:
     return {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
 
 
-# ------------------------------------------------------------
-# Databas-IO
-# ------------------------------------------------------------
+# ---------- IO ----------
 @st.cache_data(show_spinner=False)
 def load_df_cached(ws_title: str) -> pd.DataFrame:
     return ws_read_df(ws_title)
 
 def load_df(ws_title: str) -> pd.DataFrame:
-    df = ensure_columns(load_df_cached(ws_title))
-    return df
+    return ensure_columns(load_df_cached(ws_title))
 
 def save_df(ws_title: str, df: pd.DataFrame):
     ws_write_df(ws_title, df)
 
 
-# ------------------------------------------------------------
-# Yahoo helpers – live + långsamma (snabbknappar)
-# ------------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=600)
-def yahoo_fetch_one(ticker: str) -> Dict[str, float | str]:
-    out = {"Bolagsnamn": "", "Valuta": "USD", "Aktuell kurs": 0.0, "Årlig utdelning": 0.0, "CAGR 5 år (%)": 0.0}
-    try:
-        t = yf.Ticker(ticker)
-        info = {}
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
+# ---------- Beräkningar ----------
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
-        name = info.get("shortName") or info.get("longName") or ""
-        if name:
-            out["Bolagsnamn"] = str(name)
-
-        cur = info.get("currency")
-        if cur:
-            out["Valuta"] = str(cur).upper()
-
-        price = info.get("regularMarketPrice")
-        if price is None:
-            try:
-                fi = getattr(t, "fast_info", None) or {}
-                price = fi.get("lastPrice")
-            except Exception:
-                price = None
-        if price is None:
-            h = t.history(period="1d")
-            if not h.empty and "Close" in h:
-                price = float(h["Close"].iloc[-1])
-        if price is not None:
-            out["Aktuell kurs"] = float(price)
-
-        div_rate = info.get("dividendRate")
-        if div_rate is not None:
-            out["Årlig utdelning"] = float(div_rate)
-
-        out["CAGR 5 år (%)"] = calc_cagr_5y(t)
-    except Exception:
-        pass
-    return out
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def yahoo_fetch_slow(ticker: str) -> Dict[str, float | str]:
-    out = {
-        "P/B": 0.0, "P/S": 0.0, "Payout (%)": 0.0,
-        "Utestående aktier": 0.0, "Sektor": "", "Bolagsnamn": "", "Årlig utdelning": 0.0, "Valuta": ""
-    }
-    try:
-        t = yf.Ticker(ticker)
-        info = {}
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
-
-        pb = info.get("priceToBook")
-        if pb is not None:
-            out["P/B"] = float(pb)
-
-        ps = info.get("priceToSalesTrailing12Months")
-        if ps is not None:
-            out["P/S"] = float(ps)
-
-        div_rate = info.get("dividendRate")
-        eps = info.get("trailingEps")
-        payout = 0.0
-        if div_rate is not None and eps is not None and float(eps) > 0:
-            payout = (float(div_rate) / float(eps)) * 100.0
-        out["Payout (%)"] = float(payout)
-
-        shares = info.get("sharesOutstanding")
-        if shares is not None:
-            out["Utestående aktier"] = float(shares) / 1e6
-
-        sector = info.get("sector") or ""
-        out["Sektor"] = str(sector)
-
-        name = info.get("shortName") or info.get("longName") or ""
-        if name:
-            out["Bolagsnamn"] = str(name)
-
-        cur = info.get("currency")
-        if cur:
-            out["Valuta"] = str(cur).upper()
-
-        if div_rate is not None:
-            out["Årlig utdelning"] = float(div_rate)
-    except Exception:
-        pass
-    return out
-
-
-def calc_cagr_5y(t: yf.Ticker) -> float:
-    try:
-        df_is = getattr(t, "income_stmt", None)
-        ser = None
-        if isinstance(df_is, pd.DataFrame) and not df_is.empty and "Total Revenue" in df_is.index:
-            ser = df_is.loc["Total Revenue"].dropna()
-        else:
-            df_fin = getattr(t, "financials", None)
-            if isinstance(df_fin, pd.DataFrame) and not df_fin.empty and "Total Revenue" in df_fin.index:
-                ser = df_fin.loc["Total Revenue"].dropna()
-        if ser is None or ser.empty or len(ser) < 2:
-            return 0.0
-        ser = ser.sort_index()
-        start, end = float(ser.iloc[0]), float(ser.iloc[-1])
-        years = max(1, len(ser) - 1)
-        if start <= 0:
-            return 0.0
-        cagr = (end / start) ** (1.0 / years) - 1.0
-        return round(cagr * 100.0, 2)
-    except Exception:
-        return 0.0
-
-
-def mass_update_yahoo(df: pd.DataFrame, ws_title: str):
-    if st.sidebar.button("🔄 Uppdatera alla från Yahoo (pris+snabbt)"):
-        status = st.sidebar.empty()
-        bar = st.sidebar.progress(0)
-        tickers = df["Ticker"].astype(str).tolist()
-        n = len(tickers)
-        for i, tkr in enumerate(tickers):
-            status.write(f"Hämtar {i+1}/{n} – {tkr}")
-            data = yahoo_fetch_one(tkr)
-            if data.get("Bolagsnamn"): df.loc[df["Ticker"] == tkr, "Bolagsnamn"] = data["Bolagsnamn"]
-            if data.get("Valuta"):     df.loc[df["Ticker"] == tkr, "Valuta"]     = data["Valuta"]
-            if float(data.get("Aktuell kurs", 0.0)) > 0: df.loc[df["Ticker"] == tkr, "Aktuell kurs"] = float(data["Aktuell kurs"])
-            df.loc[df["Ticker"] == tkr, "Årlig utdelning"] = float(data.get("Årlig utdelning", 0.0))
-            df.loc[df["Ticker"] == tkr, "CAGR 5 år (%)"]   = float(data.get("CAGR 5 år (%)", 0.0))
-            time.sleep(0.5)
-            bar.progress((i + 1) / max(1, n))
-        try:
-            df2 = enrich_for_save(df, horizon_for_score="Riktkurs idag", strategy="Auto")
-            save_df(ws_title, df2)
-            st.sidebar.success("Beräkningar + kurser sparade till Google Sheets.")
-        except Exception as e:
-            st.sidebar.error(f"Kunde inte spara: {e}")
-
-
-def mass_update_fundamentals(df: pd.DataFrame, ws_title: str):
-    if st.sidebar.button("🧩 Uppdatera långsamma nyckeltal (Yahoo)"):
-        status = st.sidebar.empty()
-        bar = st.sidebar.progress(0)
-        tickers = df["Ticker"].astype(str).tolist()
-        n = len(tickers)
-        for i, tkr in enumerate(tickers):
-            status.write(f"Nyckeltal {i+1}/{n} – {tkr}")
-            data = yahoo_fetch_slow(tkr)
-            for k in ["P/B","P/S","Payout (%)","Utestående aktier","Årlig utdelning"]:
-                if float(data.get(k, 0.0)) > 0:
-                    df.loc[df["Ticker"] == tkr, k] = float(data[k])
-            if data.get("Sektor"):
-                df.loc[df["Ticker"] == tkr, "Sektor"] = str(data["Sektor"])
-            if data.get("Bolagsnamn"):
-                df.loc[df["Ticker"] == tkr, "Bolagsnamn"] = str(data["Bolagsnamn"])
-            if data.get("Valuta"):
-                df.loc[df["Ticker"] == tkr, "Valuta"] = str(data["Valuta"])
-            time.sleep(0.5)
-            bar.progress((i + 1) / max(1, n))
-        try:
-            df2 = enrich_for_save(df, horizon_for_score="Riktkurs idag", strategy="Auto")
-            save_df(ws_title, df2)
-            st.sidebar.success("Långsamma nyckeltal sparade till Google Sheets.")
-        except Exception as e:
-            st.sidebar.error(f"Kunde inte spara: {e}")
-
-
-# ------------------------------------------------------------
-# Beräkningar (P/S-snitt, oms år2/3, riktkurser)
-# ------------------------------------------------------------
 def compute_ps_pb_snitt(row: pd.Series) -> Tuple[float, float]:
     ps_vals = [row.get("P/S Q1", 0), row.get("P/S Q2", 0), row.get("P/S Q3", 0), row.get("P/S Q4", 0)]
     ps_clean = [float(x) for x in ps_vals if float(x) > 0]
@@ -468,7 +262,6 @@ def compute_ps_pb_snitt(row: pd.Series) -> Tuple[float, float]:
     pb_clean = [float(x) for x in pb_vals if float(x) > 0]
     pb_avg = round(float(np.mean(pb_clean)), 2) if pb_clean else 0.0
     return ps_avg, pb_avg
-
 
 def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -499,10 +292,26 @@ def update_calculations(df: pd.DataFrame) -> pd.DataFrame:
         out.at[i, "Riktkurs om 3 år"] = round(float(out.at[i, "Omsättning om 3 år"])    * ps_avg / shares_m, 2)
     return out
 
+def add_multi_uppsida(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    price = out["Aktuell kurs"].replace(0, np.nan)
+    for col, label in [
+        ("Riktkurs idag", "Uppsida idag (%)"),
+        ("Riktkurs om 1 år", "Uppsida 1 år (%)"),
+        ("Riktkurs om 2 år", "Uppsida 2 år (%)"),
+        ("Riktkurs om 3 år", "Uppsida 3 år (%)"),
+    ]:
+        rk = out[col].replace(0, np.nan)
+        out[label] = ((rk - price) / price * 100.0).fillna(0.0)
+    out["DA (%)"] = np.where(out["Aktuell kurs"]>0, (out["Årlig utdelning"]/out["Aktuell kurs"])*100.0, 0.0)
+    return out
 
-# ------------------------------------------------------------
-# Poängmotor (kompakt)
-# ------------------------------------------------------------
+def _horizon_to_tag(h: str) -> str:
+    if "om 1 år" in h: return "1 år"
+    if "om 2 år" in h: return "2 år"
+    if "om 3 år" in h: return "3 år"
+    return "Idag"
+
 def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
     out = df.copy()
     out["DA (%)"] = np.where(out["Aktuell kurs"] > 0, (out["Årlig utdelning"] / out["Aktuell kurs"]) * 100.0, 0.0)
@@ -533,18 +342,17 @@ def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
         if strategy == "Utdelning":  return (0.15, 0.70, 0.15)
         if strategy == "Finans":     return (0.20, 0.20, 0.60)
         s = (sektor or "").lower()
-        if any(k in s for k in ["bank", "finans", "insurance", "financial"]): return (0.25, 0.25, 0.50)
-        if any(k in s for k in ["utility", "utilities", "consumer staples", "telecom"]): return (0.20, 0.60, 0.20)
-        if any(k in s for k in ["tech", "information technology", "semiconductor", "software"]): return (0.70, 0.10, 0.20)
+        if any(k in s for k in ["bank","finans","insurance","financial"]): return (0.25, 0.25, 0.50)
+        if any(k in s for k in ["utility","utilities","consumer staples","telecom"]): return (0.20, 0.60, 0.20)
+        if any(k in s for k in ["tech","information technology","semiconductor","software"]): return (0.70, 0.10, 0.20)
         return (0.45, 0.35, 0.20)
 
     Wg, Wd, Wf = [], [], []
     for _, r in out.iterrows():
-        wg, wd, wf = weights_for_row(r.get("Sektor", ""), strategy)
+        wg, wd, wf = weights_for_row(r.get("Sektor",""), strategy)
         Wg.append(wg); Wd.append(wd); Wf.append(wf)
     Wg = np.array(Wg); Wd = np.array(Wd); Wf = np.array(Wf)
-
-    out["Score (Total)"] = (Wg * out["Score (Growth)"] + Wd * out["Score (Dividend)"] + Wf * out["Score (Financials)"]).round(2)
+    out["Score (Total)"] = (Wg*out["Score (Growth)"] + Wd*out["Score (Dividend)"] + Wf*out["Score (Financials)"]).round(2)
 
     need = [
         out["Aktuell kurs"] > 0,
@@ -556,52 +364,394 @@ def score_rows(df: pd.DataFrame, horizon: str, strategy: str) -> pd.DataFrame:
     out["Confidence"] = (present.mean(axis=0) * 100.0).round(0)
     return out
 
-
-def add_multi_uppsida(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    price = out["Aktuell kurs"].replace(0, np.nan)
-    for col, label in [
-        ("Riktkurs idag", "Uppsida idag (%)"),
-        ("Riktkurs om 1 år", "Uppsida 1 år (%)"),
-        ("Riktkurs om 2 år", "Uppsida 2 år (%)"),
-        ("Riktkurs om 3 år", "Uppsida 3 år (%)"),
-    ]:
-        rk = out[col].replace(0, np.nan)
-        up = ((rk - price) / price) * 100.0
-        out[label] = up.fillna(0.0)
-    out["DA (%)"] = np.where(out["Aktuell kurs"] > 0, (out["Årlig utdelning"]/out["Aktuell kurs"])*100.0, 0.0)
-    return out
-
-
 def compute_scores_all_horizons(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
     out = df.copy()
-    mapping = [
-        ("Riktkurs idag",   "Idag"),
-        ("Riktkurs om 1 år","1 år"),
-        ("Riktkurs om 2 år","2 år"),
-        ("Riktkurs om 3 år","3 år"),
-    ]
+    mapping = [("Riktkurs idag","Idag"), ("Riktkurs om 1 år","1 år"), ("Riktkurs om 2 år","2 år"), ("Riktkurs om 3 år","3 år")]
     strat = "Auto" if str(strategy).startswith("Auto") else strategy
     for horizon, tag in mapping:
         tmp = score_rows(out, horizon=horizon, strategy=strat)
-        out[f"Score Growth ({tag})"]      = tmp["Score (Growth)"].round(2)
-        out[f"Score Dividend ({tag})"]    = tmp["Score (Dividend)"].round(2)
-        out[f"Score Financials ({tag})"]  = tmp["Score (Financials)"].round(2)
-        out[f"Score Total ({tag})"]       = tmp["Score (Total)"].round(2)
+        out[f"Score Growth ({tag})"]     = tmp["Score (Growth)"].round(2)
+        out[f"Score Dividend ({tag})"]   = tmp["Score (Dividend)"].round(2)
+        out[f"Score Financials ({tag})"] = tmp["Score (Financials)"].round(2)
+        out[f"Score Total ({tag})"]      = tmp["Score (Total)"].round(2)
     return out
-
 
 def enrich_for_save(df: pd.DataFrame, horizon_for_score: str = "Riktkurs idag", strategy: str = "Auto") -> pd.DataFrame:
     df2 = update_calculations(df)
     df2 = add_multi_uppsida(df2)
     df2 = score_rows(df2, horizon=horizon_for_score, strategy=("Auto" if str(strategy).startswith("Auto") else strategy))
     df2 = compute_scores_all_horizons(df2, strategy=("Auto" if str(strategy).startswith("Auto") else strategy))
+    df2["Senast beräknad"] = now_stamp()
     return df2
 
+# app.py (Del 3/4)
 
-# ------------------------------------------------------------
-# Vyer
-# ------------------------------------------------------------
+# ---------- Snabb Yahoo (pris mm) ----------
+@st.cache_data(show_spinner=False, ttl=600)
+def yahoo_fetch_one_quick(ticker: str) -> Dict[str, float | str]:
+    out = {"Bolagsnamn":"", "Valuta":"USD", "Aktuell kurs":0.0, "Årlig utdelning":0.0, "CAGR 5 år (%)":0.0}
+    try:
+        t = yf.Ticker(ticker)
+        info = {}
+        try: info = t.info or {}
+        except Exception: info = {}
+        nm = info.get("shortName") or info.get("longName");  out["Bolagsnamn"] = str(nm or "")
+        cur = info.get("currency");                          out["Valuta"]     = str(cur or "USD").upper()
+        px  = info.get("regularMarketPrice")
+        if px is None:
+            h = t.history(period="1d")
+            if not h.empty and "Close" in h: px = float(h["Close"].iloc[-1])
+        if px is not None: out["Aktuell kurs"] = float(px)
+        dr = info.get("dividendRate");  out["Årlig utdelning"] = float(dr or 0.0)
+
+        # CAGR 5y
+        try:
+            df_is = getattr(t, "income_stmt", None)
+            ser = None
+            if isinstance(df_is, pd.DataFrame) and not df_is.empty and "Total Revenue" in df_is.index:
+                ser = df_is.loc["Total Revenue"].dropna()
+            else:
+                df_fin = getattr(t, "financials", None)
+                if isinstance(df_fin, pd.DataFrame) and not df_fin.empty and "Total Revenue" in df_fin.index:
+                    ser = df_fin.loc["Total Revenue"].dropna()
+            if ser is not None and len(ser) >= 2:
+                ser = ser.sort_index()
+                start, end = float(ser.iloc[0]), float(ser.iloc[-1])
+                years = max(1, len(ser)-1)
+                if start > 0:
+                    out["CAGR 5 år (%)"] = round(((end/start)**(1.0/years) - 1.0) * 100.0, 2)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return out
+
+
+# ---------- Hjälpare för etiketttext bredvid fält ----------
+def _m_tag(df_row: pd.Series) -> str:
+    d = str(df_row.get("Senast manuellt uppdaterad","")).strip()
+    return f"〔M: {d or '—'}〕"
+
+def _a_tag(df_row: pd.Series) -> str:
+    d = str(df_row.get("Senast auto uppdaterad","")).strip()
+    src = str(df_row.get("Auto källa","")).strip()
+    return f"〔A: {d or '—'}{(' · '+src) if src else ''}〕"
+
+def _b_tag(df_row: pd.Series) -> str:
+    d = str(df_row.get("Senast beräknad","")).strip()
+    return f"〔B: {d or '—'}〕"
+
+
+# ---------- Äldst-tabeller (manuell/auto + total) ----------
+def _oldest_tables(df: pd.DataFrame):
+    st.markdown("### ⏱️ Äldst uppdaterade")
+
+    def _to_date(s: str) -> Optional[pd.Timestamp]:
+        s = (s or "").strip()
+        if not s: return None
+        try: return pd.to_datetime(s)
+        except Exception: return None
+
+    tmp = df.copy()
+
+    tmp["d_man"]  = tmp["Senast manuellt uppdaterad"].apply(_to_date)
+    tmp["d_auto"] = tmp["Senast auto uppdaterad"].apply(_to_date)
+    tmp["d_any"]  = tmp[["d_man","d_auto"]].min(axis=1)
+
+    # a) Äldst i databasen (min av man/auto)
+    any_sorted = tmp.dropna(subset=["d_any"]).sort_values("d_any", ascending=True)
+    if any_sorted.empty:
+        st.info("Inga tidsstämplar ännu.")
+    else:
+        st.dataframe(any_sorted.head(10)[["Ticker","Bolagsnamn","d_any"]].rename(columns={"d_any":"Äldst (valfri)"}), use_container_width=True)
+
+    # b) Äldst (manuell)
+    man_sorted = tmp.dropna(subset=["d_man"]).sort_values("d_man", ascending=True)
+    if not man_sorted.empty:
+        st.dataframe(man_sorted.head(10)[["Ticker","Bolagsnamn","d_man"]].rename(columns={"d_man":"Äldst (manuell)"}), use_container_width=True)
+    else:
+        st.caption("Inga manuella uppdateringar stämplade ännu.")
+
+    # c) Äldst (auto)
+    auto_sorted = tmp.dropna(subset=["d_auto"]).sort_values("d_auto", ascending=True)
+    if not auto_sorted.empty:
+        st.dataframe(auto_sorted.head(10)[["Ticker","Bolagsnamn","d_auto","Auto källa"]].rename(columns={"d_auto":"Äldst (auto)"}), use_container_width=True)
+    else:
+        st.caption("Inga automatiska uppdateringar stämplade ännu.")
+
+    st.markdown("---")
+
+
+# ---------- Enskild full uppdatering (alla fetchers) ----------
+def _update_one_all_fetchers(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    tkr = (ticker or "").strip().upper()
+    if not tkr:
+        return df
+
+    mask = (df["Ticker"].astype(str).str.upper() == tkr)
+    if not mask.any():
+        return df
+
+    # Yahoo bred (om finns via fetchers)
+    if y_overview:
+        try:
+            y = y_overview(tkr) or {}
+            # mappa några centrala fält om de finns
+            mapping = {
+                "name": "Bolagsnamn",
+                "currency": "Valuta",
+                "price": "Aktuell kurs",
+                "dividend_rate": "Årlig utdelning",
+                "ps_ttm": "P/S",
+                "pb": "P/B",
+                "shares_outstanding": "Utestående aktier",  # här antas absoluta tal → omvandla till M
+                "cagr5_pct": "CAGR 5 år (%)",
+            }
+            for k_src, k_dst in mapping.items():
+                v = y.get(k_src)
+                if v is None: continue
+                if k_dst == "Utestående aktier":
+                    df.loc[mask, k_dst] = float(v) / 1e6
+                else:
+                    df.loc[mask, k_dst] = float(v) if isinstance(v, (int,float)) else str(v)
+            df.loc[mask, "Senast auto uppdaterad"] = now_stamp()
+            df.loc[mask, "Auto källa"] = "Yahoo"
+        except Exception:
+            pass
+
+    # Finviz (om finns)
+    if fz_overview:
+        try:
+            fz = fz_overview(tkr) or {}
+            if float(fz.get("ps_ttm", 0.0)) > 0: df.loc[mask, "P/S"] = float(fz["ps_ttm"])
+            if float(fz.get("pb", 0.0))     > 0: df.loc[mask, "P/B"] = float(fz["pb"])
+            if float(fz.get("dividend_yield_pct", 0.0)) > 0 and float(df.loc[mask, "Aktuell kurs"].iloc[0] or 0) > 0:
+                # kan lämnas; vi beräknar DA (%) senare
+                pass
+            df.loc[mask, "Senast auto uppdaterad"] = now_stamp()
+            df.loc[mask, "Auto källa"] = "Finviz"
+        except Exception:
+            pass
+
+    # Morningstar (om finns)
+    if ms_overview:
+        try:
+            ms = ms_overview(tkr) or {}
+            if float(ms.get("ps_ttm", 0.0)) > 0: df.loc[mask, "P/S"] = float(ms["ps_ttm"])
+            if float(ms.get("pb", 0.0))     > 0: df.loc[mask, "P/B"] = float(ms["pb"])
+            # Book value / share finns i ms["book_value_per_share"] om du vill spara separat kolumn
+            df.loc[mask, "Senast auto uppdaterad"] = now_stamp()
+            df.loc[mask, "Auto källa"] = "Morningstar"
+        except Exception:
+            pass
+
+    # SEC → P/B kvartal (om finns)
+    if sec_pb_quarters:
+        try:
+            sec = sec_pb_quarters(tkr) or {}
+            pairs = sec.get("pb_quarters") or []  # list[(date, pb)]
+            # ta senaste 4 till P/B Q1..Q4 (Q1=senaste)
+            if pairs:
+                # sortera senast→äldst (pairs brukar redan vara det)
+                pairs = pairs[:4]
+                for idx, (_, pbv) in enumerate(pairs, start=1):
+                    if idx > 4: break
+                    df.loc[mask, f"P/B Q{idx}"] = float(pbv or 0.0)
+                # uppdatera snitt
+                row = df.loc[mask].iloc[0]
+                ps_avg, pb_avg = compute_ps_pb_snitt(row)
+                df.loc[mask, "P/B-snitt (Q1..Q4)"] = pb_avg
+            df.loc[mask, "Senast auto uppdaterad"] = now_stamp()
+            df.loc[mask, "Auto källa"] = "SEC"
+        except Exception:
+            pass
+
+    return df
+
+
+# ---------- Manuell insamling ----------
+def view_manual(df: pd.DataFrame, ws_title: str):
+    st.subheader("🧩 Manuell insamling")
+
+    # Överst: äldst-tabeller
+    _oldest_tables(df)
+
+    # Navigering
+    vis = df.sort_values(by=["Bolagsnamn","Ticker"]).reset_index(drop=True)
+    labels = [f"{r['Bolagsnamn']} ({r['Ticker']})" if str(r.get("Bolagsnamn","")).strip() else str(r["Ticker"]) for _, r in vis.iterrows()]
+    labels = ["➕ Lägg till nytt bolag..."] + labels
+
+    if "manual_idx" not in st.session_state:
+        st.session_state["manual_idx"] = 0
+
+    sel = st.selectbox("Välj bolag att redigera", list(range(len(labels))), format_func=lambda i: labels[i], index=st.session_state["manual_idx"])
+    st.session_state["manual_idx"] = sel
+
+    c_prev, c_mid, c_next = st.columns([1,2,1])
+    with c_prev:
+        if st.button("⬅️ Föregående", use_container_width=True, disabled=(sel<=0)):
+            st.session_state["manual_idx"] = max(0, sel-1); st.rerun()
+    with c_next:
+        if st.button("➡️ Nästa", use_container_width=True, disabled=(sel>=len(labels)-1)):
+            st.session_state["manual_idx"] = min(len(labels)-1, sel+1); st.rerun()
+
+    is_new = (sel == 0)
+    if not is_new:
+        row = vis.iloc[sel-1]
+    else:
+        row = pd.Series({c: (0.0 if c in df.columns and pd.api.types.is_numeric_dtype(df[c]) else "") for c in df.columns})
+
+    # ---- Enskild full uppdatering (alla fetchers) ----
+    col_up1, col_up2 = st.columns([1,1])
+    with col_up1:
+        if not is_new and st.button("🔭 Full uppdatering (alla fetchers) för vald ticker"):
+            df = _update_one_all_fetchers(df, row["Ticker"])
+            df = enrich_for_save(df, horizon_for_score="Riktkurs idag", strategy="Auto")
+            try:
+                save_df(ws_title, df)
+                st.success("Fetchers körda, beräkningar uppdaterade och sparade.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Kunde inte spara: {e}")
+    with col_up2:
+        st.caption("Kör Yahoo/Finviz/Morningstar/SEC (om tillgängliga) för just den här tickern.")
+
+    # ---------- Obligatoriska fält ----------
+    st.markdown("### Obligatoriska fält")
+    mtag = _m_tag(row); atag = _a_tag(row); btag = _b_tag(row)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        ticker = st.text_input(f"Ticker (Yahoo-format) {mtag}", value=str(row.get("Ticker","")).upper() if not is_new else "", placeholder="t.ex. AAPL")
+        antal  = st.number_input(f"Antal aktier (du äger) {mtag}", value=float(row.get("Antal aktier",0.0) or 0.0), step=1.0, min_value=0.0)
+        gav    = st.number_input(f"GAV (SEK) {mtag}", value=float(row.get("GAV (SEK)",0.0) or 0.0), step=0.01, min_value=0.0, format="%.2f")
+    with c2:
+        oms_idag = st.number_input(f"Omsättning idag (M) {mtag}", value=float(row.get("Omsättning idag",0.0) or 0.0), step=1.0, min_value=0.0)
+        oms_nxt  = st.number_input(f"Omsättning nästa år (M) {mtag}", value=float(row.get("Omsättning nästa år",0.0) or 0.0), step=1.0, min_value=0.0)
+
+    # ---------- Övriga fält: FETCHERS ----------
+    with st.expander("🌐 Fält som hämtas (auto)"):
+        cL, cR = st.columns(2)
+        with cL:
+            bolagsnamn = st.text_input(f"Bolagsnamn {atag}", value=str(row.get("Bolagsnamn","")))
+            sektor     = st.text_input(f"Sektor {atag}", value=str(row.get("Sektor","")))
+            valuta     = st.text_input(f"Valuta (t.ex. USD, SEK) {atag}", value=str(row.get("Valuta","") or "USD").upper())
+            aktuell_kurs = st.number_input(f"Aktuell kurs {atag}", value=float(row.get("Aktuell kurs",0.0) or 0.0), step=0.01, min_value=0.0)
+            utd_arlig    = st.number_input(f"Årlig utdelning {atag}", value=float(row.get("Årlig utdelning",0.0) or 0.0), step=0.01, min_value=0.0)
+            payout_pct   = st.number_input(f"Payout (%) {atag}", value=float(row.get("Payout (%)",0.0) or 0.0), step=1.0, min_value=0.0)
+        with cR:
+            utest_m = st.number_input(f"Utestående aktier (miljoner) {atag}", value=float(row.get("Utestående aktier",0.0) or 0.0), step=1.0, min_value=0.0)
+            ps  = st.number_input(f"P/S {atag}",   value=float(row.get("P/S",0.0) or 0.0), step=0.01, min_value=0.0)
+            ps1 = st.number_input(f"P/S Q1 {atag}", value=float(row.get("P/S Q1",0.0) or 0.0), step=0.01, min_value=0.0)
+            ps2 = st.number_input(f"P/S Q2 {atag}", value=float(row.get("P/S Q2",0.0) or 0.0), step=0.01, min_value=0.0)
+            ps3 = st.number_input(f"P/S Q3 {atag}", value=float(row.get("P/S Q3",0.0) or 0.0), step=0.01, min_value=0.0)
+            ps4 = st.number_input(f"P/S Q4 {atag}", value=float(row.get("P/S Q4",0.0) or 0.0), step=0.01, min_value=0.0)
+            pb  = st.number_input(f"P/B {atag}",   value=float(row.get("P/B",0.0) or 0.0), step=0.01, min_value=0.0)
+            pb1 = st.number_input(f"P/B Q1 {atag}", value=float(row.get("P/B Q1",0.0) or 0.0), step=0.01, min_value=0.0)
+            pb2 = st.number_input(f"P/B Q2 {atag}", value=float(row.get("P/B Q2",0.0) or 0.0), step=0.01, min_value=0.0)
+            pb3 = st.number_input(f"P/B Q3 {atag}", value=float(row.get("P/B Q3",0.0) or 0.0), step=0.01, min_value=0.0)
+            pb4 = st.number_input(f"P/B Q4 {atag}", value=float(row.get("P/B Q4",0.0) or 0.0), step=0.01, min_value=0.0)
+
+    # ---------- Övriga fält: BERÄKNADE ----------
+    with st.expander("🧮 Beräknade fält (auto)"):
+        btag = _b_tag(row)
+        cA, cB = st.columns(2)
+        with cA:
+            st.number_input(f"P/S-snitt (Q1..Q4) {btag}", value=float(row.get("P/S-snitt (Q1..Q4)",0.0) or 0.0), step=0.01, disabled=True)
+            st.number_input(f"Omsättning om 2 år (M) {btag}", value=float(row.get("Omsättning om 2 år",0.0) or 0.0), step=1.0, disabled=True)
+            st.number_input(f"Riktkurs idag {btag}", value=float(row.get("Riktkurs idag",0.0) or 0.0), step=0.01, disabled=True)
+            st.number_input(f"Riktkurs om 2 år {btag}", value=float(row.get("Riktkurs om 2 år",0.0) or 0.0), step=0.01, disabled=True)
+        with cB:
+            st.number_input(f"P/B-snitt (Q1..Q4) {btag}", value=float(row.get("P/B-snitt (Q1..Q4)",0.0) or 0.0), step=0.01, disabled=True)
+            st.number_input(f"Omsättning om 3 år (M) {btag}", value=float(row.get("Omsättning om 3 år",0.0) or 0.0), step=1.0, disabled=True)
+            st.number_input(f"Riktkurs om 1 år {btag}", value=float(row.get("Riktkurs om 1 år",0.0) or 0.0), step=0.01, disabled=True)
+            st.number_input(f"Riktkurs om 3 år {btag}", value=float(row.get("Riktkurs om 3 år",0.0) or 0.0), step=0.01, disabled=True)
+
+    # ---------- Spara ----------
+    def _any_core_change(before: pd.Series, after: dict) -> bool:
+        core = ["Antal aktier","GAV (SEK)","Omsättning idag","Omsättning nästa år"]
+        for k in core:
+            b = float(before.get(k,0.0) or 0.0); a = float(after.get(k,0.0) or 0.0)
+            if abs(a-b) > 1e-12: return True
+        return False
+
+    if st.button("💾 Spara"):
+        errors = []
+        if not ticker.strip(): errors.append("Ticker saknas.")
+        if antal < 0: errors.append("Antal aktier kan inte vara negativt.")
+        if gav < 0: errors.append("GAV (SEK) kan inte vara negativt.")
+        if oms_idag < 0 or oms_nxt < 0: errors.append("Omsättning idag/nästa år kan inte vara negativt.")
+        if errors:
+            st.error(" | ".join(errors)); return
+
+        exists_mask = (df["Ticker"].astype(str).str.upper() == ticker.upper())
+        exists = bool(exists_mask.any())
+
+        update = {
+            # manuella
+            "Ticker": ticker.upper(),
+            "Antal aktier": float(antal),
+            "GAV (SEK)": float(gav),
+            "Omsättning idag": float(oms_idag),
+            "Omsättning nästa år": float(oms_nxt),
+            # auto-fält (tillåt manuell korr om du vill)
+            "Bolagsnamn": str(bolagsnamn or "").strip(),
+            "Sektor": str(sektor or "").strip(),
+            "Valuta": str(valuta or "").strip().upper(),
+            "Aktuell kurs": float(aktuell_kurs),
+            "Årlig utdelning": float(utd_arlig),
+            "Payout (%)": float(payout_pct),
+            "Utestående aktier": float(utest_m),
+            "P/S": float(ps), "P/S Q1": float(ps1), "P/S Q2": float(ps2), "P/S Q3": float(ps3), "P/S Q4": float(ps4),
+            "P/B": float(pb), "P/B Q1": float(pb1), "P/B Q2": float(pb2), "P/B Q3": float(pb3), "P/B Q4": float(pb4),
+        }
+
+        def _apply_update(df_in: pd.DataFrame, mask, data: dict) -> pd.DataFrame:
+            out = df_in.copy()
+            for k,v in data.items():
+                if k not in out.columns: continue
+                if isinstance(v, str):
+                    if v.strip(): out.loc[mask, k] = v
+                else:
+                    out.loc[mask, k] = v
+            return out
+
+        if exists:
+            before_row = df.loc[exists_mask].iloc[0].copy()
+            df = _apply_update(df, exists_mask, update)
+            if _any_core_change(before_row, update):
+                df.loc[exists_mask, "Senast manuellt uppdaterad"] = now_stamp()
+        else:
+            base = {c: (0.0 if c not in ["Ticker","Bolagsnamn","Sektor","Valuta","Senast manuellt uppdaterad","Senast auto uppdaterad","Auto källa","Senast beräknad","Div_Månader","Div_Vikter"] else "") for c in FINAL_COLS}
+            base.update(update)
+            base["Senast manuellt uppdaterad"] = now_stamp()
+            df = pd.concat([df, pd.DataFrame([base])], ignore_index=True)
+            exists_mask = (df["Ticker"].astype(str).str.upper() == ticker.upper())
+
+        # Direkt efter spara → snabb Yahoo (pris etc) + auto-stämpel
+        try:
+            quick = yahoo_fetch_one_quick(ticker.upper())
+            if quick.get("Bolagsnamn"): df.loc[exists_mask, "Bolagsnamn"] = str(quick["Bolagsnamn"])
+            if quick.get("Valuta"):     df.loc[exists_mask, "Valuta"]     = str(quick["Valuta"])
+            if float(quick.get("Aktuell kurs",0.0))>0: df.loc[exists_mask, "Aktuell kurs"] = float(quick["Aktuell kurs"])
+            df.loc[exists_mask, "Årlig utdelning"] = float(quick.get("Årlig utdelning",0.0))
+            df.loc[exists_mask, "CAGR 5 år (%)"]   = float(quick.get("CAGR 5 år (%)",0.0))
+            df.loc[exists_mask, "Senast auto uppdaterad"] = now_stamp()
+            df.loc[exists_mask, "Auto källa"] = "Yahoo (snabb)"
+        except Exception:
+            pass
+
+        # Beräkna & spara
+        try:
+            df2 = enrich_for_save(df, horizon_for_score="Riktkurs idag", strategy="Auto")
+            save_df(ws_title, df2)
+            st.success("Sparat, snabbdata hämtad, beräkningar uppdaterade.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Kunde inte spara: {e}")
+
+# app.py (Del 4/4)
+
 def view_data(df: pd.DataFrame, ws_title: str):
     st.subheader("📄 Data (hela bladet)")
     st.dataframe(df, use_container_width=True)
@@ -618,173 +768,6 @@ def view_data(df: pd.DataFrame, ws_title: str):
             st.success("Beräkningar sparade till Google Sheets.")
         except Exception as e:
             st.error(f"Kunde inte spara: {e}")
-
-
-def view_manual(df: pd.DataFrame, ws_title: str):
-    """
-    Manuell insamling:
-      - Välj ticker + bläddra
-      - Lägg till/uppdatera bolag
-      - Obligatoriska fält: Ticker, Antal aktier, GAV (SEK), Omsättning idag, Omsättning nästa år
-      - Övriga fält i expander
-      - Sätter 'Senast manuellt uppdaterad' vid ändringar i obligatoriska fält
-    """
-    st.subheader("🧩 Manuell insamling")
-
-    vis = df.sort_values(by=["Bolagsnamn", "Ticker"]).reset_index(drop=True)
-    labels = [f"{r['Bolagsnamn']} ({r['Ticker']})" if str(r.get("Bolagsnamn","")).strip() else str(r["Ticker"]) for _, r in vis.iterrows()]
-    labels = ["➕ Lägg till nytt bolag..."] + labels
-
-    if "manual_idx" not in st.session_state:
-        st.session_state["manual_idx"] = 0  # 0 = nytt bolag
-
-    sel = st.selectbox("Välj bolag att redigera", list(range(len(labels))), format_func=lambda i: labels[i], index=st.session_state["manual_idx"])
-    st.session_state["manual_idx"] = sel
-
-    col_nav1, col_nav2, col_nav3 = st.columns([1,2,1])
-    with col_nav1:
-        if st.button("⬅️ Föregående", use_container_width=True, disabled=(sel <= 0)):
-            st.session_state["manual_idx"] = max(0, sel - 1)
-            st.rerun()
-    with col_nav3:
-        if st.button("➡️ Nästa", use_container_width=True, disabled=(sel >= len(labels)-1)):
-            st.session_state["manual_idx"] = min(len(labels)-1, sel + 1)
-            st.rerun()
-
-    is_new = (sel == 0)
-    if not is_new:
-        row = vis.iloc[sel-1]
-    else:
-        row = pd.Series({c: (0.0 if c in df.columns and pd.api.types.is_numeric_dtype(df[c]) else "") for c in df.columns})
-
-    # OBLIGATORISKA FÄLT
-    st.markdown("### Obligatoriska fält")
-    c1, c2 = st.columns(2)
-    with c1:
-        ticker = st.text_input("Ticker (Yahoo-format)", value=str(row.get("Ticker","")).upper() if not is_new else "", placeholder="t.ex. AAPL")
-        antal  = st.number_input("Antal aktier (du äger)", value=float(row.get("Antal aktier", 0.0) or 0.0), step=1.0, min_value=0.0)
-        gav    = st.number_input("GAV (SEK)", value=float(row.get("GAV (SEK)", 0.0) or 0.0), step=0.01, min_value=0.0, format="%.2f")
-    with c2:
-        oms_idag = st.number_input("Omsättning idag (M)", value=float(row.get("Omsättning idag", 0.0) or 0.0), step=1.0, min_value=0.0)
-        oms_nxt  = st.number_input("Omsättning nästa år (M)", value=float(row.get("Omsättning nästa år", 0.0) or 0.0), step=1.0, min_value=0.0)
-
-    # ÖVRIGA FÄLT
-    with st.expander("➕ Visa/ändra övriga fält"):
-        cL, cR = st.columns(2)
-        with cL:
-            bolagsnamn = st.text_input("Bolagsnamn", value=str(row.get("Bolagsnamn","")))
-            sektor     = st.text_input("Sektor", value=str(row.get("Sektor","")))
-            valuta     = st.text_input("Valuta (t.ex. USD, SEK)", value=str(row.get("Valuta","") or "USD").upper())
-
-            aktuell_kurs = st.number_input("Aktuell kurs", value=float(row.get("Aktuell kurs", 0.0) or 0.0), step=0.01, min_value=0.0)
-            utd_arlig    = st.number_input("Årlig utdelning", value=float(row.get("Årlig utdelning", 0.0) or 0.0), step=0.01, min_value=0.0)
-            payout_pct   = st.number_input("Payout (%)", value=float(row.get("Payout (%)", 0.0) or 0.0), step=1.0, min_value=0.0)
-            cagr5        = st.number_input("CAGR 5 år (%)", value=float(row.get("CAGR 5 år (%)", 0.0) or 0.0), step=0.1)
-        with cR:
-            utest_m = st.number_input("Utestående aktier (miljoner)", value=float(row.get("Utestående aktier", 0.0) or 0.0), step=1.0, min_value=0.0)
-            ps  = st.number_input("P/S",   value=float(row.get("P/S", 0.0) or 0.0), step=0.01, min_value=0.0)
-            ps1 = st.number_input("P/S Q1", value=float(row.get("P/S Q1", 0.0) or 0.0), step=0.01, min_value=0.0)
-            ps2 = st.number_input("P/S Q2", value=float(row.get("P/S Q2", 0.0) or 0.0), step=0.01, min_value=0.0)
-            ps3 = st.number_input("P/S Q3", value=float(row.get("P/S Q3", 0.0) or 0.0), step=0.01, min_value=0.0)
-            ps4 = st.number_input("P/S Q4", value=float(row.get("P/S Q4", 0.0) or 0.0), step=0.01, min_value=0.0)
-            pb  = st.number_input("P/B",   value=float(row.get("P/B", 0.0) or 0.0), step=0.01, min_value=0.0)
-            pb1 = st.number_input("P/B Q1", value=float(row.get("P/B Q1", 0.0) or 0.0), step=0.01, min_value=0.0)
-            pb2 = st.number_input("P/B Q2", value=float(row.get("P/B Q2", 0.0) or 0.0), step=0.01, min_value=0.0)
-            pb3 = st.number_input("P/B Q3", value=float(row.get("P/B Q3", 0.0) or 0.0), step=0.01, min_value=0.0)
-            pb4 = st.number_input("P/B Q4", value=float(row.get("P/B Q4", 0.0) or 0.0), step=0.01, min_value=0.0)
-
-    def _any_core_change(before: pd.Series, after: dict) -> bool:
-        core = ["Antal aktier", "GAV (SEK)", "Omsättning idag", "Omsättning nästa år"]
-        for k in core:
-            b = float(before.get(k, 0.0) or 0.0)
-            a = float(after.get(k, 0.0) or 0.0)
-            if abs(a - b) > 1e-12:
-                return True
-        return False
-
-    if st.button("💾 Spara"):
-        errors = []
-        if not ticker.strip():
-            errors.append("Ticker saknas.")
-        if antal < 0: errors.append("Antal aktier kan inte vara negativt.")
-        if gav < 0: errors.append("GAV (SEK) kan inte vara negativt.")
-        if oms_idag < 0 or oms_nxt < 0: errors.append("Omsättning idag/nästa år kan inte vara negativt.")
-        if errors:
-            st.error(" | ".join(errors))
-            return
-
-        exists_mask = (df["Ticker"].astype(str).str.upper() == ticker.upper())
-        exists = bool(exists_mask.any())
-
-        update = {
-            "Ticker": ticker.upper(),
-            "Antal aktier": float(antal),
-            "GAV (SEK)": float(gav),
-            "Omsättning idag": float(oms_idag),
-            "Omsättning nästa år": float(oms_nxt),
-            "Bolagsnamn": (bolagsnamn or "").strip(),
-            "Sektor": (sektor or "").strip(),
-            "Valuta": (valuta or "").strip().upper(),
-            "Aktuell kurs": float(aktuell_kurs),
-            "Årlig utdelning": float(utd_arlig),
-            "Payout (%)": float(payout_pct),
-            "CAGR 5 år (%)": float(cagr5),
-            "Utestående aktier": float(utest_m),
-            "P/S": float(ps), "P/S Q1": float(ps1), "P/S Q2": float(ps2), "P/S Q3": float(ps3), "P/S Q4": float(ps4),
-            "P/B": float(pb), "P/B Q1": float(pb1), "P/B Q2": float(pb2), "P/B Q3": float(pb3), "P/B Q4": float(pb4),
-        }
-
-        def _apply_update(df_in: pd.DataFrame, mask, data: dict) -> pd.DataFrame:
-            out = df_in.copy()
-            for k, v in data.items():
-                if k not in out.columns:
-                    continue
-                if isinstance(v, str):
-                    if v.strip():
-                        out.loc[mask, k] = v
-                else:
-                    out.loc[mask, k] = v
-            return out
-
-        if exists:
-            before_row = df.loc[exists_mask].iloc[0].copy()
-            df = _apply_update(df, exists_mask, update)
-            if _any_core_change(before_row, update):
-                df.loc[exists_mask, "Senast manuellt uppdaterad"] = now_stamp()
-        else:
-            # ny rad – se till att alla kolumner finns med default
-            new_row = {c: (0.0 if c not in ["Ticker","Bolagsnamn","Sektor","Valuta","Senast manuellt uppdaterad","Div_Månader","Div_Vikter"] else "") for c in FINAL_COLS}
-            new_row.update(update)
-            new_row["Senast manuellt uppdaterad"] = now_stamp()
-            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-        try:
-            df2 = enrich_for_save(df, horizon_for_score="Riktkurs idag", strategy="Auto")
-            save_df(ws_title, df2)
-            st.success("Sparat och beräkningar uppdaterade.")
-            # hoppa till ny/uppdaterad rad i listan
-            try:
-                vis2 = df2.sort_values(by=["Bolagsnamn","Ticker"]).reset_index(drop=True)
-                new_idx = vis2.index[vis2["Ticker"].astype(str).str.upper() == ticker.upper()].tolist()
-                if new_idx:
-                    st.session_state["manual_idx"] = new_idx[0] + 1  # +1 pga "ny" först
-            except Exception:
-                pass
-        except Exception as e:
-            st.error(f"Kunde inte spara: {e}")
-
-    st.markdown("### Förhandsgranskning (beräknade fält)")
-    tmp = update_calculations(df.copy())
-    if not is_new:
-        mask = (tmp["Ticker"].astype(str).str.upper() == str(row["Ticker"]).upper())
-        prev = tmp.loc[mask, [
-            "Ticker","Bolagsnamn","P/S-snitt (Q1..Q4)","P/B-snitt (Q1..Q4)",
-            "Omsättning om 2 år","Omsättning om 3 år",
-            "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"
-        ]]
-        st.dataframe(prev, use_container_width=True)
-    else:
-        st.info("Ny post: fyll i obligatoriska fält och spara för att se beräkningar.")
 
 
 def view_portfolio(df: pd.DataFrame, rates: Dict[str, float]):
@@ -811,8 +794,7 @@ def view_ideas(df: pd.DataFrame):
     st.subheader("💡 Köpförslag")
 
     if df.empty:
-        st.info("Inga rader.")
-        return
+        st.info("Inga rader."); return
 
     horizon = st.selectbox("Riktkurs-horisont", ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"], index=0)
     strategy = st.selectbox("Strategi", ["Auto (via sektor)","Tillväxt","Utdelning","Finans"], index=0)
@@ -825,8 +807,7 @@ def view_ideas(df: pd.DataFrame):
     base = update_calculations(base)
     base = base[(base[horizon] > 0) & (base["Aktuell kurs"] > 0)].copy()
     if base.empty:
-        st.info("Inget att visa.")
-        return
+        st.info("Inget att visa."); return
 
     base = score_rows(base, horizon=horizon, strategy=("Auto" if strategy.startswith("Auto") else strategy))
 
@@ -869,12 +850,9 @@ def view_ideas(df: pd.DataFrame):
     ascending = False
     if sort_on == "Uppsida (%)":
         trim_mode = st.checkbox("Visa trim/sälj-läge (minst uppsida först)", value=False)
-        if trim_mode:
-            ascending = True
-
+        if trim_mode: ascending = True
     reverse_global = st.checkbox("Omvänd sortering (gäller valt fält)", value=False)
-    if reverse_global:
-        ascending = not ascending
+    if reverse_global: ascending = not ascending
 
     cols = ["Ticker","Bolagsnamn","Sektor","Aktuell kurs",horizon,"Uppsida (%)","DA (%)"]
     if show_components:
@@ -895,10 +873,8 @@ def view_ideas(df: pd.DataFrame):
         "Visa rad #", min_value=0, max_value=max(0, len(base)-1),
         value=st.session_state["idea_idx"], step=1
     )
-
     r = base.iloc[st.session_state["idea_idx"]]
     st.subheader(f"{r['Bolagsnamn']} ({r['Ticker']})")
-
     c1, c2 = st.columns(2)
     with c1:
         st.write(f"- **Sektor:** {r.get('Sektor','—')}")
@@ -949,43 +925,20 @@ def view_dividend_calendar(df: pd.DataFrame, ws_title: str, rates: Dict[str, flo
             df2 = enrich_for_save(df_to_save, horizon_for_score="Riktkurs idag", strategy="Auto")
             save_df(ws_title, df2)
             summ = st.session_state.get("div_summ", pd.DataFrame())
-            det = st.session_state.get("div_det", pd.DataFrame())
+            det  = st.session_state.get("div_det", pd.DataFrame())
             ws_write_df("Utdelningskalender – Summering", summ if not summ.empty else pd.DataFrame(columns=["År","Månad","Månad (sv)","Summa (SEK)"]))
             ws_write_df("Utdelningskalender – Detalj", det if not det.empty else pd.DataFrame(columns=[
                 "År","Månad","Månad (sv)","Ticker","Bolagsnamn","Antal aktier","Valuta","Per utbetalning (valuta)","SEK-kurs","Summa (SEK)"]))
-            st.success("Schema + kalender sparat till Google Sheets.")
+            st.success("Schema + kalender sparat.")
         except Exception as e:
             st.error(f"Kunde inte spara: {e}")
 
     if c2.button("↻ Rensa kalender-cache"):
         for k in ["div_summ","div_det","div_df_out"]:
-            if k in st.session_state:
-                del st.session_state[k]
+            if k in st.session_state: del st.session_state[k]
         st.info("Kalender-cache rensad.")
 
 
-# ------------------------------------------------------------
-# Massuppdatering alla källor (Yahoo+Finviz+Morningstar+SEC)
-# ------------------------------------------------------------
-def mass_update_all_sources(df: pd.DataFrame, ws_title: str):
-    if st.sidebar.button("🔭 Massuppdatera (Yahoo + Finviz + Morningstar + SEC)"):
-        out = collectors_mass_update(
-            df,
-            ws_title=ws_title,
-            delay_sec=0.5,
-            save_fn=ws_write_df
-        )
-        try:
-            out2 = enrich_for_save(out, horizon_for_score="Riktkurs idag", strategy="Auto")
-            save_df(ws_title, out2)
-            st.sidebar.success("✅ All källdata uppdaterad och beräkningar sparade till Google Sheets.")
-        except Exception as e:
-            st.sidebar.error(f"⚠️ Kunde inte spara beräkningar efter uppdatering: {e}")
-
-
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
 def main():
     st.title("K-pf-rslag")
 
@@ -994,18 +947,8 @@ def main():
 
     user_rates = sidebar_rates()
 
-    # Läs data
     df = load_df(ws_title)
-
-    # Snapshot direkt vid appstart (en gång per session)
     snapshot_on_start(df, ws_title)
-
-    st.sidebar.markdown("---")
-    # Knappar för uppdateringar
-    mass_update_yahoo(df, ws_title)
-    mass_update_fundamentals(df, ws_title)
-    mass_update_all_sources(df, ws_title)
-
     df = update_calculations(df)
 
     tabs = st.tabs(["📄 Data", "🧩 Manuell insamling", "📦 Portfölj", "💡 Köpförslag", "📅 Utdelningskalender"])

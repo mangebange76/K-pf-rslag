@@ -1,13 +1,16 @@
+# stockapp/sheets.py
 from __future__ import annotations
 
 import base64
 import json
-import os
 import time
 from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
+
+# Ny: acceptera dict-lika objekt (AttrDict/Mapping)
+from collections.abc import Mapping
 
 # 3p
 try:
@@ -48,14 +51,6 @@ def _json_from_b64(s: str) -> dict:
         raise RuntimeError(f"Kunde inte BASE64-avkoda credentials ({e}).")
 
 
-def _json_from_path(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        raise RuntimeError(f"Kunde inte läsa credentials-fil ({e}).")
-
-
 def _fix_private_key_newlines(data: dict) -> dict:
     pk = data.get("private_key")
     if isinstance(pk, str):
@@ -85,24 +80,33 @@ def _build_minimal_dict_from_separate_keys() -> dict | None:
 def _load_credentials_dict() -> Tuple[dict, str]:
     """
     Försöker läsa service account-JSON från flera källor (i ordning):
-      1) GOOGLE_CREDENTIALS / google_credentials / gcp_service_account (dict eller JSON-sträng)
+      1) GOOGLE_CREDENTIALS / google_credentials / gcp_service_account
+         - accepterar Mapping (AttrDict), dict, str (JSON) eller bytes
       2) GOOGLE_CREDENTIALS_B64 (base64 av JSON)
       3) GOOGLE_CREDENTIALS_PATH (fil på disk)
       4) separata nycklar SHEETS_CLIENT_EMAIL + SHEETS_PRIVATE_KEY
-    Returnerar (json_dict, källa_str).
     """
-    # 1) Direkt i secrets (dict eller JSON-sträng)
+    # 1) Direkt i secrets
     raw = (
         st.secrets.get("GOOGLE_CREDENTIALS")
         or st.secrets.get("google_credentials")
         or st.secrets.get("gcp_service_account")
     )
     if raw:
+        # Ny: acceptera alla Mapping-varianter (inkl. Streamlits AttrDict)
+        if isinstance(raw, Mapping):
+            return _fix_private_key_newlines(dict(raw)), "secrets:mapping"
         if isinstance(raw, dict):
             return _fix_private_key_newlines(dict(raw)), "secrets:dict"
+        if isinstance(raw, (bytes, bytearray)):
+            return _fix_private_key_newlines(_json_from_str(raw.decode("utf-8"))), "secrets:json_bytes"
         if isinstance(raw, str):
             return _fix_private_key_newlines(_json_from_str(raw)), "secrets:json_str"
-        raise RuntimeError("GOOGLE_CREDENTIALS fanns men hade okänt format (varken dict eller str).")
+        # Om något annat ovanligt dyker upp – försök tolkning via str()
+        try:
+            return _fix_private_key_newlines(_json_from_str(str(raw))), "secrets:coerced_str"
+        except Exception:
+            raise RuntimeError("GOOGLE_CREDENTIALS fanns men hade okänt format (varken mapping/str/bytes).")
 
     # 2) BASE64
     b64 = st.secrets.get("GOOGLE_CREDENTIALS_B64")
@@ -112,7 +116,12 @@ def _load_credentials_dict() -> Tuple[dict, str]:
     # 3) PATH
     path = st.secrets.get("GOOGLE_CREDENTIALS_PATH")
     if path:
-        return _fix_private_key_newlines(_json_from_path(path)), "file:path"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return _fix_private_key_newlines(data), "file:path"
+        except Exception as e:
+            raise RuntimeError(f"Kunde inte läsa credentials-fil ({e}).")
 
     # 4) Separerade nycklar
     sep = _build_minimal_dict_from_separate_keys()
@@ -121,7 +130,7 @@ def _load_credentials_dict() -> Tuple[dict, str]:
 
     raise RuntimeError(
         "Hittade inga service account-uppgifter. "
-        "Använd någon av: GOOGLE_CREDENTIALS (dict/str), GOOGLE_CREDENTIALS_B64, "
+        "Använd någon av: GOOGLE_CREDENTIALS (dict/str/mapping), GOOGLE_CREDENTIALS_B64, "
         "GOOGLE_CREDENTIALS_PATH eller SHEETS_CLIENT_EMAIL + SHEETS_PRIVATE_KEY."
     )
 
@@ -176,23 +185,20 @@ def get_spreadsheet():
 # ---------------- Diagnostics ----------------
 def creds_debug_summary() -> str:
     """
-    Ger en kort, sanitiserad diagnos om hur credentials hittades och ser ut (utan att exponera hemligheter).
+    Kort diagnos om hur credentials hittades och ser ut (inga hemligheter läcks).
     """
     try:
         data, source = _load_credentials_dict()
-        email = str(data.get("client_email", ""))
+        email = bool(data.get("client_email"))
         pk = str(data.get("private_key", ""))
         has_pk = bool(pk)
-        has_nl = "\\n" in pk or "\n" in pk
-        return f"Källa: {source} | client_email: {bool(email)} | private_key: {has_pk} | radbrytningar i nyckel: {has_nl}"
+        has_nl = ("\\n" in pk) or ("\n" in pk)
+        return f"Källa: {source} | client_email: {email} | private_key: {has_pk} | radbrytningar: {has_nl}"
     except Exception as e:
         return f"Creds: FEL – {e}"
 
 
 def test_connection() -> Tuple[bool, str]:
-    """
-    Testar att creds kan laddas och att spreadsheet går att öppna.
-    """
     try:
         ss = get_spreadsheet()
         _ = [ws.title for ws in ss.worksheets()]

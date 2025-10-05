@@ -1,8 +1,7 @@
-# app.py (Del 1/4)
+# app.py (Del 1/5)
 from __future__ import annotations
 
 import re
-import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
@@ -11,7 +10,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# Egna moduler
+# Egna moduler (måste finnas i stockapp/)
 from stockapp.sheets import (
     ws_read_df, ws_write_df, list_worksheet_titles, delete_worksheet
 )
@@ -20,7 +19,7 @@ from stockapp.rates import (
 )
 from stockapp.dividends import build_dividend_calendar
 
-# (Valfritt) direkta fetchers för enskild uppdatering i Manuell-insamling
+# (Valfritt) fetchers för enskild uppdatering i Manuell-insamling
 try:
     from stockapp.fetchers.yahoo import get_all as y_overview
 except Exception:
@@ -70,6 +69,7 @@ def _parse_snap_title(title: str) -> Optional[datetime]:
         return None
 
 def snapshot_on_start(df: pd.DataFrame, base_ws_title: str):
+    """Skapar snapshotblad vid första körningen och rensar äldre än 5 dagar."""
     if st.session_state.get("_snapshot_done"):
         return
     st.session_state["_snapshot_done"] = True
@@ -81,7 +81,6 @@ def snapshot_on_start(df: pd.DataFrame, base_ws_title: str):
     except Exception as e:
         st.sidebar.warning(f"Kunde inte spara snapshot: {e}")
 
-    # Rensa äldre än 5 dagar
     try:
         titles = list_worksheet_titles() or []
         cutoff = now - timedelta(days=5)
@@ -89,6 +88,7 @@ def snapshot_on_start(df: pd.DataFrame, base_ws_title: str):
             if not str(t).startswith(SNAP_PREFIX):
                 continue
             ts = _parse_snap_title(t)
+            # vissa miljöer saknar tzinfo på dt i Sheets → jämför naive
             if ts and ts < cutoff.replace(tzinfo=None):
                 try:
                     delete_worksheet(t)
@@ -121,10 +121,10 @@ FINAL_COLS: List[str] = [
     # Övrigt
     "CAGR 5 år (%)",
 
-    # Tidsstämplar (NYTT)
+    # Tidsstämplar
     "Senast manuellt uppdaterad",      # M
     "Senast auto uppdaterad",          # A (fetchers/kurs)
-    "Auto källa",                      # text om källa senast auto
+    "Auto källa",                      # text
     "Senast beräknad",                 # B (beräkningar)
 
     # Visning/score
@@ -174,19 +174,22 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for c in float_cols:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
 
-    for c in ["Ticker","Bolagsnamn","Sektor","Valuta","Auto källa","Senast manuellt uppdaterad","Senast auto uppdaterad","Senast beräknad","Div_Månader","Div_Vikter"]:
+    for c in ["Ticker","Bolagsnamn","Sektor","Valuta","Auto källa",
+              "Senast manuellt uppdaterad","Senast auto uppdaterad","Senast beräknad",
+              "Div_Månader","Div_Vikter"]:
         if c in out.columns:
             out[c] = out[c].astype(str)
         else:
             out[c] = ""
     return out
 
-# app.py (Del 2/4)
+# app.py (Del 2/5)
 
 # ---------- Sidopanel: valutakurser ----------
 def sidebar_rates() -> Dict[str, float]:
     st.sidebar.subheader("💱 Valutakurser → SEK")
 
+    # Initiera sessionstate endast en gång innan widgets skapas
     if "rates_loaded" not in st.session_state:
         saved = read_rates()
         st.session_state["rate_usd"] = float(saved.get("USD", DEFAULT_RATES["USD"]))
@@ -237,16 +240,21 @@ def sidebar_rates() -> Dict[str, float]:
     return {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
 
 
-# ---------- IO ----------
+# ---------- IO (med cache-nonce) ----------
 @st.cache_data(show_spinner=False)
-def load_df_cached(ws_title: str) -> pd.DataFrame:
+def load_df_cached(ws_title: str, _nonce: int) -> pd.DataFrame:
+    # _nonce används endast för att bust:a cachen efter sparning
     return ws_read_df(ws_title)
 
 def load_df(ws_title: str) -> pd.DataFrame:
-    return ensure_columns(load_df_cached(ws_title))
+    n = st.session_state.get("_reload_nonce", 0)
+    df = load_df_cached(ws_title, n)
+    return ensure_columns(df)
 
-def save_df(ws_title: str, df: pd.DataFrame):
+def save_df(ws_title: str, df: pd.DataFrame, bust_cache: bool = True):
     ws_write_df(ws_title, df)
+    if bust_cache:
+        st.session_state["_reload_nonce"] = st.session_state.get("_reload_nonce", 0) + 1
 
 
 # ---------- Beräkningar ----------
@@ -384,7 +392,7 @@ def enrich_for_save(df: pd.DataFrame, horizon_for_score: str = "Riktkurs idag", 
     df2["Senast beräknad"] = now_stamp()
     return df2
 
-# app.py (Del 3/4)
+# app.py (Del 3/5)
 
 # ---------- Snabb Yahoo (pris mm) ----------
 @st.cache_data(show_spinner=False, ttl=600)
@@ -404,7 +412,7 @@ def yahoo_fetch_one_quick(ticker: str) -> Dict[str, float | str]:
         if px is not None: out["Aktuell kurs"] = float(px)
         dr = info.get("dividendRate");  out["Årlig utdelning"] = float(dr or 0.0)
 
-        # CAGR 5y
+        # CAGR 5y från revenue
         try:
             df_is = getattr(t, "income_stmt", None)
             ser = None
@@ -427,7 +435,7 @@ def yahoo_fetch_one_quick(ticker: str) -> Dict[str, float | str]:
     return out
 
 
-# ---------- Hjälpare för etiketttext bredvid fält ----------
+# ---------- Etiketttext bredvid fält ----------
 def _m_tag(df_row: pd.Series) -> str:
     d = str(df_row.get("Senast manuellt uppdaterad","")).strip()
     return f"〔M: {d or '—'}〕"
@@ -442,7 +450,7 @@ def _b_tag(df_row: pd.Series) -> str:
     return f"〔B: {d or '—'}〕"
 
 
-# ---------- Äldst-tabeller (manuell/auto + total) ----------
+# ---------- Äldst-tabeller ----------
 def _oldest_tables(df: pd.DataFrame):
     st.markdown("### ⏱️ Äldst uppdaterade")
 
@@ -458,7 +466,7 @@ def _oldest_tables(df: pd.DataFrame):
     tmp["d_auto"] = tmp["Senast auto uppdaterad"].apply(_to_date)
     tmp["d_any"]  = tmp[["d_man","d_auto"]].min(axis=1)
 
-    # a) Äldst i databasen (min av man/auto)
+    # a) Äldst totalt (min av man/auto)
     any_sorted = tmp.dropna(subset=["d_any"]).sort_values("d_any", ascending=True)
     if any_sorted.empty:
         st.info("Inga tidsstämplar ännu.")
@@ -492,11 +500,10 @@ def _update_one_all_fetchers(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if not mask.any():
         return df
 
-    # Yahoo bred (om finns via fetchers)
+    # Yahoo bred
     if y_overview:
         try:
             y = y_overview(tkr) or {}
-            # mappa några centrala fält om de finns
             mapping = {
                 "name": "Bolagsnamn",
                 "currency": "Valuta",
@@ -504,7 +511,7 @@ def _update_one_all_fetchers(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 "dividend_rate": "Årlig utdelning",
                 "ps_ttm": "P/S",
                 "pb": "P/B",
-                "shares_outstanding": "Utestående aktier",  # här antas absoluta tal → omvandla till M
+                "shares_outstanding": "Utestående aktier",  # absolut → M
                 "cagr5_pct": "CAGR 5 år (%)",
             }
             for k_src, k_dst in mapping.items():
@@ -519,47 +526,41 @@ def _update_one_all_fetchers(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    # Finviz (om finns)
+    # Finviz
     if fz_overview:
         try:
             fz = fz_overview(tkr) or {}
             if float(fz.get("ps_ttm", 0.0)) > 0: df.loc[mask, "P/S"] = float(fz["ps_ttm"])
             if float(fz.get("pb", 0.0))     > 0: df.loc[mask, "P/B"] = float(fz["pb"])
-            if float(fz.get("dividend_yield_pct", 0.0)) > 0 and float(df.loc[mask, "Aktuell kurs"].iloc[0] or 0) > 0:
-                # kan lämnas; vi beräknar DA (%) senare
-                pass
             df.loc[mask, "Senast auto uppdaterad"] = now_stamp()
             df.loc[mask, "Auto källa"] = "Finviz"
         except Exception:
             pass
 
-    # Morningstar (om finns)
+    # Morningstar
     if ms_overview:
         try:
             ms = ms_overview(tkr) or {}
             if float(ms.get("ps_ttm", 0.0)) > 0: df.loc[mask, "P/S"] = float(ms["ps_ttm"])
             if float(ms.get("pb", 0.0))     > 0: df.loc[mask, "P/B"] = float(ms["pb"])
-            # Book value / share finns i ms["book_value_per_share"] om du vill spara separat kolumn
             df.loc[mask, "Senast auto uppdaterad"] = now_stamp()
             df.loc[mask, "Auto källa"] = "Morningstar"
         except Exception:
             pass
 
-    # SEC → P/B kvartal (om finns)
+    # SEC → P/B kvartal
     if sec_pb_quarters:
         try:
             sec = sec_pb_quarters(tkr) or {}
             pairs = sec.get("pb_quarters") or []  # list[(date, pb)]
-            # ta senaste 4 till P/B Q1..Q4 (Q1=senaste)
             if pairs:
-                # sortera senast→äldst (pairs brukar redan vara det)
-                pairs = pairs[:4]
+                pairs = pairs[:4]  # Q1..Q4
                 for idx, (_, pbv) in enumerate(pairs, start=1):
                     if idx > 4: break
                     df.loc[mask, f"P/B Q{idx}"] = float(pbv or 0.0)
                 # uppdatera snitt
                 row = df.loc[mask].iloc[0]
-                ps_avg, pb_avg = compute_ps_pb_snitt(row)
+                _ps_avg, pb_avg = compute_ps_pb_snitt(row)
                 df.loc[mask, "P/B-snitt (Q1..Q4)"] = pb_avg
             df.loc[mask, "Senast auto uppdaterad"] = now_stamp()
             df.loc[mask, "Auto källa"] = "SEC"
@@ -576,7 +577,7 @@ def view_manual(df: pd.DataFrame, ws_title: str):
     # Överst: äldst-tabeller
     _oldest_tables(df)
 
-    # Navigering
+    # Navigering & val
     vis = df.sort_values(by=["Bolagsnamn","Ticker"]).reset_index(drop=True)
     labels = [f"{r['Bolagsnamn']} ({r['Ticker']})" if str(r.get("Bolagsnamn","")).strip() else str(r["Ticker"]) for _, r in vis.iterrows()]
     labels = ["➕ Lägg till nytt bolag..."] + labels
@@ -587,7 +588,7 @@ def view_manual(df: pd.DataFrame, ws_title: str):
     sel = st.selectbox("Välj bolag att redigera", list(range(len(labels))), format_func=lambda i: labels[i], index=st.session_state["manual_idx"])
     st.session_state["manual_idx"] = sel
 
-    c_prev, c_mid, c_next = st.columns([1,2,1])
+    c_prev, c_next = st.columns([1,1])
     with c_prev:
         if st.button("⬅️ Föregående", use_container_width=True, disabled=(sel<=0)):
             st.session_state["manual_idx"] = max(0, sel-1); st.rerun()
@@ -601,14 +602,14 @@ def view_manual(df: pd.DataFrame, ws_title: str):
     else:
         row = pd.Series({c: (0.0 if c in df.columns and pd.api.types.is_numeric_dtype(df[c]) else "") for c in df.columns})
 
-    # ---- Enskild full uppdatering (alla fetchers) ----
+    # Enskild full uppdatering
     col_up1, col_up2 = st.columns([1,1])
     with col_up1:
         if not is_new and st.button("🔭 Full uppdatering (alla fetchers) för vald ticker"):
             df = _update_one_all_fetchers(df, row["Ticker"])
             df = enrich_for_save(df, horizon_for_score="Riktkurs idag", strategy="Auto")
             try:
-                save_df(ws_title, df)
+                save_df(ws_title, df, bust_cache=True)
                 st.success("Fetchers körda, beräkningar uppdaterade och sparade.")
                 st.rerun()
             except Exception as e:
@@ -616,9 +617,9 @@ def view_manual(df: pd.DataFrame, ws_title: str):
     with col_up2:
         st.caption("Kör Yahoo/Finviz/Morningstar/SEC (om tillgängliga) för just den här tickern.")
 
-    # ---------- Obligatoriska fält ----------
+    # Obligatoriska fält
     st.markdown("### Obligatoriska fält")
-    mtag = _m_tag(row); atag = _a_tag(row); btag = _b_tag(row)
+    mtag = _m_tag(row)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -629,7 +630,8 @@ def view_manual(df: pd.DataFrame, ws_title: str):
         oms_idag = st.number_input(f"Omsättning idag (M) {mtag}", value=float(row.get("Omsättning idag",0.0) or 0.0), step=1.0, min_value=0.0)
         oms_nxt  = st.number_input(f"Omsättning nästa år (M) {mtag}", value=float(row.get("Omsättning nästa år",0.0) or 0.0), step=1.0, min_value=0.0)
 
-    # ---------- Övriga fält: FETCHERS ----------
+    # Övriga fält: FETCHERS
+    atag = _a_tag(row)
     with st.expander("🌐 Fält som hämtas (auto)"):
         cL, cR = st.columns(2)
         with cL:
@@ -652,9 +654,9 @@ def view_manual(df: pd.DataFrame, ws_title: str):
             pb3 = st.number_input(f"P/B Q3 {atag}", value=float(row.get("P/B Q3",0.0) or 0.0), step=0.01, min_value=0.0)
             pb4 = st.number_input(f"P/B Q4 {atag}", value=float(row.get("P/B Q4",0.0) or 0.0), step=0.01, min_value=0.0)
 
-    # ---------- Övriga fält: BERÄKNADE ----------
+    # Övriga fält: BERÄKNADE (read-only)
+    btag = _b_tag(row)
     with st.expander("🧮 Beräknade fält (auto)"):
-        btag = _b_tag(row)
         cA, cB = st.columns(2)
         with cA:
             st.number_input(f"P/S-snitt (Q1..Q4) {btag}", value=float(row.get("P/S-snitt (Q1..Q4)",0.0) or 0.0), step=0.01, disabled=True)
@@ -667,7 +669,7 @@ def view_manual(df: pd.DataFrame, ws_title: str):
             st.number_input(f"Riktkurs om 1 år {btag}", value=float(row.get("Riktkurs om 1 år",0.0) or 0.0), step=0.01, disabled=True)
             st.number_input(f"Riktkurs om 3 år {btag}", value=float(row.get("Riktkurs om 3 år",0.0) or 0.0), step=0.01, disabled=True)
 
-    # ---------- Spara ----------
+    # Spara
     def _any_core_change(before: pd.Series, after: dict) -> bool:
         core = ["Antal aktier","GAV (SEK)","Omsättning idag","Omsättning nästa år"]
         for k in core:
@@ -694,7 +696,7 @@ def view_manual(df: pd.DataFrame, ws_title: str):
             "GAV (SEK)": float(gav),
             "Omsättning idag": float(oms_idag),
             "Omsättning nästa år": float(oms_nxt),
-            # auto-fält (tillåt manuell korr om du vill)
+            # auto-fält (tillåt korr)
             "Bolagsnamn": str(bolagsnamn or "").strip(),
             "Sektor": str(sektor or "").strip(),
             "Valuta": str(valuta or "").strip().upper(),
@@ -744,13 +746,13 @@ def view_manual(df: pd.DataFrame, ws_title: str):
         # Beräkna & spara
         try:
             df2 = enrich_for_save(df, horizon_for_score="Riktkurs idag", strategy="Auto")
-            save_df(ws_title, df2)
+            save_df(ws_title, df2, bust_cache=True)  # BUST cache
             st.success("Sparat, snabbdata hämtad, beräkningar uppdaterade.")
             st.rerun()
         except Exception as e:
             st.error(f"Kunde inte spara: {e}")
 
-# app.py (Del 4/4)
+# app.py (Del 4/5)
 
 def view_data(df: pd.DataFrame, ws_title: str):
     st.subheader("📄 Data (hela bladet)")
@@ -764,7 +766,7 @@ def view_data(df: pd.DataFrame, ws_title: str):
     if st.button("💾 Spara beräkningar → Google Sheets"):
         try:
             df2 = enrich_for_save(df, horizon_for_score=horizon, strategy=("Auto" if strategy.startswith("Auto") else strategy))
-            save_df(ws_title, df2)
+            save_df(ws_title, df2, bust_cache=True)
             st.success("Beräkningar sparade till Google Sheets.")
         except Exception as e:
             st.error(f"Kunde inte spara: {e}")
@@ -923,7 +925,7 @@ def view_dividend_calendar(df: pd.DataFrame, ws_title: str, rates: Dict[str, flo
         try:
             df_to_save = st.session_state.get("div_df_out", df)
             df2 = enrich_for_save(df_to_save, horizon_for_score="Riktkurs idag", strategy="Auto")
-            save_df(ws_title, df2)
+            save_df(ws_title, df2, bust_cache=True)
             summ = st.session_state.get("div_summ", pd.DataFrame())
             det  = st.session_state.get("div_det", pd.DataFrame())
             ws_write_df("Utdelningskalender – Summering", summ if not summ.empty else pd.DataFrame(columns=["År","Månad","Månad (sv)","Summa (SEK)"]))
@@ -938,15 +940,27 @@ def view_dividend_calendar(df: pd.DataFrame, ws_title: str, rates: Dict[str, flo
             if k in st.session_state: del st.session_state[k]
         st.info("Kalender-cache rensad.")
 
+# app.py (Del 5/5)
 
 def main():
     st.title("K-pf-rslag")
 
-    titles = list_worksheet_titles() or ["Blad1"]
+    # Välj data-blad
+    try:
+        titles = list_worksheet_titles() or ["Blad1"]
+    except Exception:
+        titles = ["Blad1"]
     ws_title = st.sidebar.selectbox("Google Sheets → välj data-blad", titles, index=0)
 
+    # Sidopanel: tvångsläs om (om du editerat i Google Sheets)
+    if st.sidebar.button("↻ Läs om data nu"):
+        st.session_state["_reload_nonce"] = st.session_state.get("_reload_nonce", 0) + 1
+        st.rerun()
+
+    # Valutakurser
     user_rates = sidebar_rates()
 
+    # Läs data + snapshot + beräkna
     df = load_df(ws_title)
     snapshot_on_start(df, ws_title)
     df = update_calculations(df)

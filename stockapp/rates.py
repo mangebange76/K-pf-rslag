@@ -1,131 +1,69 @@
-# stockapp/rates.py
 from __future__ import annotations
-
-import time
-from typing import Dict, Any, List
-
-import pandas as pd
+from typing import Dict
+import requests
 import streamlit as st
+import pandas as pd
+from .sheets import ws_read_df, ws_write_df
 
-try:
-    import yfinance as yf
-except Exception:
-    yf = None  # type: ignore
+RATES_SHEET = "Valutakurser"
+DEFAULT_RATES: Dict[str, float] = {"USD": 10.0, "NOK": 1.0, "CAD": 7.5, "EUR": 11.0, "SEK": 1.0}
 
-from .sheets import get_spreadsheet, _with_backoff
-
-RATES_SHEET_NAME = "Valutakurser"
-
-DEFAULT_RATES: Dict[str, float] = {
-    "USD": 9.75,
-    "NOK": 0.95,
-    "CAD": 7.05,
-    "EUR": 11.18,
-    "SEK": 1.0,
-}
-
-FX = {"USD": "USDSEK=X", "NOK": "NOKSEK=X", "CAD": "CADSEK=X", "EUR": "EURSEK=X"}
-
-
-def _get_or_create_rates_ws():
-    ss = get_spreadsheet()
+def _ensure_rates_sheet():
     try:
-        return _with_backoff(ss.worksheet, RATES_SHEET_NAME)
+        df = ws_read_df(RATES_SHEET)
+        if df.empty or "Valuta" not in df.columns or "Kurs" not in df.columns:
+            base = pd.DataFrame([["Valuta","Kurs"]], columns=["Valuta","Kurs"]).iloc[0:0]
+            ws_write_df(RATES_SHEET, pd.DataFrame([["Valuta","Kurs"]], columns=["Valuta","Kurs"]).iloc[0:0])
+            ws_write_df(RATES_SHEET, pd.DataFrame([["USD", DEFAULT_RATES["USD"]],
+                                                   ["NOK", DEFAULT_RATES["NOK"]],
+                                                   ["CAD", DEFAULT_RATES["CAD"]],
+                                                   ["EUR", DEFAULT_RATES["EUR"]],
+                                                   ["SEK", 1.0]], columns=["Valuta","Kurs"]))
     except Exception:
-        ws = _with_backoff(ss.add_worksheet, title=RATES_SHEET_NAME, rows=20, cols=5)
-        body = [["Valuta", "Kurs"]]
-        for k in ["USD", "NOK", "CAD", "EUR", "SEK"]:
-            body.append([k, str(DEFAULT_RATES[k])])
-        _with_backoff(ws.update, body)
-        return ws
-
-
-def _to_float(x) -> float:
-    try:
-        if isinstance(x, str):
-            return float(x.replace(",", ".").strip())
-        return float(x)
-    except Exception:
-        return 0.0
-
+        pass
 
 @st.cache_data(ttl=600, show_spinner=False)
 def read_rates() -> Dict[str, float]:
-    ws = _get_or_create_rates_ws()
-    rows = _with_backoff(ws.get_all_records)
-    out: Dict[str, float] = {}
-    if isinstance(rows, list):
-        for r in rows:
-            cur = str(r.get("Valuta", "")).upper().strip()
-            val = _to_float(r.get("Kurs", ""))
-            if cur:
-                out[cur] = val
-    for k, v in DEFAULT_RATES.items():
-        out.setdefault(k, v)
-    return out
-
-
-def save_rates(rates: Dict[str, float]) -> None:
-    ws = _get_or_create_rates_ws()
-    body = [["Valuta", "Kurs"]]
-    for k in ["USD", "NOK", "CAD", "EUR", "SEK"]:
-        body.append([k, str(_to_float(rates.get(k, DEFAULT_RATES[k])))])
-    _with_backoff(ws.clear)
-    _with_backoff(ws.update, body)
+    _ensure_rates_sheet()
     try:
-        read_rates.clear()  # cache bust
+        df = ws_read_df(RATES_SHEET)
+        if df.empty: return DEFAULT_RATES.copy()
+        out: Dict[str, float] = {}
+        for _, r in df.iterrows():
+            cur = str(r.get("Valuta","")).upper().strip()
+            val = str(r.get("Kurs","")).strip().replace(",",".")
+            try:
+                out[cur] = float(val)
+            except Exception:
+                continue
+        for k,v in DEFAULT_RATES.items():
+            out.setdefault(k, v)
+        return out
     except Exception:
-        pass
+        return DEFAULT_RATES.copy()
 
-
-def _yf_last(pair: str) -> float:
-    if yf is None:
-        return 0.0
-    try:
-        t = yf.Ticker(pair)
-        info = {}
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
-        px = info.get("regularMarketPrice")
-        if px is not None and _to_float(px) > 0:
-            return float(px)
-        hist = t.history(period="5d")
-        if not hist.empty and "Close" in hist.columns:
-            return float(hist["Close"].iloc[-1])
-    except Exception:
-        pass
-    return 0.0
-
+def save_rates(d: Dict[str, float]):
+    rows = []
+    for k in ["USD","NOK","CAD","EUR","SEK"]:
+        rows.append([k, float(d.get(k, DEFAULT_RATES.get(k,1.0)))])
+    ws_write_df(RATES_SHEET, pd.DataFrame(rows, columns=["Valuta","Kurs"]))
 
 def fetch_live_rates() -> Dict[str, float]:
-    cur = read_rates().copy()
-    updated = {}
-    for k, sym in FX.items():
-        val = _yf_last(sym)
-        if val > 0:
-            updated[k] = val
-    if updated:
-        cur.update(updated)
-    return cur
-
-
-def repair_rates_sheet() -> bool:
-    ws = _get_or_create_rates_ws()
+    """
+    Hämtar SEK-kurser från exchangerate.host.
+    """
+    url = "https://api.exchangerate.host/latest?base=SEK&symbols=USD,NOK,CAD,EUR,SEK"
     try:
-        rows = _with_backoff(ws.get_all_values)()
-        if not rows or rows[0][:2] != ["Valuta", "Kurs"]:
-            body = [["Valuta", "Kurs"]]
-            for k in ["USD", "NOK", "CAD", "EUR", "SEK"]:
-                body.append([k, str(DEFAULT_RATES[k])])
-            _with_backoff(ws.clear)
-            _with_backoff(ws.update, body)
-        return True
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rates = data.get("rates", {})
+        # vi vill ha X→SEK, men base=SEK returnerar SEK→X; invertera
+        out = {}
+        for c in ["USD","NOK","CAD","EUR","SEK"]:
+            v = float(rates.get(c, 0.0))
+            out[c] = (1.0 / v) if v > 0 else DEFAULT_RATES.get(c, 1.0)
+        out["SEK"] = 1.0
+        return out
     except Exception:
-        body = [["Valuta", "Kurs"]]
-        for k in ["USD", "NOK", "CAD", "EUR", "SEK"]:
-            body.append([k, str(DEFAULT_RATES[k])])
-        _with_backoff(ws.clear)
-        _with_backoff(ws.update, body)
-        return True
+        return DEFAULT_RATES.copy()

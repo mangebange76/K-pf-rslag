@@ -1,73 +1,110 @@
-from __future__ import annotations
-from typing import Tuple, Dict
+# stockapp/dividends.py
 import pandas as pd
 import numpy as np
 
-def _parse_months(s: str) -> list[int]:
-    if not s: return []
-    out=[]
-    for tok in str(s).replace(","," ").split():
+MONTHS_SV = {
+    1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"Maj",6:"Jun",
+    7:"Jul",8:"Aug",9:"Sep",10:"Okt",11:"Nov",12:"Dec"
+}
+
+def _to_float(x):
+    try:
+        s = str(x).strip().replace("\u00a0","").replace(" ","").replace(",",".")
+        if s in ("","-","nan","None"):
+            return 0.0
+        return float(s)
+    except:
         try:
-            m=int(tok)
-            if 1<=m<=12: out.append(m)
+            return float(x)
         except:
-            pass
-    return out
+            return 0.0
 
-def _parse_weights(s: str, n: int) -> list[float]:
-    if not s or str(s).strip()=="":
-        return [1.0]*n
-    vals=[]
-    for tok in str(s).replace(","," ").split():
-        try: vals.append(float(tok))
-        except: pass
-    if len(vals)!=n:
-        return [1.0]*n
-    return vals
+def build_dividend_calendar(df_in: pd.DataFrame, rates: dict, months_forward: int = 12, write_back_schedule: bool = True):
+    df = df_in.copy()
 
-def build_dividend_calendar(df: pd.DataFrame, rates: Dict[str,float], months_forward=12, write_back_schedule=True) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame]:
-    base = df[(df["Antal aktier"]>0) & (df["Årlig utdelning"]>0)].copy()
-    if base.empty:
-        return (pd.DataFrame(), pd.DataFrame(), df)
+    # Säkerställ schemafält
+    if "Div_Frekvens/år" not in df.columns: df["Div_Frekvens/år"] = 0.0
+    if "Div_Månader"    not in df.columns: df["Div_Månader"]    = ""
+    if "Div_Vikter"     not in df.columns: df["Div_Vikter"]     = ""
 
-    today = pd.Timestamp.today().normalize()
-    month_list = [(today + pd.DateOffset(months=i)).to_period("M") for i in range(months_forward)]
+    # Default: om DA finns, anta kvartalsvis
+    df["Div_Frekvens/år"] = df["Div_Frekvens/år"].map(_to_float)
+    df.loc[df["Div_Frekvens/år"]<=0, "Div_Frekvens/år"] = 4.0
+    # Default months om tomt: Jan/Apr/Jul/Okt
+    df.loc[df["Div_Månader"].astype(str).str.strip()=="", "Div_Månader"] = "1,4,7,10"
+    df.loc[df["Div_Vikter"].astype(str).str.strip()=="",  "Div_Vikter"]  = "1,1,1,1"
 
-    det_rows=[]
-    for _, r in base.iterrows():
-        tkr = str(r["Ticker"])
-        name= str(r["Bolagsnamn"])
-        cur = str(r["Valuta"]).upper()
-        rate= float(rates.get(cur, 1.0))
-        shares = float(r["Antal aktier"])
-        annual = float(r["Årlig utdelning"])
+    det_rows = []
+    # Generera 12 månader framåt från nu
+    from datetime import datetime
+    start = datetime.today()
+    months = []
+    y, m = start.year, start.month
+    for i in range(months_forward):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            m = 1; y += 1
 
-        freq = int(float(r.get("Div_Frekvens/år",0.0)) or 0)
-        months = _parse_months(str(r.get("Div_Månader","")))
-        if freq<=0:
-            if months: freq=len(months)
-            else: freq=4; months=[3,6,9,12]
+    for _, r in df.iterrows():
+        tkr = str(r.get("Ticker","")).strip()
+        if not tkr: continue
+        namn = str(r.get("Bolagsnamn","")).strip()
+        antal = _to_float(r.get("Antal aktier",0.0))
+        valuta = str(r.get("Valuta","SEK")).strip().upper()
+        vx = float(rates.get(valuta, 1.0))
+        arlig = _to_float(r.get("Årlig utdelning",0.0))
+        freq  = int(max(1, _to_float(r.get("Div_Frekvens/år",4.0))))
 
-        if not months or len(months)!=freq:
-            months = months if months else [3,6,9,12]
-            if len(months)!=freq:
-                freq=len(months)
+        # parse månader/vikter
+        try:
+            ms = [int(x) for x in str(r.get("Div_Månader","")).replace(" ","").split(",") if str(x).strip()]
+        except:
+            ms = [1,4,7,10]
+        try:
+            ws = [float(x) for x in str(r.get("Div_Vikter","")).replace(" ","").split(",") if str(x).strip()]
+        except:
+            ws = [1,1,1,1]
+        if len(ms) != len(ws):
+            # fallback jämn viktning
+            ms = [1,4,7,10]
+            ws = [1,1,1,1]
 
-        weights = _parse_weights(str(r.get("Div_Vikter","")), freq)
-        wsum = sum(weights) if sum(weights)>0 else float(freq)
-        per_payment = [annual * (w/wsum) for w in weights]
+        wsum = sum(ws) if ws else 1.0
+        per_payment_currency = [(arlig * (w/wsum))/1.0 for w in ws]  # per aktie i bolagets valuta
 
-        for mi, m in enumerate(months):
-            # hitta alla framtida månader som matchar m
-            for p in month_list:
-                if p.month == m:
-                    gross_val = per_payment[mi] * shares
-                    sek = gross_val * rate
-                    det_rows.append([int(p.year), int(p.month), tkr, name, shares, cur, round(per_payment[mi],4), round(rate,6), round(sek,2)])
+        # expandera till månader
+        sched = {mth:0.0 for mth in range(1,13)}
+        for mon, val in zip(ms, per_payment_currency):
+            sched[int(mon)] += val
 
-    det = pd.DataFrame(det_rows, columns=["År","Månad","Ticker","Bolagsnamn","Antal aktier","Valuta","Per utbetalning (valuta)","SEK-kurs","Summa (SEK)"])
+        # skapa rader för 12 mån framåt
+        for (yy, mm) in months:
+            per_share_val = sched.get(mm, 0.0)
+            if per_share_val <= 0: continue
+            summa_sek = antal * per_share_val * vx
+            det_rows.append({
+                "År": yy,
+                "Månad": mm,
+                "Månad (sv)": MONTHS_SV.get(mm, str(mm)),
+                "Ticker": tkr,
+                "Bolagsnamn": namn,
+                "Antal aktier": antal,
+                "Valuta": valuta,
+                "Per utbetalning (valuta)": round(per_share_val, 4),
+                "SEK-kurs": round(vx, 4),
+                "Summa (SEK)": round(summa_sek, 2),
+            })
+
+    det = pd.DataFrame(det_rows)
     if det.empty:
-        return (pd.DataFrame(), pd.DataFrame(), df)
-    det["Månad (sv)"] = det["Månad"].map({1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"Maj",6:"Jun",7:"Jul",8:"Aug",9:"Sep",10:"Okt",11:"Nov",12:"Dec"})
-    summ = det.groupby(["År","Månad","Månad (sv)"], as_index=False)["Summa (SEK)"].sum().sort_values(["År","Månad"])
-    return (summ, det, df)
+        summ = pd.DataFrame(columns=["År","Månad","Månad (sv)","Summa (SEK)"])
+    else:
+        summ = det.groupby(["År","Månad","Månad (sv)"], as_index=False)["Summa (SEK)"].sum().sort_values(["År","Månad"])
+
+    df_out = df.copy()
+    if write_back_schedule:
+        # Fälten kan ha justerats; skriv tillbaka
+        pass
+
+    return summ, det, df_out

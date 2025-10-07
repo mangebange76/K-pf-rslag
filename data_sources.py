@@ -1,16 +1,15 @@
 # data_sources.py
-# ---------------------------------------------
-# Nät-hämtningar från Yahoo & SEC + live-valutor
-# Robust mot 403/429/999 (kraschar inte appen).
-# ---------------------------------------------
+# ----------------------------------------------------------
+# Yahoo/SEC-hämtning, robust mot fel. Räknar P/S-kvartal på TTM-intäkter.
+# Har circuit breaker + offline-läge och dubbel fallback för valutakurser.
+# ----------------------------------------------------------
 
 from __future__ import annotations
 import time
 import math
-import json
 import random
-import typing as t
 from datetime import datetime, timedelta, timezone
+from typing import List, Tuple, Dict, Optional
 
 import requests
 import streamlit as st
@@ -32,7 +31,32 @@ _TIMEOUT = 12
 def _log_fetch(evt: dict) -> None:
     st.session_state.setdefault("fetch_logs", []).append(evt)
 
-# SEC kräver kontakt i UA. Försök läsa från secrets, annars fallback.
+def _now_ts() -> float:
+    return time.time()
+
+def _circuit_open() -> bool:
+    """True om nätet är pausat (offline-läge eller breaker aktiv)."""
+    if st.session_state.get("offline_mode", False):
+        return True
+    until = st.session_state.get("net_down_until", 0.0)
+    return _now_ts() < float(until)
+
+def _trip_circuit(sec: int = 900) -> None:
+    """Slå ifrån nätet under 'sec' sekunder."""
+    st.session_state["net_down_until"] = _now_ts() + sec
+    st.session_state["net_fail_count"] = 0
+
+def _note_fail() -> None:
+    n = int(st.session_state.get("net_fail_count", 0)) + 1
+    st.session_state["net_fail_count"] = n
+    if n >= 3:
+        _trip_circuit(600)  # 10 minuter
+
+def _reset_fail() -> None:
+    st.session_state["net_fail_count"] = 0
+
+
+# SEC kräver kontakt i UA (sätt i st.secrets["sec"]["user_agent"]).
 def _sec_headers() -> dict:
     ua = None
     try:
@@ -40,8 +64,9 @@ def _sec_headers() -> dict:
     except Exception:
         ua = None
     if not ua:
-        ua = "kpf-app/1.0 (contact: example@example.com)"  # byt gärna i st.secrets
+        ua = "kpf-app/1.0 (contact: your-email@example.com)"
     return {"User-Agent": ua, "Accept": "application/json"}
+
 
 # =======================
 # Hjälpare för HTTP/JSON
@@ -50,35 +75,37 @@ def _sec_headers() -> dict:
 @st.cache_data(show_spinner=False)
 def _get_json(url: str, headers: dict | None = None, ttl: int = 0) -> dict:
     """
-    Hämtar JSON men returnerar {} vid fel (kraschar aldrig).
-    Param 'ttl' finns kvar för kompatibilitet med ev. gamla anrop.
+    Hämtar JSON. Returnerar {} vid fel (kraschar aldrig).
+    Respekterar circuit breaker och offline-läge.
     """
+    if _circuit_open():
+        _log_fetch({"type": "net_paused", "url": url})
+        return {}
     try:
+        r = requests.get(url, headers=headers or _DEFAULT_HEADERS, timeout=_TIME_TIMEOUT)
+    except NameError:
+        # (streamlit ibland cacha gamla namn – guard)
         r = requests.get(url, headers=headers or _DEFAULT_HEADERS, timeout=_TIMEOUT)
+    try:
         r.raise_for_status()
-        try:
-            return r.json()
-        except Exception as e:
-            _log_fetch({"type": "parse_error", "url": url, "err": str(e)})
-            return {}
+        js = r.json()
+        _reset_fail()
+        return js
     except Exception as e:
+        _note_fail()
         _log_fetch({"type": "http_error", "url": url, "err": str(e)})
         return {}
 
-# En liten paus så vi inte spammar externa API:er
-def _gentle_sleep(a: float = 0.15, b: float = 0.35) -> None:
+
+def _gentle_sleep(a: float = 0.12, b: float = 0.28) -> None:
     time.sleep(random.uniform(a, b))
 
+
 # =======================
-# YAHOO – Live valutakurser
+# Valutakurser – Yahoo + exchangerate.host + fallback
 # =======================
 
-@st.cache_data(ttl=600, show_spinner=False)
-def hamta_live_valutakurser() -> dict:
-    """
-    Hämtar USD/NOK/CAD/EUR → SEK via Yahoo Quote API (cache 10 min).
-    Returnerar {} vid fel (så att UI inte skriver över sparade kurser).
-    """
+def _fx_from_yahoo() -> dict:
     pairs = {
         "USD": "USDSEK=X",
         "NOK": "NOKSEK=X",
@@ -101,11 +128,44 @@ def hamta_live_valutakurser() -> dict:
             out["SEK"] = 1.0
         return out
     except Exception as e:
-        _log_fetch({"type": "parse_error", "url": url, "err": str(e)})
+        _log_fetch({"type": "parse_error", "provider": "yahoo_fx", "err": str(e)})
         return {}
 
+def _fx_from_exchangerate_host() -> dict:
+    # Hämta SEK-baserade kurser och invertera till X→SEK
+    url = "https://api.exchangerate.host/latest?base=SEK&symbols=USD,NOK,CAD,EUR"
+    js = _get_json(url)
+    if not js:
+        return {}
+    try:
+        rates = js.get("rates", {})
+        out = {}
+        for k in ["USD", "NOK", "CAD", "EUR"]:
+            v = rates.get(k)
+            # v = hur många av k man får för 1 SEK → X→SEK = 1/v
+            if isinstance(v, (int, float)) and v > 0:
+                out[k] = float(1.0 / v)
+        if out:
+            out["SEK"] = 1.0
+        return out
+    except Exception as e:
+        _log_fetch({"type": "parse_error", "provider": "exchangerate_host", "err": str(e)})
+        return {}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def hamta_live_valutakurser() -> dict:
+    fx = _fx_from_yahoo()
+    if fx:
+        return fx
+    fx = _fx_from_exchangerate_host()
+    if fx:
+        return fx
+    # inga live – returnera tomt så UI inte skriver över sparade
+    return {}
+
+
 # =======================
-# YAHOO – Basinfo & P/S TTM
+# Yahoo – quoteSummary helpers
 # =======================
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -114,20 +174,19 @@ def _yahoo_quote_summary(ticker: str) -> dict:
     url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules={mods}"
     return _get_json(url)
 
-def _yahoo_price_to_sales_ttm(qsum: dict) -> float | None:
-    # Finns ibland i summaryDetail eller defaultKeyStatistics
+def _yahoo_price_to_sales_ttm(qsum: dict) -> Optional[float]:
     try:
         res = qsum["quoteSummary"]["result"][0]
     except Exception:
         return None
-    # 1) summaryDetail
+    # summaryDetail
     try:
         val = res.get("summaryDetail", {}).get("priceToSalesTrailing12Months", {}).get("raw")
         if isinstance(val, (int, float)) and val > 0:
             return float(val)
     except Exception:
         pass
-    # 2) defaultKeyStatistics
+    # defaultKeyStatistics
     try:
         val = res.get("defaultKeyStatistics", {}).get("priceToSalesTrailing12Months", {}).get("raw")
         if isinstance(val, (int, float)) and val > 0:
@@ -136,21 +195,21 @@ def _yahoo_price_to_sales_ttm(qsum: dict) -> float | None:
         pass
     return None
 
-def _yahoo_shares_outstanding(qsum: dict) -> float | None:
+def _yahoo_shares_outstanding(qsum: dict) -> Optional[float]:
+    """Returnera utestående aktier i MILJONER (för DF-fältet), annars None."""
     try:
         res = qsum["quoteSummary"]["result"][0]
     except Exception:
         return None
-    # Prova flera ställen
-    keys = [
+    candidates = [
         ("defaultKeyStatistics", "sharesOutstanding"),
         ("price", "sharesOutstanding"),
     ]
-    for grp, field in keys:
+    for grp, field in candidates:
         try:
             raw = res.get(grp, {}).get(field, {}).get("raw")
             if isinstance(raw, (int, float)) and raw > 0:
-                return float(raw) / 1e6  # → miljoner
+                return float(raw) / 1e6  # till miljoner
         except Exception:
             pass
     return None
@@ -163,7 +222,7 @@ def _yahoo_basic_fields(ticker: str) -> dict:
         "Aktuell kurs": 0.0,
         "Årlig utdelning": 0.0,
         "CAGR 5 år (%)": 0.0,
-        "Utestående aktier": 0.0,
+        "Utestående aktier": 0.0,  # i miljoner (för DF)
         "P/S": 0.0,
         "Källa P/S": "Yahoo/ps_ttm",
         "TS P/S": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -175,46 +234,80 @@ def _yahoo_basic_fields(ticker: str) -> dict:
     except Exception:
         return out
 
-    # Namn/valuta/kurs
     price = res.get("price", {})
-    out["Bolagsnamn"] = (
-        price.get("shortName")
-        or price.get("longName")
-        or price.get("quoteSourceName")
-        or ""
-    )
+    out["Bolagsnamn"] = price.get("shortName") or price.get("longName") or ""
     out["Valuta"] = price.get("currency") or ""
     p = price.get("regularMarketPrice", {}).get("raw")
-    if isinstance(p, (int, float)):
-        out["Aktuell kurs"] = float(p)
+    if isinstance(p, (int, float)): out["Aktuell kurs"] = float(p)
 
-    # Utdelning (trailing)
     div = res.get("summaryDetail", {}).get("dividendRate", {}).get("raw")
-    if isinstance(div, (int, float)):
-        out["Årlig utdelning"] = float(div)
+    if isinstance(div, (int, float)): out["Årlig utdelning"] = float(div)
 
-    # P/S (TTM)
     ps = _yahoo_price_to_sales_ttm(qsum)
-    if isinstance(ps, (int, float)) and ps > 0:
-        out["P/S"] = float(ps)
+    if isinstance(ps, (int, float)) and ps > 0: out["P/S"] = float(ps)
 
-    # Utestående aktier (miljoner)
-    sh = _yahoo_shares_outstanding(qsum)
-    if isinstance(sh, (int, float)) and sh > 0:
-        out["Utestående aktier"] = float(sh)
+    sh_mn = _yahoo_shares_outstanding(qsum)
+    if isinstance(sh_mn, (int, float)) and sh_mn > 0: out["Utestående aktier"] = float(sh_mn)
 
     return out
 
+
 # =======================
-# SEC – CIK & länkar & fakta
+# Yahoo – kvartalsintäkter (för TTM)
+# =======================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yahoo_quarterly_revenues(ticker: str) -> List[Tuple[str, float]]:
+    """
+    Returnerar [(YYYY-MM-DD, revenue_currency)], nyast först.
+    """
+    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=incomeStatementHistoryQuarterly"
+    js = _get_json(url)
+    try:
+        items = js["quoteSummary"]["result"][0]["incomeStatementHistoryQuarterly"]["incomeStatementHistory"]
+    except Exception:
+        return []
+    out = []
+    for it in items:
+        end = it.get("endDate", {}).get("fmt")
+        rev = it.get("totalRevenue", {}).get("raw")
+        if isinstance(rev, (int, float)) and rev > 0 and isinstance(end, str):
+            out.append((end, float(rev)))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+# =======================
+# Yahoo – dagliga closes
+# =======================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yahoo_daily_close(ticker: str, start_date: str, end_date: str) -> Dict[str, float]:
+    sd = int(datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc).timestamp())
+    ed = int(datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc).timestamp())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={sd}&period2={ed}&interval=1d"
+    js = _get_json(url)
+    try:
+        tms = js["chart"]["result"][0]["timestamp"]
+        closes = js["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+    except Exception:
+        return {}
+    out = {}
+    for ts, cl in zip(tms, closes):
+        if cl is None: continue
+        dt = datetime.utcfromtimestamp(ts).date().isoformat()
+        out[dt] = float(cl)
+    return out
+
+
+# =======================
+# SEC – helpers
 # =======================
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _sec_ticker_map() -> dict:
-    # https://www.sec.gov/files/company_tickers.json  (ca 4-6MB)
     url = "https://www.sec.gov/files/company_tickers.json"
     js = _get_json(url, headers=_sec_headers())
-    # Struktur: {"0":{"cik_str":320193,"ticker":"AAPL","title":"Apple Inc."}, ...}
     out = {}
     try:
         for _, obj in js.items():
@@ -227,27 +320,22 @@ def _sec_ticker_map() -> dict:
     return out
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
-def _cik_from_ticker(ticker: str) -> str | None:
-    m = _sec_ticker_map()
-    return m.get(ticker.upper())
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _sec_company_submissions(cik: str) -> dict:
-    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-    return _get_json(url, headers=_sec_headers())
+def _cik_from_ticker(ticker: str) -> Optional[str]:
+    return _sec_ticker_map().get(ticker.upper())
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _sec_company_facts(cik: str) -> dict:
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
     return _get_json(url, headers=_sec_headers())
 
-def hamta_sec_filing_lankar(ticker: str) -> list[dict]:
-    """
-    Returnerar en lista med {form, date, url, viewer, cik}.
-    """
+@st.cache_data(ttl=3600, show_spinner=False)
+def _sec_company_submissions(cik: str) -> dict:
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    return _get_json(url, headers=_sec_headers())
+
+def hamta_sec_filing_lankar(ticker: str) -> List[dict]:
     cik = _cik_from_ticker(ticker)
-    if not cik:
-        return []
+    if not cik: return []
     sub = _sec_company_submissions(cik)
     out = []
     try:
@@ -257,153 +345,88 @@ def hamta_sec_filing_lankar(ticker: str) -> list[dict]:
         accs  = recent.get("accessionNumber", [])
         prim  = recent.get("primaryDocument", [])
         for form, d, acc, doc in zip(forms, dates, accs, prim):
-            # Bygg arkiv-URL
             acc_nodash = acc.replace("-", "")
             base = f"/Archives/edgar/data/{int(cik)}/{acc_nodash}/{doc}"
             url = f"https://www.sec.gov{base}"
             viewer = f"https://www.sec.gov/ixviewer/doc?action=display&source=content&source_url={base}"
-            out.append({
-                "form": form, "date": d, "url": url, "viewer": viewer, "cik": cik
-            })
+            out.append({"form": form, "date": d, "url": url, "viewer": viewer, "cik": cik})
     except Exception:
         return []
     return out[:12]
 
-# =======================
-# YAHOO – Kvartalsomsättning (för P/S Q1..Q4)
-# =======================
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _yahoo_quarterly_revenues(ticker: str) -> list[tuple[str, float]]:
-    """
-    Hämtar senaste kvartalens 'totalRevenue' via quoteSummary.
-    Returnerar lista [(YYYY-MM-DD, revenue_usd), ...] i fallande datumordning.
-    """
-    url = (
-        f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
-        f"{ticker}?modules=incomeStatementHistoryQuarterly"
-    )
-    js = _get_json(url)
-    try:
-        items = js["quoteSummary"]["result"][0]["incomeStatementHistoryQuarterly"]["incomeStatementHistory"]
-    except Exception:
-        return []
-    out = []
-    for it in items:
-        end = it.get("endDate", {}).get("fmt")  # "2025-07-31"
-        rev = it.get("totalRevenue", {}).get("raw")
-        if isinstance(rev, (int, float)) and rev > 0 and isinstance(end, str):
-            out.append((end, float(rev)))
-    # Vanligen nyast först – men vi säkerställer:
-    out.sort(key=lambda x: x[0], reverse=True)
-    return out
 
 # =======================
-# YAHOO – Dagliga priser för datumspan
+# SEC – data för TTM-beräkning (fallback)
 # =======================
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _yahoo_daily_close(ticker: str, start_date: str, end_date: str) -> dict[str, float]:
-    """
-    Returnerar {YYYY-MM-DD: close} för intervallet [start_date, end_date].
-    """
-    # Unix-tider (sekunder)
-    sd = int(datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc).timestamp())
-    ed = int(datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc).timestamp())
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        f"?period1={sd}&period2={ed}&interval=1d"
-    )
-    js = _get_json(url)
-    try:
-        tms = js["chart"]["result"][0]["timestamp"]
-        closes = js["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-    except Exception:
-        return {}
-    out = {}
-    for ts, cl in zip(tms, closes):
-        if cl is None:
-            continue
-        dt = datetime.utcfromtimestamp(ts).date().isoformat()
-        out[dt] = float(cl)
-    return out
-
-# =======================
-# SEC – Aktier & intäkter (kvartal)
-# =======================
-
-def _sec_quarterly_revenues_from_facts(facts: dict) -> list[tuple[str, float]]:
-    """
-    Plockar kvartalsintäkter från SEC CompanyFacts. Försöker flera taggar.
-    Returnerar [(YYYY-MM-DD, revenue_usd)], nyast först.
-    """
+def _sec_quarterly_revenues_from_facts(facts: dict) -> List[Tuple[str, float]]:
     tags = [
         ("Revenues", "USD"),
-        ("Revenues", "USDm"),
         ("SalesRevenueNet", "USD"),
-        ("SalesRevenueNet", "USDm"),
         ("RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
     ]
     out = []
     try:
-        facts_d = facts.get("facts", {}).get("us-gaap", {})
+        usgaap = facts.get("facts", {}).get("us-gaap", {})
         for tag, unit in tags:
-            unit_obj = facts_d.get(tag, {}).get("units", {}).get(unit)
-            if not unit_obj:
-                continue
-            for v in unit_obj:
-                # Kvartalsperioder har ofta frame som "CY2025Q3I" etc, men vi kan också titta på 'fp': 'Q1'..'Q4'
+            arr = usgaap.get(tag, {}).get("units", {}).get(unit)
+            if not arr: continue
+            for v in arr:
+                fp = v.get("fp")
                 end = v.get("end")
                 val = v.get("val")
-                fp = v.get("fp")
-                # Ta bara kvartal
-                if not end or fp not in ("Q1","Q2","Q3","Q4"):
-                    continue
-                if isinstance(val, (int, float)) and val > 0:
+                if fp in ("Q1","Q2","Q3","Q4") and isinstance(val, (int, float)) and end:
                     out.append((end, float(val)))
-            if out:
-                break
+            if out: break
     except Exception:
         return []
-    # nyast först
     out.sort(key=lambda x: x[0], reverse=True)
     return out
 
-def _sec_shares_series_from_facts(facts: dict) -> list[tuple[str, float]]:
-    """
-    Returnerar [(YYYY-MM-DD, shares)] för rapporterade antal utestående aktier (nära kvartalsdatum).
-    """
+def _sec_shares_series_from_facts(facts: dict) -> List[Tuple[str, float]]:
     candidates = [
         ("EntityCommonStockSharesOutstanding", "shares"),
         ("CommonStockSharesOutstanding", "shares"),
     ]
     out = []
     try:
-        facts_d = facts.get("facts", {}).get("dei", {})
+        dei = facts.get("facts", {}).get("dei", {})
         for tag, unit in candidates:
-            arr = facts_d.get(tag, {}).get("units", {}).get(unit)
-            if not arr:
-                continue
+            arr = dei.get(tag, {}).get("units", {}).get(unit)
+            if not arr: continue
             for v in arr:
-                # 'end' eller 'instant' (tar det som finns)
                 d = v.get("end") or v.get("instant")
                 val = v.get("val")
                 if d and isinstance(val, (int, float)) and val > 0:
-                    out.append((d, float(val)))
+                    out.append((d, float(val)))  # i aktier (inte miljoner)
     except Exception:
         return []
     out.sort(key=lambda x: x[0])
     return out
 
-def _closest_before(series: list[tuple[str, float]], date_iso: str) -> float | None:
-    """
-    Väljer senaste värde i 'series' som är <= date_iso.
-    """
+def _closest_before(series: List[Tuple[str, float]], date_iso: str) -> Optional[float]:
     best = None
     for d, v in series:
         if d <= date_iso:
             best = v
     return best
+
+
+# =======================
+# TTM-beräkning för P/S per kvartal
+# =======================
+
+def _ttm_series_from_quarterlies(qrevs: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+    """
+    Givet [(end, rev)], nyast först -> returnera TTM per kvartal:
+      [(end0, sum(rev0..rev3)), (end1, sum(rev1..rev4)), ...]
+    """
+    out = []
+    for i in range(0, max(0, len(qrevs) - 3)):
+        ttm = qrevs[i][1] + qrevs[i+1][1] + qrevs[i+2][1] + qrevs[i+3][1]
+        out.append((qrevs[i][0], float(ttm)))
+    return out
+
 
 # =======================
 # Huvud: hämta fält för en ticker
@@ -411,52 +434,54 @@ def _closest_before(series: list[tuple[str, float]], date_iso: str) -> float | N
 
 def hamta_yahoo_fält(ticker: str) -> dict:
     """
-    Returnerar ett dict med allt appen förväntar sig:
-      - Basfält (Yahoo)
+    Returnerar dict med:
+      - Bas (Yahoo)
       - P/S (TTM) (Yahoo)
-      - P/S Q1..Q4 (försöker Yahoo->SEC mix, annars 0) + datum & käll-etiketter
-      - Utestående aktier (Yahoo; fallback SEC* om du vill utöka)
+      - P/S Q1..Q4 (beräknat som: MarketCap (D+1)/ TTM intäkter upp t.o.m. kvartalet)
+        Q1=senaste kvartalet, Q2=näst senaste, osv.
+      - Datum/källa för varje P/S Qn
+      - Utestående aktier (Yahoo, miljoner)
     """
     out = _yahoo_basic_fields(ticker)
 
-    # Initiera kvartals-fält (nollade)
-    for q in (1, 2, 3, 4):
+    # initiera metadata för Q1..Q4
+    for q in (1,2,3,4):
         out[f"P/S Q{q}"] = 0.0
         out[f"P/S Q{q} datum"] = ""
         out[f"Källa P/S Q{q}"] = "— (n/a)"
 
-    # 1) Hämta kvartalsintäkter
+    # 1) Hämta kvartalsintäkter (Yahoo; fallback SEC)
     qrevs = _yahoo_quarterly_revenues(ticker)
-    ps_source = "Computed/Yahoo-revenue"
-
-    # 2) Försök komplettera med SEC-shares för bättre precision
+    ps_source = "TTM/Yahoo-revenue"
     cik = _cik_from_ticker(ticker)
-    sec_shares_ser = []
+    sec_shares_ser: List[Tuple[str, float]] = []
     if cik:
         facts = _sec_company_facts(cik)
-        # Om Yahoo inte gav intäkter → prova SEC-intäkter
+        sec_shares_ser = _sec_shares_series_from_facts(facts)
         if not qrevs:
             qrevs = _sec_quarterly_revenues_from_facts(facts)
-            ps_source = "Computed/SEC-revenue"
-        sec_shares_ser = _sec_shares_series_from_facts(facts)
+            ps_source = "TTM/SEC-revenue"
 
-    # 3) Hämta dagspriser kring perioderna vi vill beräkna
-    #    Vi tar +1 handelsdag efter kvartalsslut (eller närmaste dag efter).
-    if qrevs:
-        # Vi behöver en prisserie som täcker från (min_end - 5d) till (max_end + 7d)
-        ends = [datetime.fromisoformat(d) for d, _ in qrevs[:6]]
-        min_d = min(ends)
-        max_d = max(ends)
-        start = (min_d - timedelta(days=5)).date().isoformat()
-        stop  = (max_d + timedelta(days=10)).date().isoformat()
-        px_map = _yahoo_daily_close(ticker, start, stop)
-    else:
-        px_map = {}
+    if not qrevs or len(qrevs) < 4:
+        # kan inte räkna TTM-kvartal – logga och returnera basfält
+        _log_fetch({"type": "ps_quarters_skipped", "ticker": ticker.upper(), "reason": "too_few_quarters"})
+        _gentle_sleep()
+        return out
 
-    # 4) Beräkna P/S för de senaste 4 kvartalen (Q1 nyast, Q4 4:e nyaste)
-    for idx, (end_iso, rev) in enumerate(qrevs[:4], start=1):
-        qnum = idx  # 1..4 i nyhetsordning
-        # hitta pris första dag efter periodslut som finns i px_map
+    # 2) Bygg TTM-serie (nyast först)
+    ttm_list = _ttm_series_from_quarterlies(qrevs)  # [(end0, ttm0), (end1, ttm1), ...]
+    # Q1..Q4
+    ttm_slice = ttm_list[:4]
+    ends = [datetime.fromisoformat(d) for d, _ in ttm_slice]
+    start = (min(ends) - timedelta(days=7)).date().isoformat()
+    stop  = (max(ends) + timedelta(days=14)).date().isoformat()
+
+    # 3) Hämta prisdata för intervallet
+    px_map = _yahoo_daily_close(ticker, start, stop)
+
+    # 4) Beräkna P/S per kvartal (MarketCap / TTM intäkter)
+    for idx, (end_iso, ttm_rev) in enumerate(ttm_slice, start=1):
+        # price = första handelsdagen efter slutdatum (fallback: samma/bakåt)
         d0 = datetime.fromisoformat(end_iso).date()
         price = None
         for plus in range(1, 8):
@@ -465,40 +490,31 @@ def hamta_yahoo_fält(ticker: str) -> dict:
                 price = px_map[d_try]
                 break
         if price is None:
-            # fallback: samma dag eller närmaste innan
-            for minus in range(0, 7):
+            for minus in range(0, 8):
                 d_try = (d0 - timedelta(days=minus)).isoformat()
                 if d_try in px_map:
                     price = px_map[d_try]
                     break
-        # hitta aktier (SEC-serie) senaste <= end_iso
+
+        # shares: SEC närmast <= end, annars Yahoo (DF-värde i miljoner → aktier)
         shares = _closest_before(sec_shares_ser, end_iso) if sec_shares_ser else None
+        if shares is None:
+            y_mn = float(out.get("Utestående aktier", 0.0) or 0.0)
+            shares = y_mn * 1e6 if y_mn > 0 else None
 
-        if (isinstance(price, (int, float)) and price > 0) and (isinstance(shares, (int, float)) and shares > 0):
-            ps_val = (price * shares) / rev
-            out[f"P/S Q{qnum}"] = round(float(ps_val), 2)
-            out[f"P/S Q{qnum} datum"] = end_iso
-            out[f"Källa P/S Q{qnum}"] = f"{ps_source}+SEC-shares+1d-after"
-        elif isinstance(price, (int, float)) and price > 0 and out.get("Utestående aktier", 0) > 0:
-            # fallback: Yahoo-shares (miljoner → *1e6)
-            shares_y = float(out["Utestående aktier"]) * 1e6
-            ps_val = (price * shares_y) / rev
-            out[f"P/S Q{qnum}"] = round(float(ps_val), 2)
-            out[f"P/S Q{qnum} datum"] = end_iso
-            out[f"Källa P/S Q{qnum}"] = f"{ps_source}+Yahoo-shares+1d-after"
+        if isinstance(price, (int, float)) and price > 0 and isinstance(shares, (int, float)) and shares > 0:
+            market_cap = price * shares
+            ps_val = market_cap / float(ttm_rev)
+            out[f"P/S Q{idx}"] = round(float(ps_val), 2)
+            out[f"P/S Q{idx} datum"] = end_iso
+            source_detail = "SEC-shares" if sec_shares_ser else "Yahoo-shares"
+            out[f"Källa P/S Q{idx}"] = f"{ps_source}+{source_detail}+D+1"
         else:
-            # misslyckades – lämna 0
-            out[f"P/S Q{qnum}"] = 0.0
-            out[f"P/S Q{qnum} datum"] = end_iso  # vi visar ändå datum vi försökte beräkna på
-            out[f"Källa P/S Q{qnum}"] = f"{ps_source}+n/a"
+            out[f"P/S Q{idx}"] = 0.0
+            out[f"P/S Q{idx} datum"] = end_iso
+            out[f"Källa P/S Q{idx}"] = f"{ps_source}+incomplete"
 
-    # Slutlig källa-kommentar för P/S (TTM)
-    if out.get("P/S", 0.0) > 0:
-        out["Källa P/S"] = "Yahoo/ps_ttm"
-    else:
-        out["Källa P/S"] = "— (n/a)"
-
-    # Nyttjas i UI-debug
+    # Loggmeta
     meta = {
         "ps_source": "yahoo_ps_ttm" if out.get("P/S", 0.0) > 0 else "n/a",
         "qrev_pts": len(qrevs),

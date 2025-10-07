@@ -309,8 +309,16 @@ def hamta_ps_kvartal(ticker: str) -> dict:
         "Källa P/S":"", "Källa P/S Q1":"", "Källa P/S Q2":"", "Källa P/S Q3":"", "Källa P/S Q4":"",
         "_DEBUG_PS": {}
     }
+    # cutoff-år (default 6) kan styras i secrets
+    try:
+        SEC_CUTOFF_YEARS = int(st.secrets.get("SEC_CUTOFF_YEARS", 6))
+    except Exception:
+        SEC_CUTOFF_YEARS = 6
+    cutoff_ts = pd.Timestamp.today().tz_localize(None) - pd.DateOffset(years=SEC_CUTOFF_YEARS)
+
     dbg = {"ticker": ticker, "ps_source": "-", "q_cols": 0, "ttm_points": 0, "price_hits": 0,
-           "sec_cik": None, "sec_shares_pts": 0, "sec_rev_pts": 0}
+           "sec_cik": None, "sec_shares_pts": 0, "sec_rev_pts": 0, "sec_rev_pts_after_cutoff": 0,
+           "cutoff_years": SEC_CUTOFF_YEARS}
     try:
         t = yf.Ticker(ticker)
         info = {}
@@ -351,8 +359,14 @@ def hamta_ps_kvartal(ticker: str) -> dict:
             for i, (lab_ps, lab_dt, lab_src) in enumerate(labels):
                 if i >= len(cols): break
                 c = cols[i]
+                # hoppa över om för gammalt
+                if c < cutoff_ts:
+                    continue
+
                 window_vals = []
                 for j in range(i, min(i+4, len(cols))):
+                    if cols[j] < cutoff_ts:
+                        break
                     window_vals.append(rev_map.get(cols[j], float("nan")))
                 if len(window_vals) < 4 or any(pd.isna(x) for x in window_vals):
                     continue
@@ -394,8 +408,15 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                 if facts:
                     shares_map = _extract_shares_history(facts)
                     dbg["sec_shares_pts"] = len(shares_map)
+
                     sec_quarters = _extract_sec_quarter_revenues(facts)  # [(ts, val)] nyast->äldst
                     dbg["sec_rev_pts"] = len(sec_quarters)
+                    # ---- NYTT: filtrera bort för gamla kvartal ----
+                    try:
+                        sec_quarters = [(ts, v) for ts, v in sec_quarters if ts >= cutoff_ts]
+                    except Exception:
+                        pass
+                    dbg["sec_rev_pts_after_cutoff"] = len(sec_quarters)
 
                     if sec_quarters:
                         labels = [("P/S Q1","P/S Q1 datum","Källa P/S Q1"),
@@ -408,6 +429,8 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                             if i >= len(sec_quarters):
                                 break
                             end_ts, _ = sec_quarters[i]
+                            if end_ts < cutoff_ts:
+                                continue
                             window = sec_quarters[i:i+4]
                             if len(window) < 4:
                                 continue
@@ -528,11 +551,13 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         log["sec"]["cik"] = log["ps"].get("sec_cik")
         log["sec"]["shares_points"] = log["ps"].get("sec_shares_pts", 0)
         log["sec"]["rev_points"] = log["ps"].get("sec_rev_pts", 0)
+        log["sec"]["rev_points_after_cutoff"] = log["ps"].get("sec_rev_pts_after_cutoff", 0)
         log["summary"] = (
             f"kurs:{log['yahoo'].get('got_price_from','-')}, ps_src:{log['ps'].get('ps_source','-')}, "
             f"qcols:{log['ps'].get('q_cols',0)}, ttm_pts:{log['ps'].get('ttm_points',0)}, "
             f"px_hits:{log['ps'].get('price_hits',0)}, sec_shares:{log['ps'].get('sec_shares_pts',0)}, "
-            f"sec_rev:{log['ps'].get('sec_rev_pts',0)}"
+            f"sec_rev:{log['ps'].get('sec_rev_pts',0)}/{log['ps'].get('sec_rev_pts_after_cutoff',0)} "
+            f"(cutoff {log['ps'].get('cutoff_years',6)}y)"
         )
     except Exception as e:
         log["error"] = str(e)

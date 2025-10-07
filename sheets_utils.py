@@ -1,157 +1,143 @@
 # sheets_utils.py
 from __future__ import annotations
 import time
-from datetime import datetime
-import streamlit as st
 import pandas as pd
+import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- Lokal Stockholm-tid om pytz finns (annars systemtid) ---
-try:
-    import pytz
-    TZ_STHLM = pytz.timezone("Europe/Stockholm")
-    def now_stamp() -> str:
-        return datetime.now(TZ_STHLM).strftime("%Y-%m-%d %H:%M")
-except Exception:
-    def now_stamp() -> str:
-        return datetime.now().strftime("%Y-%m-%d %H:%M")
+# -------------------- Konfig --------------------
+SHEET_URL = st.secrets.get("SHEET_URL", "")
+SHEET_NAME = st.secrets.get("SHEET_NAME", "Blad1")
+RATES_SHEET_NAME = st.secrets.get("RATES_SHEET_NAME", "Valutakurser")
 
-# --- Google Sheets-koppling ---
-SHEET_URL = st.secrets["SHEET_URL"]
-MAIN_SHEET_NAME = "Blad1"
-RATES_SHEET_NAME = "Valutakurser"
-LOGS_SHEET_NAME = "LOGS"
-PROPOSALS_SHEET_NAME = "FÖRSLAG"
+DEFAULT_RATES = {"USD": 9.75, "EUR": 11.18, "NOK": 0.95, "CAD": 7.05, "SEK": 1.0}
 
-scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
-_client = gspread.authorize(credentials)
+# Minimalt kolumnschema (inkl. nya källa-/TS-fält och datum per PSQ)
+MAIN_COLS = [
+    "Ticker","Bolagsnamn","Utestående aktier","Antal aktier",
+    "Valuta","Aktuell kurs","Årlig utdelning","CAGR 5 år (%)",
+    "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
+    "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
+    "Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4",
+    "Källa Aktuell kurs","Källa Utestående aktier","TS P/S","TS Utestående aktier",
+    "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
+    "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
+    "Senast manuellt uppdaterad","Senast auto uppdaterad",
+]
+
+# -------------------- Google Sheets klient --------------------
+def _client():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_info = st.secrets.get("GOOGLE_CREDENTIALS", {})
+    if not creds_info:
+        raise RuntimeError("Saknar GOOGLE_CREDENTIALS i secrets.")
+    credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
+    return gspread.authorize(credentials)
 
 def _with_backoff(func, *args, **kwargs):
-    delays = [0, 0.5, 1.0, 2.0]
-    last_err = None
+    delays = [0, 0.5, 1, 2]
+    last = None
     for d in delays:
         if d: time.sleep(d)
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            last_err = e
-    raise last_err
+            last = e
+    raise last
 
-def _get_spreadsheet():
-    return _client.open_by_url(SHEET_URL)
+def _spreadsheet():
+    if not SHEET_URL:
+        raise RuntimeError("Saknar SHEET_URL i secrets.")
+    return _with_backoff(_client().open_by_url, SHEET_URL)
 
-def _get_or_create_ws(title: str, rows: int = 100, cols: int = 30):
-    ss = _get_spreadsheet()
+def _main_ws():
+    ss = _spreadsheet()
     try:
-        return ss.worksheet(title)
+        return ss.worksheet(SHEET_NAME)
     except Exception:
-        ss.add_worksheet(title=title, rows=rows, cols=cols)
-        return ss.worksheet(title)
+        ws = ss.add_worksheet(title=SHEET_NAME, rows=2000, cols=len(MAIN_COLS)+5)
+        _with_backoff(ws.update, [MAIN_COLS])
+        return ws
 
-# --- Valutakurser: standardvärden & CRUD ---
-STANDARD_VALUTAKURSER = {"USD": 9.75, "NOK": 0.95, "CAD": 7.05, "EUR": 11.18, "SEK": 1.0}
+def _rates_ws():
+    ss = _spreadsheet()
+    try:
+        return ss.worksheet(RATES_SHEET_NAME)
+    except Exception:
+        ws = ss.add_worksheet(title=RATES_SHEET_NAME, rows=20, cols=3)
+        _with_backoff(ws.update, [["Valuta","Kurs"]]+[[k, DEFAULT_RATES[k]] for k in ["USD","EUR","NOK","CAD","SEK"]])
+        return ws
 
-@st.cache_data(show_spinner=False)
-def las_sparade_valutakurser_cached(nonce: int):
-    ws = _get_or_create_ws(RATES_SHEET_NAME, rows=10, cols=5)
+# -------------------- Huvud-DF till/från Sheets --------------------
+def hamta_data() -> pd.DataFrame:
+    ws = _main_ws()
     rows = _with_backoff(ws.get_all_records)
-    out = {}
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame({c: [] for c in MAIN_COLS})
+    # säkerställ kolumnerna
+    for c in MAIN_COLS:
+        if c not in df.columns:
+            df[c] = "" if c in ["Ticker","Bolagsnamn","Valuta","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4","Källa Aktuell kurs","Källa Utestående aktier","P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum","Senast manuellt uppdaterad","Senast auto uppdaterad","TS P/S","TS Utestående aktier"] else 0.0
+    # typning
+    num_cols = ["Utestående aktier","Antal aktier","Aktuell kurs","Årlig utdelning","CAGR 5 år (%)",
+                "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
+                "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
+                "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in ["Ticker","Bolagsnamn","Valuta","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4",
+              "Källa Aktuell kurs","Källa Utestående aktier","P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
+              "Senast manuellt uppdaterad","Senast auto uppdaterad","TS P/S","TS Utestående aktier"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+    return df[MAIN_COLS]
+
+def spara_data(df: pd.DataFrame) -> None:
+    ws = _main_ws()
+    # se till att alla kolumner finns och i rätt ordning
+    for c in MAIN_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[MAIN_COLS]
+    _with_backoff(ws.clear)
+    values = [df.columns.tolist()] + df.astype(str).values.tolist()
+    _with_backoff(ws.update, values)
+
+# -------------------- Valutakurser --------------------
+@st.cache_data(show_spinner=False)
+def las_sparade_valutakurser() -> dict:
+    ws = _rates_ws()
+    rows = _with_backoff(ws.get_all_records)
+    out = {"SEK": 1.0}
     for r in rows:
         cur = str(r.get("Valuta","")).upper().strip()
         val = str(r.get("Kurs","")).replace(",", ".").strip()
         try:
             out[cur] = float(val)
-        except:
+        except Exception:
             pass
+    # defaults om saknas
+    for k,v in DEFAULT_RATES.items():
+        out.setdefault(k, v)
     return out
 
-def las_sparade_valutakurser() -> dict:
-    return las_sparade_valutakurser_cached(st.session_state.get("rates_reload", 0)) or STANDARD_VALUTAKURSER.copy()
-
-def spara_valutakurser(rates: dict):
-    ws = _get_or_create_ws(RATES_SHEET_NAME, rows=10, cols=5)
+def spara_valutakurser(rates: dict) -> None:
+    ws = _rates_ws()
     body = [["Valuta","Kurs"]]
     for k in ["USD","NOK","CAD","EUR","SEK"]:
-        v = rates.get(k, STANDARD_VALUTAKURSER.get(k, 1.0))
-        body.append([k, str(v)])
+        body.append([k, float(rates.get(k, DEFAULT_RATES.get(k, 1.0)))])
     _with_backoff(ws.clear)
     _with_backoff(ws.update, body)
+    st.cache_data.clear()  # så sidebar läser om
 
-def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
+def hamta_valutakurs(valuta: str, user_rates: dict | None = None) -> float:
     if not valuta:
         return 1.0
-    return user_rates.get(valuta.upper(), STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0))
-
-# --- Data (huvudblad) ---
-def _ensure_main_sheet_and_header():
-    ws = _get_or_create_ws(MAIN_SHEET_NAME, rows=2000, cols=40)
-    try:
-        vals = _with_backoff(ws.get_all_values)
-        if not vals:
-            return ws
-        if vals and vals[0]:
-            return ws
-    except Exception:
-        pass
-    return ws
-
-def hamta_data() -> pd.DataFrame:
-    ws = _ensure_main_sheet_and_header()
-    recs = _with_backoff(ws.get_all_records)
-    return pd.DataFrame(recs)
-
-def spara_data(df: pd.DataFrame):
-    ws = _get_or_create_ws(MAIN_SHEET_NAME, rows=max(100, len(df)+10), cols=max(40, len(df.columns)+2))
-    _with_backoff(ws.clear)
-    _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
-
-# --- Snapshot vid uppstart ---
-def _today_tag() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
-
-def skapa_snapshot_om_saknas(df: pd.DataFrame):
-    ss = _get_spreadsheet()
-    tag = _today_tag()
-    existing = [ws.title for ws in ss.worksheets()]
-    has_today = any(t.startswith(f"SNAP_{tag}") for t in existing)
-    if has_today:
-        return False, "Snapshot för idag finns redan."
-    title = f"SNAP_{tag}_{datetime.now().strftime('%H%M')}"
-    ss.add_worksheet(title=title, rows=max(100, len(df)+10), cols=max(40, len(df.columns)+2))
-    ws = ss.worksheet(title)
-    _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
-    return True, f"Snapshot skapad: {title}"
-
-# --- LOGG & FÖRSLAG till Sheets ---
-def save_logs_to_sheet(logs: list[dict]) -> int:
-    ws = _get_or_create_ws(LOGS_SHEET_NAME, rows=max(200, len(logs)+10), cols=12)
-    # Hämta befintligt för att lägga till längst ned
-    vals = _with_backoff(ws.get_all_values)
-    header = ["ts","ticker","summary","ps_json"]
-    if not vals:
-        _with_backoff(ws.update, [header])
-        vals = [header]
-    rows = []
-    for r in logs:
-        rows.append([
-            r.get("ts",""),
-            r.get("ticker",""),
-            r.get("summary",""),
-            json_dumps_safe(r.get("ps", {}))
-        ])
-    _with_backoff(ws.append_rows, rows)
-    return len(rows)
-
-def save_proposals_to_sheet(df: pd.DataFrame):
-    ws = _get_or_create_ws(PROPOSALS_SHEET_NAME, rows=max(100, len(df)+10), cols=max(20, len(df.columns)+2))
-    _with_backoff(ws.clear)
-    _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
-
-def json_dumps_safe(obj) -> str:
-    try:
-        import json
-        return json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        return str(obj)
+    v = str(valuta).upper().strip()
+    if user_rates and v in user_rates:
+        return float(user_rates[v])
+    saved = las_sparade_valutakurser()
+    return float(saved.get(v, DEFAULT_RATES.get(v, 1.0)))

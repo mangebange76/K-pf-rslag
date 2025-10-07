@@ -16,7 +16,9 @@ from sheets_utils import (
     spara_valutakurser,
     spara_data,
     hamta_valutakurs,
-    spara_hamtlogg,       # för logg-knappen
+    spara_hamtlogg,
+    sheets_status,
+    reset_sheets_client,
 )
 
 # Försök använda din riktiga beräkningsmodul; fallback om den saknas
@@ -26,27 +28,22 @@ try:
 except Exception:
     _UPD_USES_RATES = False
     def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict | None = None) -> pd.DataFrame:
-        """Minimal fallback om calc_and_cache saknas (ignorerar user_rates)."""
         df = df.copy()
         for i, rad in df.iterrows():
-            # P/S-snitt
             ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
             ps_clean = [float(x) for x in ps_vals if float(x) > 0]
             ps_snitt = round(float(np.mean(ps_clean)) if ps_clean else 0.0, 2)
             df.at[i, "P/S-snitt"] = ps_snitt
 
-            # CAGR clamp
             cagr = float(rad.get("CAGR 5 år (%)", 0.0))
             just_cagr = 50.0 if cagr > 100.0 else (2.0 if cagr < 0.0 else cagr)
             g = just_cagr / 100.0
 
-            # Omsättning om 2 & 3 år
             oms_next = float(rad.get("Omsättning nästa år", 0.0))
             if oms_next > 0:
                 df.at[i, "Omsättning om 2 år"] = round(oms_next * (1.0 + g), 2)
                 df.at[i, "Omsättning om 3 år"] = round(oms_next * ((1.0 + g) ** 2), 2)
 
-            # Riktkurser – OBS: både omsättning och utest. aktier är i “miljoner”
             ps_use = ps_snitt if ps_snitt > 0 else float(rad.get("P/S", 0.0))
             aktier_ut_mn = float(rad.get("Utestående aktier", 0.0))
             if aktier_ut_mn > 0 and ps_use > 0:
@@ -114,16 +111,32 @@ def hamta_valutakurser_sidebar() -> dict:
             else:
                 st.sidebar.error("Kunde inte hämta live-kurser just nu. Behåller dina sparade värden.")
 
+    # —— Google Sheets-status & verktyg ——
     st.sidebar.markdown("---")
-    if st.sidebar.button("↻ Läs om data från Google Sheets"):
-        st.cache_data.clear()
-        st.rerun()
+    with st.sidebar.expander("🧭 Google Sheets-status", expanded=False):
+        stat = sheets_status()
+        st.caption(f"Konfigurerad: {'Ja' if stat['configured'] else 'Nej'}")
+        st.caption(f"Anslutning: {'OK' if stat['ok'] else 'FALLBACK (lokal)'}")
+        st.caption(f"Sheet ID: {stat['sheet_id'] or '—'}")
+        st.caption(f"Servicekonto: {stat['service_email'] or '—'}")
+        if stat["message"]:
+            st.error(stat["message"])
+            if stat["service_email"]:
+                st.info("Dela kalkylarket med servicekontots e-post (redigerare).")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🔁 Initiera om Sheets-klient"):
+                reset_sheets_client()
+                st.rerun()
+        with c2:
+            if st.button("🧹 Rensa data-cache"):
+                st.cache_data.clear()
+                st.rerun()
 
     return user_rates
 
 
 def visa_hamtlogg_panel() -> None:
-    """Liten panel i sidbaren som visar senaste nät-hämtloggarna."""
     logs = st.session_state.get("fetch_logs", [])
     with st.sidebar.expander("🧾 Hämtlogg", expanded=False):
         if not logs:
@@ -150,7 +163,6 @@ def visa_hamtlogg_panel() -> None:
 
 
 def spara_logg_till_sheets() -> None:
-    """Wrapper till appens knapp (kallar sheets_utils.spara_hamtlogg)."""
     ok, msg = spara_hamtlogg(st.session_state.get("fetch_logs", []))
     (st.success if ok else st.error)(msg)
 
@@ -169,16 +181,13 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
             status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
             data = hamta_yahoo_fält(tkr)
 
-            # Basfält
             for k in ["Bolagsnamn","Aktuell kurs","Valuta","Årlig utdelning","CAGR 5 år (%)"]:
                 if k in data:
                     df.at[i, k] = data[k]
 
-            # Aktier (miljoner)
             if float(data.get("Utestående aktier", 0) or 0) > 0:
                 df.at[i, "Utestående aktier"] = float(data["Utestående aktier"])
 
-            # P/S (TTM) + Q1..Q4 och metadata
             if "P/S" in data:
                 df.at[i, "P/S"] = float(data["P/S"])
             for q in (1,2,3,4):
@@ -354,8 +363,10 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     st.markdown("### ⏱️ Äldst manuellt uppdaterade (Omsättning)")
     df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00")
     tips = df.sort_values(by=["_sort_datum","Bolagsnamn"]).head(10)
-    st.dataframe(tips[["Ticker","Bolagsnamn","Senast manuellt uppdaterad","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]],
-                 use_container_width=True)
+    st.dataframe(
+        tips[["Ticker","Bolagsnamn","Senast manuellt uppdaterad","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]],
+        use_container_width=True
+    )
 
     return df
 

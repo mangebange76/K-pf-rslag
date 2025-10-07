@@ -165,7 +165,7 @@ def _extract_sec_quarter_revenues(facts_json: dict) -> list[tuple[pd.Timestamp, 
     Returnerar lista [(end_timestamp_naiv, quarter_revenue_float)] (senaste först).
     """
     tags = [
-        "RevenueFromContractWithCustomerExcludingAssessedTax",  # modern
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
         "Revenues",
         "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
@@ -178,11 +178,8 @@ def _extract_sec_quarter_revenues(facts_json: dict) -> list[tuple[pd.Timestamp, 
             if tag not in facts: continue
             units = facts[tag].get("units", {})
             for unit_name, values in units.items():
-                # valuta: USD / USDUSD etc – ta allt som verkar valuta
-                if "usd" not in unit_name.lower(): 
-                    # en del filer skriver t.ex. "EUR" – acceptera ändå
-                    if len(unit_name) > 6:  # uteslut "shares"
-                        pass
+                if "share" in unit_name.lower(): 
+                    continue
                 for v in values:
                     val = v.get("val")
                     end = v.get("end")
@@ -197,7 +194,6 @@ def _extract_sec_quarter_revenues(facts_json: dict) -> list[tuple[pd.Timestamp, 
                     elif any(q in frame for q in ["Q1","Q2","Q3","Q4"]):
                         is_quarter = True
                     else:
-                        # fallback via duration
                         try:
                             sd = pd.to_datetime(start) if start else None
                             ed = pd.to_datetime(end)
@@ -238,19 +234,46 @@ def _try_get_quarterly_revenue_df(t: yf.Ticker) -> pd.DataFrame | None:
         return qfin.copy()
     return None
 
-def _nearest_price_on_or_after(t: yf.Ticker, dt: pd.Timestamp, max_days: int = 10) -> float | None:
-    start = (dt - pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
-    end   = (dt + pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
+def _nearest_price_on_or_after(t: yf.Ticker, dt: pd.Timestamp, max_days: int = 30) -> float | None:
+    """
+    Hitta ett pris nära 'dt'.
+    1) försök T..T+max_days (dagliga)
+    2) försök T-1..T-max_days (dagliga)
+    3) veckodata i ett bredare fönster, ta första >= T, annars närmast
+    """
     try:
-        h = t.history(start=start, end=end, auto_adjust=False, interval="1d")
-        if h.empty: return None
-        after = h[h.index >= dt]
-        if not after.empty: return float(after["Close"].iloc[0])
-        before = h[h.index < dt]
-        if not before.empty: return float(before["Close"].iloc[-1])
-        return float(h["Close"].iloc[-1])
+        # 1) på/efter
+        start1 = dt.strftime("%Y-%m-%d")
+        end1   = (dt + pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
+        h1 = t.history(start=start1, end=end1, auto_adjust=False, interval="1d")
+        if not h1.empty:
+            after = h1[h1.index >= dt]
+            if not after.empty:
+                return float(after["Close"].iloc[0])
+
+        # 2) före
+        start2 = (dt - pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
+        end2   = dt.strftime("%Y-%m-%d")
+        h2 = t.history(start=start2, end=end2, auto_adjust=False, interval="1d")
+        if not h2.empty:
+            before = h2[h2.index < dt]
+            if not before.empty:
+                return float(before["Close"].iloc[-1])
+
+        # 3) veckodata
+        start3 = (dt - pd.Timedelta(days=max_days+20)).strftime("%Y-%m-%d")
+        end3   = (dt + pd.Timedelta(days=max_days+20)).strftime("%Y-%m-%d")
+        hw = t.history(start=start3, end=end3, auto_adjust=False, interval="1wk")
+        if not hw.empty:
+            afterw = hw[hw.index >= dt]
+            if not afterw.empty:
+                return float(afterw["Close"].iloc[0])
+            idx = (hw.index - dt).abs().argmin()
+            return float(hw["Close"].iloc[idx])
+
     except Exception:
         return None
+    return None
 
 # ---------- P/S-historik + källor + DEBUG ----------
 def hamta_ps_kvartal(ticker: str) -> dict:
@@ -349,28 +372,23 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                     sec_quarters = _extract_sec_quarter_revenues(facts)  # [(ts, val)] nyast->äldst
                     dbg["sec_rev_pts"] = len(sec_quarters)
 
-                    # Bygg TTM per kvartal från SEC-kvartal
                     if sec_quarters:
                         labels = [("P/S Q1","P/S Q1 datum","Källa P/S Q1"),
                                   ("P/S Q2","P/S Q2 datum","Källa P/S Q2"),
                                   ("P/S Q3","P/S Q3 datum","Källa P/S Q3"),
                                   ("P/S Q4","P/S Q4 datum","Källa P/S Q4")]
                         for i, (lab_ps, lab_dt, lab_src) in enumerate(labels):
-                            # hoppa om vi redan har ett värde (från Yahoo)
                             if out[lab_ps] and out[lab_ps] > 0:
                                 continue
                             if i >= len(sec_quarters):
                                 break
                             end_ts, _ = sec_quarters[i]
-
-                            # fönster: fyra kvartal från och med detta
                             window = sec_quarters[i:i+4]
                             if len(window) < 4:
                                 continue
                             ttm = sum(v for _, v in window)
                             if ttm <= 0:
                                 continue
-
                             px = _nearest_price_on_or_after(t, end_ts)
                             if px is None:
                                 continue
@@ -396,11 +414,10 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                             out["Källa P/S"] = "SEC_fallback/q1_ttm"
                             dbg["ps_source"] = "sec_fallback"
 
-        # om fortfarande inget ps_source satt, men vi räknade Yahoo Q1: markera
         if dbg["ps_source"] == "-" and used_ps_q1:
             dbg["ps_source"] = "computed_q1"
 
-        # sista fallback om allt annat misslyckar
+        # sista fallback om allt annat misslyckas
         if (not out["P/S"] or out["P/S"] <= 0):
             try:
                 mc = info.get("marketCap")

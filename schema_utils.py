@@ -1,70 +1,124 @@
-# schema_utils.py
+# sheets_utils.py
+import streamlit as st
 import pandas as pd
+import gspread
+import time
+from datetime import datetime
+from google.oauth2.service_account import Credentials
 
-FINAL_COLS = [
-    "Ticker","Bolagsnamn","Utestående aktier",
-    "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
-    "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
-    "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
-    "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
-    "Antal aktier","Valuta","Årlig utdelning","Aktuell kurs",
-    "CAGR 5 år (%)","P/S-snitt",
-    "Senast manuellt uppdaterad","Senast auto uppdaterad",
-    "TS P/S","TS Omsättning","TS Utestående aktier",
-    "Källa Aktuell kurs","Källa Utestående aktier",
-    "Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"
-]
+# ---- Tidsstämplar ----
+try:
+    import pytz
+    TZ_STHLM = pytz.timezone("Europe/Stockholm")
+    def now_stamp(): return datetime.now(TZ_STHLM).strftime("%Y-%m-%d %H:%M")
+    def now_ymd(): return datetime.now(TZ_STHLM).strftime("%Y-%m-%d")
+    def now_compact(): return datetime.now(TZ_STHLM).strftime("%Y%m%d_%H%M")
+except Exception:
+    def now_stamp(): return datetime.now().strftime("%Y-%m-%d %H:%M")
+    def now_ymd(): return datetime.now().strftime("%Y-%m-%d")
+    def now_compact(): return datetime.now().strftime("%Y%m%d_%H%M")
 
-def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
-    for kol in FINAL_COLS:
-        if kol not in df.columns:
-            # metadata/källor/tidsstämplar ska vara text
-            if kol.startswith("Källa ") or kol.startswith("TS ") or kol in [
-                "Senast manuellt uppdaterad","Senast auto uppdaterad",
-                "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
-                "Ticker","Bolagsnamn","Valuta"
-            ]:
-                df[kol] = ""
-            # numeriska fält
-            elif any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs","snitt","utestående"]):
-                df[kol] = 0.0
-            else:
-                df[kol] = ""
-    return df
+# ---- Secrets / kopplingar ----
+SHEET_URL = st.secrets["SHEET_URL"]
+MAIN_SHEET_NAME = "Blad1"
+RATES_SHEET_NAME = "Valutakurser"
 
-def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
-    mapping = {
-        "Riktkurs 2026":"Riktkurs om 1 år",
-        "Riktkurs 2027":"Riktkurs om 2 år",
-        "Riktkurs 2028":"Riktkurs om 3 år",
-        "Riktkurs om idag":"Riktkurs idag"
-    }
-    for old, new in mapping.items():
-        if old in df.columns:
-            if new not in df.columns: df[new] = 0.0
-            nv = pd.to_numeric(df[new], errors="coerce").fillna(0.0)
-            ov = pd.to_numeric(df[old], errors="coerce").fillna(0.0)
-            mask = (nv == 0.0) & (ov > 0.0)
-            df.loc[mask, new] = ov[mask]
-            df = df.drop(columns=[old])
-    return df
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
+client = gspread.authorize(credentials)
 
-def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
-    num_cols = [
-        "Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
-        "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
-        "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
-        "Antal aktier","Årlig utdelning","Aktuell kurs","CAGR 5 år (%)","P/S-snitt"
-    ]
-    for c in num_cols:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    str_cols = [
-        "Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Senast auto uppdaterad",
-        "TS P/S","TS Omsättning","TS Utestående aktier",
-        "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
-        "Källa Aktuell kurs","Källa Utestående aktier",
-        "Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"
-    ]
-    for c in str_cols:
-        if c in df.columns: df[c] = df[c].astype(str)
-    return df
+def _with_backoff(func, *args, **kwargs):
+    delays = [0, 0.5, 1.0, 2.0]
+    last_err = None
+    for d in delays:
+        if d: time.sleep(d)
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+def get_spreadsheet():
+    return client.open_by_url(SHEET_URL)
+
+# ---- Rates-ark ----
+def _ensure_rates_sheet():
+    ss = get_spreadsheet()
+    try:
+        return ss.worksheet(RATES_SHEET_NAME)
+    except Exception:
+        ss.add_worksheet(title=RATES_SHEET_NAME, rows=10, cols=5)
+        ws = ss.worksheet(RATES_SHEET_NAME)
+        ws.update("A1", [["Valuta","Kurs"]])
+        return ws
+
+@st.cache_data(show_spinner=False)
+def las_sparade_valutakurser():
+    ws = _ensure_rates_sheet()
+    rows = _with_backoff(ws.get_all_records)
+    out = {}
+    for r in rows:
+        cur = str(r.get("Valuta","")).upper().strip()
+        val = str(r.get("Kurs","")).replace(",",".").strip()
+        try: out[cur] = float(val)
+        except: pass
+    # defaults
+    out.setdefault("USD", 9.75)
+    out.setdefault("NOK", 0.95)
+    out.setdefault("CAD", 7.05)
+    out.setdefault("EUR", 11.18)
+    out.setdefault("SEK", 1.0)
+    return out
+
+def spara_valutakurser(rates: dict):
+    ws = _ensure_rates_sheet()
+    body = [["Valuta","Kurs"]]
+    for k in ["USD","NOK","CAD","EUR","SEK"]:
+        v = rates.get(k, las_sparade_valutakurser().get(k, 1.0))
+        body.append([k, str(v)])
+    _with_backoff(ws.clear)
+    _with_backoff(ws.update, body)
+
+def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
+    if not valuta: return 1.0
+    return float(user_rates.get(str(valuta).upper(), 1.0))
+
+# ---- Läs/skriv huvuddata ----
+def _ensure_main_sheet():
+    ss = get_spreadsheet()
+    try:
+        return ss.worksheet(MAIN_SHEET_NAME)
+    except Exception:
+        ss.add_worksheet(title=MAIN_SHEET_NAME, rows=1000, cols=40)
+        return ss.worksheet(MAIN_SHEET_NAME)
+
+def hamta_data() -> pd.DataFrame:
+    ws = _ensure_main_sheet()
+    rows = _with_backoff(ws.get_all_records)
+    if not rows: return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+def spara_data(df: pd.DataFrame):
+    ws = _ensure_main_sheet()
+    _with_backoff(ws.clear)
+    _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
+
+# ---- Snapshot ----
+def skapa_snapshot_om_saknas(df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Skapar SNAP_YYYYMMDD om det inte redan finns ett snapshot för dagens datum.
+    Returnerar (ok, meddelande).
+    """
+    try:
+        ss = get_spreadsheet()
+        existing = [w.title for w in ss.worksheets()]
+        today_tag = f"SNAP_{now_ymd()}"
+        if any(t.startswith(today_tag) for t in existing):
+            return False, f"Snapshot finns redan: {today_tag}"
+        title = f"{today_tag}_{now_compact().split('_')[1]}"
+        ss.add_worksheet(title=title, rows=max(1000, len(df)+5), cols=max(40, len(df.columns)+2))
+        ws = ss.worksheet(title)
+        _with_backoff(ws.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
+        return True, f"Snapshot skapad: {title}"
+    except Exception as e:
+        return False, f"Kunde inte skapa snapshot: {e}"

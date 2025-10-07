@@ -3,18 +3,19 @@ import streamlit as st
 import pandas as pd
 import gspread
 import time
+from typing import Tuple
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
-# Tidsstämplar i Stockholm
+# Tidsstämplar (Stockholm)
 try:
     import pytz
     TZ_STHLM = pytz.timezone("Europe/Stockholm")
-    def now_stamp(): return datetime.now(TZ_STHLM).strftime("%Y-%m-%d %H:%M")
-    def today_stamp(): return datetime.now(TZ_STHLM).strftime("%Y-%m-%d")
+    def now_stamp() -> str: return datetime.now(TZ_STHLM).strftime("%Y-%m-%d %H:%M")
+    def today_stamp() -> str: return datetime.now(TZ_STHLM).strftime("%Y-%m-%d")
 except Exception:
-    def now_stamp(): return datetime.now().strftime("%Y-%m-%d %H:%M")
-    def today_stamp(): return datetime.now().strftime("%Y-%m-%d")
+    def now_stamp() -> str: return datetime.now().strftime("%Y-%m-%d %H:%M")
+    def today_stamp() -> str: return datetime.now().strftime("%Y-%m-%d")
 
 SHEET_URL = st.secrets["SHEET_URL"]
 SHEET_NAME = "Blad1"
@@ -49,7 +50,7 @@ def skapa_rates_sheet_if_missing():
         ws.update([["Valuta","Kurs"]])
         return ws
 
-def hamta_data():
+def hamta_data() -> pd.DataFrame:
     ws = _main_ws()
     data = _with_backoff(ws.get_all_records)
     return pd.DataFrame(data)
@@ -61,7 +62,7 @@ def spara_data(df: pd.DataFrame):
 
 # Snapshot
 SNAP_PREFIX = "SNAP_"
-def skapa_snapshot_om_saknas(df: pd.DataFrame) -> tuple[bool, str]:
+def skapa_snapshot_om_saknas(df: pd.DataFrame) -> Tuple[bool, str]:
     try:
         ss = get_spreadsheet()
         namn = f"{SNAP_PREFIX}{today_stamp()}"

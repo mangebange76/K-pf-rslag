@@ -15,6 +15,10 @@ def _fmt_date_label(val: str) -> str:
     s = str(val).strip()
     return "–" if s in bad else s
 
+def _fmt_src(val: str) -> str:
+    s = str(val or "").strip()
+    return "–" if s in {"", "0", "0.0", "nan", "None"} else s
+
 def visa_hamtlogg_panel():
     with st.sidebar.expander("🔎 Hämtlogg (senaste körning)"):
         last = (st.session_state.get("fetch_logs") or [])[-1:]
@@ -128,7 +132,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
                     failed.append(f)
             if any_ps: df.at[i, "TS P/S"] = now_stamp()
             for dcol in ["P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum"]:
-                if dcol in data and data[dcol]:
+                if dcol in data and dcol:
                     df.at[i, dcol] = str(data[dcol])
 
             for k in ["Källa Aktuell kurs","Källa Utestående aktier","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"]:
@@ -195,26 +199,26 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         c1, c2 = st.columns(2)
         with c1:
             ticker = st.text_input("Ticker (Yahoo-format)", value=bef.get("Ticker","") if not bef.empty else "").upper()
-            utest = st.number_input(f"Utestående aktier (miljoner) [{ts_ut}] ({src_ut or '–'})",
+            utest = st.number_input(f"Utestående aktier (miljoner) [{ts_ut}] ({_fmt_src(src_ut)})",
                                     value=float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0)
             antal = st.number_input("Antal aktier du äger",
                                     value=float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0)
-            ps  = st.number_input(f"P/S (TTM) [{ts_ps}] ({src_ps or '–'})",
+            ps  = st.number_input(f"P/S (TTM) [{ts_ps}] ({_fmt_src(src_ps)})",
                                   value=float(bef.get("P/S",0.0)) if not bef.empty else 0.0)
-            ps1 = st.number_input(f"P/S Q1 (senaste) — {_fmt_date_label(bef.get('P/S Q1 datum',''))} ({src_ps1 or '–'})",
+            ps1 = st.number_input(f"P/S Q1 (senaste) — {_fmt_date_label(bef.get('P/S Q1 datum',''))} ({_fmt_src(src_ps1)})",
                                   value=float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0)
-            ps2 = st.number_input(f"P/S Q2 — {_fmt_date_label(bef.get('P/S Q2 datum',''))} ({src_ps2 or '–'})",
+            ps2 = st.number_input(f"P/S Q2 — {_fmt_date_label(bef.get('P/S Q2 datum',''))} ({_fmt_src(src_ps2)})",
                                   value=float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0)
-            ps3 = st.number_input(f"P/S Q3 — {_fmt_date_label(bef.get('P/S Q3 datum',''))} ({src_ps3 or '–'})",
+            ps3 = st.number_input(f"P/S Q3 — {_fmt_date_label(bef.get('P/S Q3 datum',''))} ({_fmt_src(src_ps3)})",
                                   value=float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0)
-            ps4 = st.number_input(f"P/S Q4 — {_fmt_date_label(bef.get('P/S Q4 datum',''))} ({src_ps4 or '–'})",
+            ps4 = st.number_input(f"P/S Q4 — {_fmt_date_label(bef.get('P/S Q4 datum',''))} ({_fmt_src(src_ps4)})",
                                   value=float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0)
         with c2:
             oms_idag  = st.number_input(f"Omsättning idag (miljoner) [{ts_oms}]",
                                         value=float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0)
             oms_next  = st.number_input(f"Omsättning nästa år (miljoner) [{ts_oms}]",
                                         value=float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0)
-            st.caption(f"Aktuell kurskälla: {src_px or '–'}")
+            st.caption(f"Aktuell kurskälla: {_fmt_src(src_px)}")
             st.caption(f"Senast manuellt uppdaterad: {bef.get('Senast manuellt uppdaterad','–') if not bef.empty else '–'}")
             st.caption(f"Senast auto uppdaterad: {bef.get('Senast auto uppdaterad','–') if not bef.empty else '–'}")
             st.markdown("**Uppdateras automatiskt vid spara:** Namn, Valuta, Kurs, Utdelning, CAGR, Utestående aktier, P/S (TTM & Q1..Q4).")
@@ -292,7 +296,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                 df.loc[df["Ticker"]==ticker, "TS P/S"] = now_stamp()
 
             for dcol in ["P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum"]:
-                if dcol in data and data[dcol]:
+                if dcol in data and dcol:
                     df.loc[df["Ticker"]==ticker, dcol] = str(data[dcol])
 
             for k in ["Källa Aktuell kurs","Källa Utestående aktier","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"]:
@@ -319,7 +323,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             st.caption(
                 f"Debug: ps_source={psdbg.get('ps_source','-')}, q_cols={psdbg.get('q_cols',0)}, "
                 f"price_hits={psdbg.get('price_hits',0)}, sec_cik={psdbg.get('sec_cik') or '–'}, "
-                f"sec_shares_pts={psdbg.get('sec_shares_pts',0)}"
+                f"sec_shares_pts={psdbg.get('sec_shares_pts',0)}, sec_rev_pts={psdbg.get('sec_rev_pts',0)}"
             )
 
     st.markdown("### ⏱️ Äldst manuellt uppdaterade (Omsättning)")

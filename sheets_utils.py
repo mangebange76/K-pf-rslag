@@ -1,14 +1,15 @@
 # sheets_utils.py
 # ----------------------------------------------------------
 # Läs/skriv mot Google Sheets med snälla fallbacks lokalt.
-# Kräver st.secrets med antingen:
-#   - gcp_service_account (standard Streamlit-format) OCH
-#   - sheets: { main_id: "<Google Sheet ID>",
-#               data_ws: "Data",
-#               rates_ws: "Rates",
-#               logs_ws: "FetchLog",
-#               snapshots_prefix: "Snap-" }
-# Om inget av detta finns -> jobbar i minnet + enkla lokala filer.
+# Kräver st.secrets med:
+#   gcp_service_account (standard Streamlit-format)
+#   sheets:
+#     main_id: "<Google Sheet ID>"
+#     data_ws: "Data"
+#     rates_ws: "Rates"
+#     logs_ws: "FetchLog"
+#     snapshots_prefix: "Snap-"
+# Om inget finns -> jobbar lokalt/in-memory.
 # ----------------------------------------------------------
 
 from __future__ import annotations
@@ -43,6 +44,26 @@ def now_stamp() -> str:
 
 # ----------------- Hjälpare: Sheets -----------------
 
+def _get_sa_info():
+    """Returnerar (sa_dict, service_email) eller (None, '')."""
+    try:
+        sa = st.secrets.get("gcp_service_account", None)
+        if not sa:
+            return None, ""
+        return sa, str(sa.get("client_email", ""))
+    except Exception:
+        return None, ""
+
+
+def _sheet_conf() -> dict:
+    try:
+        conf = dict(_DEFAULT_SHEET_CONF)
+        conf.update(st.secrets.get("sheets", {}))
+        return conf
+    except Exception:
+        return dict(_DEFAULT_SHEET_CONF)
+
+
 @st.cache_resource(show_spinner=False)
 def _gspread_client():
     """Returnera gspread-klient eller None."""
@@ -50,7 +71,7 @@ def _gspread_client():
         import gspread
         from google.oauth2.service_account import Credentials
 
-        sa = st.secrets.get("gcp_service_account", None)
+        sa, _ = _get_sa_info()
         if not sa:
             return None
 
@@ -65,16 +86,8 @@ def _gspread_client():
         return None
 
 
-def _sheet_conf() -> dict:
-    try:
-        conf = dict(_DEFAULT_SHEET_CONF)
-        conf.update(st.secrets.get("sheets", {}))
-        return conf
-    except Exception:
-        return dict(_DEFAULT_SHEET_CONF)
-
-
 def _open_sheet():
+    """Öppna huvudarket, annars None."""
     gc = _gspread_client()
     if not gc:
         return None
@@ -105,7 +118,6 @@ def _write_df_to_ws(ws, df: pd.DataFrame):
         if df.empty:
             ws.update("A1", [[""]])
             return True
-        # Konvertera till listor
         values = [list(df.columns)]
         values += df.astype(object).where(pd.notnull(df), "").values.tolist()
         ws.update("A1", values)
@@ -125,6 +137,55 @@ def _read_ws_to_df(ws) -> pd.DataFrame:
     if not header:
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=header)
+
+
+# ----------------- Offentligt: status/diagnostik -----------------
+
+def sheets_status() -> dict:
+    """
+    Returnerar en status-dict för sidopanelen:
+      {
+        "ok": bool,
+        "configured": bool,
+        "sheet_id": "...",
+        "service_email": "...",
+        "using": "sheets" | "local",
+        "message": "...",
+      }
+    """
+    conf = _sheet_conf()
+    sa, service_email = _get_sa_info()
+    sheet_id = conf.get("main_id", "")
+
+    configured = bool(sa) and bool(sheet_id)
+    sh = _open_sheet() if configured else None
+    ok = bool(sh)
+    using = "sheets" if ok else "local"
+
+    msg = ""
+    if not sa:
+        msg = "gcp_service_account saknas i st.secrets."
+    elif not sheet_id:
+        msg = "sheets.main_id saknas i st.secrets."
+    elif not sh:
+        msg = "Kunde inte öppna kalkylarket – dela arket med servicekontot eller kontrollera Sheet-ID."
+
+    return {
+        "ok": ok,
+        "configured": configured,
+        "sheet_id": sheet_id,
+        "service_email": service_email,
+        "using": using,
+        "message": msg,
+    }
+
+
+def reset_sheets_client():
+    """Knapp-handler: initiera om gspread-klienten."""
+    try:
+        st.cache_resource.clear()   # rensar alla resource-cachar, inkl. gspread-klienten
+    except Exception:
+        pass
 
 
 # ----------------- DATA -----------------
@@ -192,7 +253,7 @@ def las_sparade_valutakurser() -> Dict[str, float]:
             return json.loads(_LOCAL_RATES.read_text())
         except Exception:
             pass
-    # Fallback minne
+    # Fallback minne (rimliga defaultar)
     return st.session_state.get("saved_rates", {"USD": 10.0, "NOK": 1.0, "CAD": 7.5, "EUR": 11.0, "SEK": 1.0})
 
 
@@ -228,10 +289,7 @@ def hamta_valutakurs(valuta: str, user_rates: Dict[str, float] | None = None) ->
 # ----------------- SNAPSHOTS -----------------
 
 def skapa_snapshot_om_saknas(df: pd.DataFrame) -> Tuple[bool, str]:
-    """
-    Skapar ett dags-snapshot som ny worksheet "Snap-YYYY-MM-DD" om det saknas.
-    Returnerar (ok, meddelande).
-    """
+    """Skapar dags-snapshot 'Snap-YYYY-MM-DD' om det saknas."""
     sh = _open_sheet()
     if not sh:
         return False, "Snapshot hoppades över (ingen Sheets-anslutning)."
@@ -246,7 +304,7 @@ def skapa_snapshot_om_saknas(df: pd.DataFrame) -> Tuple[bool, str]:
             if ws.title == today_name:
                 return False, f"Snapshot '{today_name}' fanns redan."
 
-        ws = _get_or_create_ws(sh, today_name, rows=max(1000, len(df) + 10), cols=max(20, len(df.columns) + 5))
+        ws = _get_or_create_ws(sh, today_name, rows=max(1000, len(df)+10), cols=max(20, len(df.columns)+5))
         if not ws:
             return False, "Kunde inte skapa snapshot-ark."
         ok = _write_df_to_ws(ws, df)
@@ -258,9 +316,7 @@ def skapa_snapshot_om_saknas(df: pd.DataFrame) -> Tuple[bool, str]:
 # ----------------- LOGG -----------------
 
 def spara_hamtlogg(logs: List[dict]) -> Tuple[bool, str]:
-    """
-    Sparar hämtningslogg (st.session_state['fetch_logs']) till logs_ws.
-    """
+    """Spara hämtningslogg till Sheets eller lokalt."""
     if not logs:
         return False, "Ingen logg att spara."
 

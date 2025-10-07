@@ -1,45 +1,64 @@
 # sheets_utils.py
 from __future__ import annotations
 import time
+from datetime import datetime
 import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --------------------------------------------------------------------------------------
-# Konfig
-# --------------------------------------------------------------------------------------
+# -------------------- Tid/zon --------------------
+try:
+    import pytz
+    TZ_STHLM = pytz.timezone("Europe/Stockholm")
+    def now_stamp() -> str:
+        return datetime.now(TZ_STHLM).strftime("%Y-%m-%d")
+except Exception:
+    def now_stamp() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+# -------------------- Konfig --------------------
 SHEET_URL = st.secrets.get("SHEET_URL", "")
 SHEET_NAME = st.secrets.get("SHEET_NAME", "Blad1")
 RATES_SHEET_NAME = st.secrets.get("RATES_SHEET_NAME", "Valutakurser")
 
 DEFAULT_RATES = {"USD": 9.75, "EUR": 11.18, "NOK": 0.95, "CAD": 7.05, "SEK": 1.0}
 
-# Ursprungs-kolumner + nya meta/källfält som vyerna använder
+# Viktigt: matchar app.py + nya metadatafält som vyerna använder
 FINAL_COLS = [
-    # Nyckel & bas
-    "Ticker", "Bolagsnamn", "Utestående aktier",
-    # P/S
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4", "P/S-snitt",
-    # P/S metadata
+    # Bas
+    "Ticker", "Bolagsnamn", "Valuta", "Aktuell kurs", "Årlig utdelning",
+    "Utestående aktier", "Antal aktier",
+    # P/S & kvartal
+    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
     "P/S Q1 datum", "P/S Q2 datum", "P/S Q3 datum", "P/S Q4 datum",
-    "Källa P/S", "Källa P/S Q1", "Källa P/S Q2", "Källa P/S Q3", "Källa P/S Q4",
-    "TS P/S",
+    "Källa Aktuell kurs", "Källa Utestående aktier", "Källa P/S", "Källa P/S Q1", "Källa P/S Q2", "Källa P/S Q3", "Källa P/S Q4",
     # Omsättning & riktkurser
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    # Portfölj/övrigt
-    "Antal aktier", "Valuta", "Årlig utdelning", "Aktuell kurs",
-    "CAGR 5 år (%)",
-    # Källor/tidsstämplar övrigt
-    "Källa Aktuell kurs", "Källa Utestående aktier", "TS Utestående aktier",
-    # Manuella datum
+    # Derivat/övrigt
+    "CAGR 5 år (%)", "P/S-snitt",
+    # Tidsstämplar & meta
     "Senast manuellt uppdaterad", "Senast auto uppdaterad",
+    "TS P/S", "TS Utestående aktier", "TS Omsättning",
 ]
 
-# --------------------------------------------------------------------------------------
-# Google Sheets-klient
-# --------------------------------------------------------------------------------------
+_STR_COLS = {
+    "Ticker","Bolagsnamn","Valuta",
+    "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
+    "Källa Aktuell kurs","Källa Utestående aktier","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4",
+    "Senast manuellt uppdaterad","Senast auto uppdaterad",
+    "TS P/S","TS Utestående aktier","TS Omsättning",
+}
+_NUM_COLS = {
+    "Utestående aktier","Antal aktier",
+    "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
+    "Aktuell kurs","Årlig utdelning","CAGR 5 år (%)",
+    "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
+    "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
+}
+
+# -------------------- Google Sheets-klient --------------------
 def _client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_info = st.secrets.get("GOOGLE_CREDENTIALS", {})
@@ -49,10 +68,11 @@ def _client():
     return gspread.authorize(credentials)
 
 def _with_backoff(func, *args, **kwargs):
-    delays = [0, 0.5, 1, 2]
+    delays = [0, 0.5, 1.0, 2.0]
     last = None
     for d in delays:
-        if d: time.sleep(d)
+        if d:
+            time.sleep(d)
         try:
             return func(*args, **kwargs)
         except Exception as e:
@@ -64,12 +84,12 @@ def _spreadsheet():
         raise RuntimeError("Saknar SHEET_URL i secrets.")
     return _with_backoff(_client().open_by_url, SHEET_URL)
 
-def _main_ws():
+def _worksheet(name: str):
     ss = _spreadsheet()
     try:
-        return ss.worksheet(SHEET_NAME)
+        return ss.worksheet(name)
     except Exception:
-        ws = ss.add_worksheet(title=SHEET_NAME, rows=5000, cols=len(FINAL_COLS) + 5)
+        ws = ss.add_worksheet(title=name, rows=5000, cols=len(FINAL_COLS) + 5)
         _with_backoff(ws.update, [FINAL_COLS])
         return ws
 
@@ -82,45 +102,54 @@ def _rates_ws():
         _with_backoff(ws.update, [["Valuta","Kurs"]] + [[k, DEFAULT_RATES[k]] for k in ["USD","EUR","NOK","CAD","SEK"]])
         return ws
 
-# --------------------------------------------------------------------------------------
-# Läs/skriv huvud-DF
-# --------------------------------------------------------------------------------------
+# -------------------- IO: huvudblad --------------------
 def hamta_data() -> pd.DataFrame:
-    ws = _main_ws()
+    ws = _worksheet(SHEET_NAME)
     rows = _with_backoff(ws.get_all_records)
     df = pd.DataFrame(rows)
-
-    # Tom grund-DF om bladet är tomt
     if df.empty:
         return pd.DataFrame({c: [] for c in FINAL_COLS})
-
-    # Säkerställ kolumner och typer
     df = säkerställ_kolumner(df)
-    df = migrera_gamla_riktkurskolumner(df)
     df = konvertera_typer(df)
-    # Sätt kolumnordning
+    # håll ordningen
     for c in FINAL_COLS:
         if c not in df.columns:
-            df[c] = "" if c in _str_cols() else 0.0
+            df[c] = "" if c in _STR_COLS else 0.0
     return df[FINAL_COLS]
 
 def spara_data(df: pd.DataFrame) -> None:
-    ws = _main_ws()
-    # Gör DF kompatibel: säkerställ kolumner och ordning
+    ws = _worksheet(SHEET_NAME)
     df = säkerställ_kolumner(df)
-    df = migrera_gamla_riktkurskolumner(df)
     df = konvertera_typer(df)
     for c in FINAL_COLS:
         if c not in df.columns:
-            df[c] = "" if c in _str_cols() else 0.0
+            df[c] = "" if c in _STR_COLS else 0.0
     df = df[FINAL_COLS]
     _with_backoff(ws.clear)
-    values = [df.columns.tolist()] + df.astype(str).values.tolist()
-    _with_backoff(ws.update, values)
+    _with_backoff(ws.update, [df.columns.tolist()] + df.astype(str).values.tolist())
 
-# --------------------------------------------------------------------------------------
-# Valutakurser
-# --------------------------------------------------------------------------------------
+# -------------------- Schemahjälpare --------------------
+def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for kol in FINAL_COLS:
+        if kol not in df.columns:
+            df[kol] = "" if kol in _STR_COLS else 0.0
+    return df
+
+def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in _NUM_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in _STR_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+    # Heuristik: om Utestående aktier råkat vara i absoluta tal, konvertera till miljoner
+    if "Utestående aktier" in df.columns:
+        df["Utestående aktier"] = df["Utestående aktier"].apply(lambda x: float(x)/1e6 if float(x) > 1e9 else float(x))
+    return df
+
+# -------------------- Valutakurser --------------------
 @st.cache_data(show_spinner=False)
 def las_sparade_valutakurser() -> dict:
     ws = _rates_ws()
@@ -133,7 +162,6 @@ def las_sparade_valutakurser() -> dict:
             out[cur] = float(val)
         except Exception:
             pass
-    # Defaults om saknas
     for k,v in DEFAULT_RATES.items():
         out.setdefault(k, v)
     return out
@@ -145,7 +173,7 @@ def spara_valutakurser(rates: dict) -> None:
         body.append([k, float(rates.get(k, DEFAULT_RATES.get(k, 1.0)))])
     _with_backoff(ws.clear)
     _with_backoff(ws.update, body)
-    st.cache_data.clear()  # läs-cache för kurser
+    st.cache_data.clear()  # reset cache så sidopanelen läser om
 
 def hamta_valutakurs(valuta: str, user_rates: dict | None = None) -> float:
     if not valuta:
@@ -156,67 +184,30 @@ def hamta_valutakurs(valuta: str, user_rates: dict | None = None) -> float:
     saved = las_sparade_valutakurser()
     return float(saved.get(v, DEFAULT_RATES.get(v, 1.0)))
 
-# --------------------------------------------------------------------------------------
-# Schemahjälpare (för kompatibilitet med din gamla app.py)
-# --------------------------------------------------------------------------------------
-def _num_cols():
-    return [
-        "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-        "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-        "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-        "Antal aktier", "Årlig utdelning", "Aktuell kurs", "CAGR 5 år (%)", "P/S-snitt"
-    ]
+# -------------------- Snapshot-funktion --------------------
+def skapa_snapshot_om_saknas(df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Skapar ett nytt blad 'SNAP_YYYY-MM-DD' om det inte redan finns.
+    Returnerar (skapades?, meddelande).
+    """
+    today = now_stamp()
+    snap_name = f"SNAP_{today}"
+    ss = _spreadsheet()
+    try:
+        ss.worksheet(snap_name)
+        return False, f"Snapshot {snap_name} finns redan."
+    except Exception:
+        pass
 
-def _str_cols():
-    return [
-        "Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Senast auto uppdaterad",
-        "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
-        "Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4",
-        "Källa Aktuell kurs","Källa Utestående aktier","TS P/S","TS Utestående aktier",
-    ]
+    # skapa nytt blad och skriv DF
+    ws = ss.add_worksheet(title=snap_name, rows= max(1000, len(df) + 10), cols= max(20, len(FINAL_COLS) + 2))
+    # säkerställ schema innan skrivning
+    df2 = säkerställ_kolumner(df)
+    df2 = konvertera_typer(df2)
+    for c in FINAL_COLS:
+        if c not in df2.columns:
+            df2[c] = "" if c in _STR_COLS else 0.0
+    df2 = df2[FINAL_COLS]
 
-def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # lägg till nya kolumner vid behov
-    for kol in FINAL_COLS:
-        if kol not in df.columns:
-            df[kol] = "" if kol in _str_cols() else 0.0
-    # extra: om gamla kolumner saknas i FINAL_COLS, behåll dem (vi tappas inte bort)
-    for c in df.columns:
-        if c not in FINAL_COLS and c not in _str_cols() and c not in _num_cols():
-            # lämna kvar – vi skriver ändå bara FINAL_COLS vid spara_data
-            pass
-    return df
-
-def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    mapping = {
-        "Riktkurs 2026": "Riktkurs om 1 år",
-        "Riktkurs 2027": "Riktkurs om 2 år",
-        "Riktkurs 2028": "Riktkurs om 3 år",
-        "Riktkurs om idag": "Riktkurs idag",
-    }
-    for old, new in mapping.items():
-        if old in df.columns:
-            if new not in df.columns:
-                df[new] = 0.0
-            new_vals = pd.to_numeric(df[new], errors="coerce").fillna(0.0)
-            old_vals = pd.to_numeric(df[old], errors="coerce").fillna(0.0)
-            mask = (new_vals == 0.0) & (old_vals > 0.0)
-            df.loc[mask, new] = old_vals[mask]
-            df = df.drop(columns=[old])
-    return df
-
-def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for c in _num_cols():
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    for c in _str_cols():
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-    # special: se till att "Utestående aktier" är i miljoner (om någon rad råkat vara i absolut)
-    # heuristik: om ett värde > 1e9 → anta absolut och konvertera till miljoner
-    if "Utestående aktier" in df.columns:
-        df["Utestående aktier"] = df["Utestående aktier"].apply(lambda x: float(x)/1e6 if float(x) > 1e9 else float(x))
-    return df
+    _with_backoff(ws.update, [df2.columns.tolist()] + df2.astype(str).values.tolist())
+    return True, f"Skapade snapshot {snap_name}."

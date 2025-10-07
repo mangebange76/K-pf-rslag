@@ -1,14 +1,21 @@
-# views.py
+# views.py (del 1/2)
 import streamlit as st
 import pandas as pd
-from sheets_utils import (las_sparade_valutakurser, spara_valutakurser,
-                          hamta_valutakurs, get_spreadsheet, now_stamp,
-                          skapa_snapshot_om_saknas, spara_data)
+
+from sheets_utils import (
+    las_sparade_valutakurser, spara_valutakurser,
+    hamta_valutakurs, get_spreadsheet, now_stamp,
+    skapa_snapshot_om_saknas, spara_data
+)
 from data_sources import hamta_yahoo_fält, hamta_live_valutakurser
 from calc_and_cache import uppdatera_berakningar, bygg_forslag_cache
 
-MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
+MANUELL_FALT_FOR_DATUM = [
+    "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
+    "Omsättning idag","Omsättning nästa år"
+]
 
+# -------- små formatterare för etiketter --------
 def _fmt_date_label(val: str) -> str:
     bad = {"", "0", "0.0", "nan", "NaT", "None"}
     if val is None: return "–"
@@ -19,6 +26,7 @@ def _fmt_src(val: str) -> str:
     s = str(val or "").strip()
     return "–" if s in {"", "0", "0.0", "nan", "None"} else s
 
+# --------- Hämtlogg (valfritt i sidopanelen) ----------
 def visa_hamtlogg_panel():
     with st.sidebar.expander("🔎 Hämtlogg (senaste körning)"):
         last = (st.session_state.get("fetch_logs") or [])[-1:]
@@ -51,6 +59,7 @@ def spara_logg_till_sheets():
     except Exception as ex:
         st.sidebar.warning(f"Kunde inte spara logg: {ex}")
 
+# --------- Valutakurser i sidopanelen ----------
 def hamta_valutakurser_sidebar():
     st.sidebar.header("💱 Valutakurser → SEK")
     saved = las_sparade_valutakurser()
@@ -80,6 +89,7 @@ def hamta_valutakurser_sidebar():
         st.rerun()
     return user_rates
 
+# --------- Massuppdatering & snapshot ----------
 def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.DataFrame:
     st.sidebar.markdown("---")
     colA, colB = st.sidebar.columns(2)
@@ -100,6 +110,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
         for i, row in df.iterrows():
             tkr = str(row["Ticker"]).strip()
             status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
+
             data = hamta_yahoo_fält(tkr)
             failed = []
 
@@ -131,11 +142,15 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
                 else:
                     failed.append(f)
             if any_ps: df.at[i, "TS P/S"] = now_stamp()
+
             for dcol in ["P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum"]:
                 if dcol in data and dcol:
                     df.at[i, dcol] = str(data[dcol])
 
-            for k in ["Källa Aktuell kurs","Källa Utestående aktier","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"]:
+            for k in [
+                "Källa Aktuell kurs","Källa Utestående aktier","Källa P/S",
+                "Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"
+            ]:
                 if k in data and data[k]:
                     df.at[i, k] = str(data[k])
 
@@ -155,6 +170,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
             st.sidebar.text_area("Misslyckade fält", "\n".join(misslyckade), height=160, key=f"{key_prefix}_miss")
     return df
 
+# views.py (del 2/2)
 def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     st.header("➕ Lägg till / uppdatera bolag")
 
@@ -225,8 +241,9 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
 
         spar = st.form_submit_button("💾 Spara & hämta från Yahoo")
 
-    # Snabb-knapp: hämta om enbart vald ticker
+    # 🔁 Patch A: rensa cache innan ”Hämta igen” så SEC-cutoff slår igenom
     if valt_label and (bef.get("Ticker") or "").strip() and st.button("🔁 Hämta igen denna ticker (Yahoo/SEC)"):
+        st.cache_data.clear()  # <-- viktig
         ticker = bef.get("Ticker")
         data = hamta_yahoo_fält(ticker)
         for k in ["Bolagsnamn","Valuta"]:
@@ -314,7 +331,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                 pass
             st.rerun()
 
-    # liten debugrad för vald ticker (senaste loggpost)
+    # 🔍 Patch B: utökad debugrad med cutoff-info
     if not bef.empty and bef.get("Ticker"):
         logs = st.session_state.get("fetch_logs") or []
         last_for_tk = next((e for e in reversed(logs) if e.get("ticker","").upper()==str(bef.get("Ticker")).upper()), None)
@@ -323,7 +340,9 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             st.caption(
                 f"Debug: ps_source={psdbg.get('ps_source','-')}, q_cols={psdbg.get('q_cols',0)}, "
                 f"price_hits={psdbg.get('price_hits',0)}, sec_cik={psdbg.get('sec_cik') or '–'}, "
-                f"sec_shares_pts={psdbg.get('sec_shares_pts',0)}, sec_rev_pts={psdbg.get('sec_rev_pts',0)}"
+                f"sec_shares_pts={psdbg.get('sec_shares_pts',0)}, "
+                f"sec_rev_pts={psdbg.get('sec_rev_pts',0)}/{psdbg.get('sec_rev_pts_after_cutoff',0)} "
+                f"(cutoff {psdbg.get('cutoff_years',6)}y)"
             )
 
     st.markdown("### ⏱️ Äldst manuellt uppdaterade (Omsättning)")
@@ -404,6 +423,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     riktkurs_val = st.selectbox("Vilken riktkurs ska användas?", ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"], index=1)
     subset = st.radio("Vilka bolag?", ["Alla bolag","Endast portfölj"], horizontal=True)
 
+    # förkalkylera tungt jobb med cache i calc_and_cache
     df_ser = df.to_json(orient="split")
     base = bygg_forslag_cache(df_ser, riktkurs_val, subset, kapital_sek)
 
@@ -468,7 +488,6 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     )
 
     if st.button("🧾 Spara dessa förslag till Sheets"):
-        from views import spara_forslag_till_sheets  # för att undvika cykler
         spara_forslag_till_sheets(base, {
             "riktkurs_val": riktkurs_val,
             "subset": subset,

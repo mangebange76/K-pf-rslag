@@ -13,13 +13,24 @@ try:
 except Exception:
     def now_stamp(): return datetime.now().strftime("%Y-%m-%d %H:%M")
 
+# ---- små helpers för datum/etiketter ----
+def _to_naive_ts(x):
+    if isinstance(x, pd.Timestamp):
+        try: return x.tz_localize(None)
+        except Exception: return pd.Timestamp(x)
+    try: return pd.to_datetime(x).tz_localize(None)
+    except Exception: return None
+
+def _clean_iso(d):
+    try: return pd.to_datetime(d).date().isoformat()
+    except Exception: return ""
+
 # --------- Live FX (Yahoo) ---------
 FX_TICKERS = {"USD":"USDSEK=X","NOK":"NOKSEK=X","CAD":"CADSEK=X","EUR":"EURSEK=X","SEK":None}
 def hamta_live_valutakurser() -> dict:
     out = {}
     for cc, yt in FX_TICKERS.items():
-        if yt is None:
-            out[cc] = 1.0; continue
+        if yt is None: out[cc] = 1.0; continue
         try:
             t = yf.Ticker(yt)
             info = {}
@@ -58,9 +69,7 @@ SEC_BASE = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
 def _sec_headers():
-    ua = st.secrets.get("SEC_USER_AGENT", "").strip()
-    if not ua:
-        ua = "StreamlitApp/1.0 (contact@example.com)"
+    ua = st.secrets.get("SEC_USER_AGENT", "").strip() or "StreamlitApp/1.0 (contact@example.com)"
     return {"User-Agent": ua, "Accept": "application/json"}
 
 @st.cache_data(show_spinner=False, ttl=60*60*24)
@@ -113,8 +122,7 @@ def _fetch_companyfacts(cik: str) -> dict | None:
     try:
         url = SEC_BASE.format(cik=cik)
         r = requests.get(url, headers=_sec_headers(), timeout=20)
-        if r.ok:
-            return r.json()
+        if r.ok: return r.json()
     except Exception:
         return None
     return None
@@ -127,16 +135,13 @@ def _extract_shares_history(facts_json: dict) -> dict:
             if tag not in facts: continue
             units = facts[tag].get("units", {})
             for unit_name, values in units.items():
-                if "share" not in unit_name.lower():
-                    continue
+                if "share" not in unit_name.lower(): continue
                 for v in values:
                     end = v.get("end") or v.get("instant")
                     val = v.get("val")
                     if end and val is not None:
-                        try:
-                            out[pd.to_datetime(end).date().isoformat()] = float(val)
-                        except Exception:
-                            pass
+                        try: out[pd.to_datetime(end).date().isoformat()] = float(val)
+                        except Exception: pass
             if out: break
     except Exception:
         pass
@@ -159,18 +164,19 @@ def _try_get_quarterly_revenue_df(t: yf.Ticker) -> pd.DataFrame | None:
         return qfin.copy()
     return None
 
-def _nearest_price_on_or_after(t: yf.Ticker, dt: pd.Timestamp, max_days: int = 5) -> float | None:
+def _nearest_price_on_or_after(t: yf.Ticker, dt: pd.Timestamp, max_days: int = 10) -> float | None:
     start = (dt - pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
     end   = (dt + pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
     try:
         h = t.history(start=start, end=end, auto_adjust=False, interval="1d")
-        if not h.empty:
-            after = h[h.index >= dt]
-            if not after.empty: return float(after["Close"].iloc[0])
-            return float(h["Close"].iloc[-1])
+        if h.empty: return None
+        after = h[h.index >= dt]
+        if not after.empty: return float(after["Close"].iloc[0])
+        before = h[h.index < dt]
+        if not before.empty: return float(before["Close"].iloc[-1])
+        return float(h["Close"].iloc[-1])
     except Exception:
-        pass
-    return None
+        return None
 
 # --------- P/S-historik + källor + DEBUG ---------
 def hamta_ps_kvartal(ticker: str) -> dict:
@@ -197,10 +203,23 @@ def hamta_ps_kvartal(ticker: str) -> dict:
             out["_DEBUG_PS"] = dbg
             return out
 
-        cols = sorted(list(qfin.columns), reverse=True)
+        # normalisera datumetiketter
+        cols_raw = list(qfin.columns)
+        cols = []
+        for c in cols_raw:
+            ts = _to_naive_ts(c)
+            if ts is not None: cols.append(ts)
+        cols = sorted(cols, reverse=True)  # senaste → äldst
         dbg["q_cols"] = len(cols)
-        rev = qfin.loc["Total Revenue"][cols].astype(float)
+        if not cols:
+            out["_DEBUG_PS"] = dbg
+            return out
 
+        # revenue-map på normaliserade timestamps
+        rev = qfin.loc["Total Revenue"][cols_raw].astype(float)
+        rev_map = { _to_naive_ts(c): float(rev[c]) if pd.notna(rev[c]) else float("nan") for c in cols_raw }
+
+        # SEC shares
         cik = _ticker_to_cik_any(ticker)
         dbg["sec_cik"] = cik
         shares_map = {}
@@ -215,24 +234,29 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                   ("P/S Q3","P/S Q3 datum","Källa P/S Q3"),
                   ("P/S Q4","P/S Q4 datum","Källa P/S Q4")]
         used_ps_q1 = None
+
         for i, (lab_ps, lab_dt, lab_src) in enumerate(labels):
             if i >= len(cols): break
             c = cols[i]
-            window = rev.iloc[i:i+4]
-            if not (len(window)==4 and window.notna().all()):
+            window_vals = []
+            for j in range(i, min(i+4, len(cols))):
+                window_vals.append(rev_map.get(cols[j], float("nan")))
+            if len(window_vals) < 4 or any(pd.isna(x) for x in window_vals):
                 continue
-            dt = pd.Timestamp(c).tz_localize(None) if isinstance(c, pd.Timestamp) else pd.to_datetime(c)
-            px = _nearest_price_on_or_after(t, dt)
+
+            px = _nearest_price_on_or_after(t, c)
             if px is None:
                 continue
             dbg["price_hits"] += 1
-            end_iso = pd.to_datetime(c).date().isoformat()
+
+            end_iso = _clean_iso(c)
             sh_sec = _nearest_shares_for_date(end_iso, shares_map)
             if sh_sec and sh_sec > 0:
                 sh = sh_sec; src = "Computed/SEC-shares"
             else:
                 sh = shares_now; src = "Computed/Current-shares"
-            ttm = float(window.sum())
+
+            ttm = float(sum(window_vals))
             if ttm <= 0 or not sh:
                 continue
             dbg["ttm_points"] += 1
@@ -240,7 +264,8 @@ def hamta_ps_kvartal(ticker: str) -> dict:
             out[lab_ps] = ps
             out[lab_dt] = end_iso
             out[lab_src] = src
-            if i == 0: used_ps_q1 = (ps, src)
+            if i == 0:
+                used_ps_q1 = (ps, src)
 
         ps_ttm = info.get("priceToSalesTrailing12Months")
         if ps_ttm and ps_ttm > 0:

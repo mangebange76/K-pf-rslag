@@ -6,7 +6,9 @@ from sheets_utils import (
     hamta_valutakurs, get_spreadsheet, now_stamp,
     skapa_snapshot_om_saknas, spara_data
 )
-from data_sources import hamta_yahoo_fält, hamta_live_valutakurser
+from data_sources import (
+    hamta_yahoo_fält, hamta_live_valutakurser, hamta_sec_filing_lankar
+)
 from calc_and_cache import uppdatera_berakningar, bygg_forslag_cache
 
 MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
@@ -42,7 +44,7 @@ def spara_logg_till_sheets():
         try:
             ws = ss.worksheet("LOGS")
         except Exception:
-            ss.add_worksheet(title="LOGS", rows=2000, cols=10)
+            ss.add_worksheet(title="LOGS", rows=5000, cols=10)
             ws = ss.worksheet("LOGS")
             ws.update("A1", [["ts","ticker","summary","raw_json"]])
         import json
@@ -98,39 +100,39 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
     if do_mass:
         status = st.sidebar.empty()
         bar = st.sidebar.progress(0)
-        misslyckade = []
         total = len(df)
         for i, row in df.iterrows():
             tkr = str(row["Ticker"]).strip()
             status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
 
             data = hamta_yahoo_fält(tkr)
-            failed = []
 
-            if "Bolagsnamn" in data: df.at[i, "Bolagsnamn"] = data.get("Bolagsnamn") or ""
-            if "Valuta" in data:     df.at[i, "Valuta"] = data.get("Valuta") or ""
-            if "Aktuell kurs" in data: df.at[i, "Aktuell kurs"] = float(data.get("Aktuell kurs") or 0.0)
-            if "Årlig utdelning" in data: df.at[i, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
-            if "CAGR 5 år (%)" in data:   df.at[i, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
-
-            # Nollställ P/S-fält innan ny skrivning
+            # Skriv ALLTID (även 0/“”) och nollställ P/S fält före skrivning
             for k in ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4"]:
                 df.at[i, k] = 0.0
             for k in ["P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
                       "Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"]:
                 df.at[i, k] = ""
 
-            for k in ["Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4"]:
-                if k in data:
-                    df.at[i, k] = float(data.get(k) or 0.0)
+            # Grundfält
+            df.at[i, "Bolagsnamn"] = data.get("Bolagsnamn") or ""
+            df.at[i, "Valuta"] = data.get("Valuta") or ""
+            df.at[i, "Aktuell kurs"] = float(data.get("Aktuell kurs") or 0.0)
+            df.at[i, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
+            df.at[i, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
+            df.at[i, "Utestående aktier"] = float(data.get("Utestående aktier") or 0.0)
+
+            # P/S (TTM + kvartal) + metadata
+            for k in ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4"]:
+                if k in data: df.at[i, k] = float(data.get(k) or 0.0)
             for k in ["P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
                       "Källa Aktuell kurs","Källa Utestående aktier","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4"]:
-                if k in data:
-                    df.at[i, k] = str(data.get(k) or "")
+                df.at[i, k] = str(data.get(k) or "")
 
-            df.at[i, "TS P/S"] = now_stamp()
-            df.at[i, "TS Utestående aktier"] = now_stamp()
-            df.at[i, "Senast auto uppdaterad"] = now_stamp()
+            now = now_stamp()
+            df.at[i, "TS P/S"] = now
+            df.at[i, "TS Utestående aktier"] = now
+            df.at[i, "Senast auto uppdaterad"] = now
 
             import time; time.sleep(1.0)
             bar.progress((i+1)/total)
@@ -261,6 +263,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             if not bef.empty:
                 for k,v in ny.items(): df.loc[df["Ticker"]==ticker, k] = v
             else:
+                # initiera tomrad med alla metadatafält
                 tom_init_cols = [
                     "Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Senast auto uppdaterad",
                     "TS P/S","TS Omsättning","TS Utestående aktier",
@@ -304,7 +307,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             st.success("Sparat och uppdaterat från Yahoo.")
             st.rerun()
 
-    # Debugrad från logg
+    # Debugrad + SEC-länkar
     if not bef.empty and bef.get("Ticker"):
         logs = st.session_state.get("fetch_logs") or []
         last_for_tk = next((e for e in reversed(logs) if e.get("ticker","").upper()==str(bef.get("Ticker")).upper()), None)
@@ -313,10 +316,23 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             st.caption(
                 f"Debug: ps_source={psdbg.get('ps_source','-')}, q_cols={psdbg.get('q_cols',0)}, "
                 f"price_hits={psdbg.get('price_hits',0)}, sec_cik={psdbg.get('sec_cik') or '–'}, "
-                f"sec_shares_pts={psdbg.get('sec_shares_pts',0)}, "
+                f"sec_ixbrl_pts={psdbg.get('sec_ixbrl_pts',0)}, sec_shares_pts={psdbg.get('sec_shares_pts',0)}, "
                 f"sec_rev_pts={psdbg.get('sec_rev_pts',0)}/{psdbg.get('sec_rev_pts_after_cutoff',0)} "
-                f"(cutoff {psdbg.get('cutoff_years',6)}y)"
+                f"(cutoff {psdbg.get('cutoff_years',6)}y, backfill={psdbg.get('backfill_used',False)})"
             )
+
+        # SEC-länkar att öppna direkt
+        sec_links = hamta_sec_filing_lankar(str(bef.get("Ticker")))
+        with st.expander("📄 Senaste SEC-filingar (öppna i ny flik)"):
+            if not sec_links:
+                st.caption("Inga SEC-länkar hittades just nu (saknar CIK eller nätverksfel).")
+            else:
+                for L in sec_links:
+                    st.markdown(
+                        f"- **{L['form']}** {L['date']} — "
+                        f"[iXBRL-viewer]({L['viewer']}) · [Arkiv]({L['url']}) · "
+                        f"CIK `{L['cik']}`"
+                    )
 
     st.markdown("### ⏱️ Äldst manuellt uppdaterade (Omsättning)")
     df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00 00:00")

@@ -1,700 +1,450 @@
 # data_sources.py
+from __future__ import annotations
 import streamlit as st
 import pandas as pd
+import numpy as np
+import requests, time, json
+from datetime import datetime, timedelta
 import yfinance as yf
-import requests
-import re
-from datetime import datetime
 
-# ---------- Tidsstämplar ----------
-try:
-    import pytz
-    TZ_STHLM = pytz.timezone("Europe/Stockholm")
-    def now_stamp(): return datetime.now(TZ_STHLM).strftime("%Y-%m-%d %H:%M")
-except Exception:
-    def now_stamp(): return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-# ---- små helpers för datum/etiketter ----
-def _to_naive_ts(x):
-    if isinstance(x, pd.Timestamp):
-        try: return x.tz_localize(None)
-        except Exception: return pd.Timestamp(x)
-    try: return pd.to_datetime(x).tz_localize(None)
-    except Exception: return None
-
-def _clean_iso(d):
-    try: return pd.to_datetime(d).date().isoformat()
-    except Exception: return ""
-
-def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
+# ---------- Små helpers ----------
+def _now_iso():
     try:
-        df = df.copy()
-        df.index = pd.to_datetime(df.index).tz_localize(None)
+        import pytz
+        tz = pytz.timezone("Europe/Stockholm")
+        return datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def _b(x) -> bool:
+    if isinstance(x, bool): return x
+    return str(x).lower() == "true"
+
+def _sec_cfg():
+    cutoff = int(st.session_state.get("SEC_CUTOFF_YEARS",
+                    int(st.secrets.get("SEC_CUTOFF_YEARS", 6))))
+    backfill = _b(st.session_state.get("SEC_ALLOW_BACKFILL_BEYOND_CUTOFF",
+                    st.secrets.get("SEC_ALLOW_BACKFILL_BEYOND_CUTOFF","false")))
+    return cutoff, backfill
+
+def _sec_headers():
+    ua = st.secrets.get("SEC_USER_AGENT") or "MyApp/1.0 admin@example.com"
+    return {"User-Agent": ua, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def _sec_company_tickers_index() -> dict:
+    """Hämta SECs masterlista med (ticker -> CIK) en gång per dag."""
+    url = "https://www.sec.gov/files/company_tickers.json"
+    try:
+        r = requests.get(url, headers=_sec_headers(), timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        out = {}
+        for _, row in data.items():
+            out[str(row["ticker"]).upper()] = str(row["cik_str"]).zfill(10)
+        return out
+    except Exception:
+        return {}
+
+def _cik_for_ticker(ticker: str) -> str | None:
+    # 1) override i secrets
+    try:
+        overrides = json.loads(st.secrets.get("CIK_OVERRIDES", "{}"))
+        if ticker.upper() in overrides:
+            return str(overrides[ticker.upper()]).zfill(10)
     except Exception:
         pass
-    return df
+    # 2) SEC masterindex
+    idx = _sec_company_tickers_index()
+    if ticker.upper() in idx:
+        return idx[ticker.upper()]
+    return None
 
-# ---------- Live FX (Yahoo) ----------
-FX_TICKERS = {"USD":"USDSEK=X","NOK":"NOKSEK=X","CAD":"CADSEK=X","EUR":"EURSEK=X","SEK":None}
-def hamta_live_valutakurser() -> dict:
-    out = {}
-    for cc, yt in FX_TICKERS.items():
-        if yt is None: out[cc] = 1.0; continue
+# ---------- YAHOO helpers ----------
+def _yahoo_price_currency_shares(t: yf.Ticker) -> tuple[float, str, float]:
+    """(price, currency, sharesOutstanding)"""
+    price, curr, shares = 0.0, "USD", 0.0
+    info = {}
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+    price = info.get("regularMarketPrice")
+    if price is None:
         try:
-            t = yf.Ticker(yt)
-            info = {}
-            try: info = t.info or {}
-            except Exception: info = {}
-            px = info.get("regularMarketPrice")
-            if px is None:
-                h = t.history(period="1d", auto_adjust=False)
-                if not h.empty: px = float(h["Close"].iloc[-1])
-            if px: out[cc] = float(px)
-        except Exception: pass
+            h = t.history(period="5d")
+            if not h.empty and "Close" in h:
+                price = float(h["Close"].dropna().iloc[-1])
+        except Exception:
+            price = None
+    curr = (info.get("currency") or "USD")
+    shares = float(info.get("sharesOutstanding") or 0.0)
+    return float(price or 0.0), str(curr), float(shares or 0.0)
+
+def _yahoo_ps_ttm_or_marketcap(t: yf.Ticker, price: float, shares: float) -> tuple[float, str]:
+    """Försök läsa P/S (TTM) från Yahoo. Fallback: marketCap / TTM-rev."""
+    # 1) P/S från info
+    src = "Yahoo/ps_ttm"
+    ps = 0.0
+    try:
+        info = t.info or {}
+        ps = float(info.get("priceToSalesTrailing12Months") or 0.0)
+        if ps > 0:
+            return ps, src
+    except Exception:
+        pass
+
+    # 2) marketCap / TTM
+    try:
+        info = t.info or {}
+        mcap = float(info.get("marketCap") or 0.0)
+        # försök få TTM-revenue: summera senaste 4 kvartal från yahoo
+        qrev = _yahoo_quarterly_revenue_all(t)  # dict date->rev
+        ttm = 0.0
+        if qrev:
+            for _, v in list(sorted(qrev.items(), key=lambda x: x[0], reverse=True))[:4]:
+                ttm += float(v or 0.0)
+        if ttm <= 0:
+            # fallback: annual totalRevenue från financials
+            try:
+                df_fin = getattr(t, "financials", None)
+                if isinstance(df_fin, pd.DataFrame) and not df_fin.empty and "Total Revenue" in df_fin.index:
+                    ser = df_fin.loc["Total Revenue"].dropna()
+                    if not ser.empty:
+                        ttm = float(ser.iloc[-1])
+            except Exception:
+                pass
+        if mcap > 0 and ttm > 0:
+            ps = mcap / ttm
+            return float(ps), "Computed/Yahoo-marketcap/TTM"
+    except Exception:
+        pass
+    # 3) fallback via price & sales per share om möjligt
+    if price > 0 and shares > 0:
+        qrev = _yahoo_quarterly_revenue_all(t)
+        if qrev:
+            ttm = sum(float(v or 0.0) for _, v in list(sorted(qrev.items(), key=lambda x: x[0], reverse=True))[:4])
+            if ttm > 0:
+                ps = (price * shares) / ttm
+                return float(ps), "Computed/Yahoo-price*shares/TTM"
+    return 0.0, "n/a"
+
+def _yahoo_quarterly_revenue_all(t: yf.Ticker) -> dict[str, float]:
+    """
+    Samlar kvartalsintäkter från flera Yahoo-datakällor och deduplar på datum (ISO).
+    Returnerar t.ex. {'2025-07-31': 30850000000.0, ...}
+    """
+    rev = {}
+    cands = []
+    for attr, row_name in [
+        ("quarterly_income_stmt", "Total Revenue"),
+        ("quarterly_financials",  "Total Revenue"),
+    ]:
+        try:
+            df = getattr(t, attr, None)
+            if isinstance(df, pd.DataFrame) and not df.empty and row_name in df.index:
+                cands.append(df.loc[row_name].dropna())
+        except Exception:
+            pass
+    # ibland finns "Total Revenue" i income_stmt med kolumner som kvartal
+    try:
+        df_is = getattr(t, "income_stmt", None)
+        if isinstance(df_is, pd.DataFrame) and not df_is.empty and "Total Revenue" in df_is.index:
+            cands.append(df_is.loc["Total Revenue"].dropna().tail(8))
+    except Exception:
+        pass
+
+    for s in cands:
+        for dt, val in s.items():
+            try:
+                d = pd.to_datetime(str(dt)).date().isoformat()
+                rev[d] = float(val)
+            except Exception:
+                continue
+    return rev
+
+# ---------- SEC helpers ----------
+@st.cache_data(show_spinner=False, ttl=3600)
+def _sec_companyfacts(cik: str) -> dict:
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{str(cik).zfill(10)}.json"
+    r = requests.get(url, headers=_sec_headers(), timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _sec_submissions(cik: str) -> dict:
+    url = f"https://data.sec.gov/submissions/CIK{str(cik).zfill(10)}.json"
+    r = requests.get(url, headers=_sec_headers(), timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def _sec_extract_series(facts: dict, tags: list[str], unit_keys: list[str]) -> list[dict]:
+    """Returnerar lista av punkter [{'date': 'YYYY-MM-DD', 'val': float}] för första träffande tag + unit."""
+    if not facts or "facts" not in facts:
+        return []
+    usgaap = facts.get("facts", {}).get("us-gaap", {})
+    for tag in tags:
+        if tag in usgaap:
+            units = usgaap[tag].get("units", {})
+            for uk in unit_keys:
+                if uk in units:
+                    out = []
+                    for p in units[uk]:
+                        d = p.get("end") or p.get("frame") or p.get("fy")
+                        try:
+                            d_iso = pd.to_datetime(str(d)).date().isoformat()
+                            out.append({"date": d_iso, "val": float(p.get("val") or 0.0)})
+                        except Exception:
+                            continue
+                    return out
+    return []
+
+def _nearest_value(points: list[dict], ref_date: datetime, days=60) -> float:
+    """Returnera värde vars datum är närmast ref_date inom 'days' dagar."""
+    if not points:
+        return 0.0
+    best = None
+    for p in points:
+        try:
+            d = datetime.fromisoformat(p["date"])
+            delta = abs((d - ref_date).days)
+            if delta <= days:
+                if best is None or delta < best[0]:
+                    best = (delta, float(p["val"]))
+        except Exception:
+            continue
+    return best[1] if best else 0.0
+
+def _compute_quarter_ps(t: yf.Ticker, dates_vals: list[tuple[str, float]], shares_series: list[dict]) -> tuple[list[tuple[str,float,str]], int]:
+    """
+    För varje (datum, revenue) beräkna P/S = price_(d+1) * shares_(nära d) / revenue_d.
+    Returnerar [(date_iso, ps_val, src_label), ...], samt hur många pris-träffar vi lyckades få.
+    """
+    hits = 0
+    rows = []
+    for d_iso, revenue in dates_vals:
+        # pris: använd d + 1 handelsdag
+        try:
+            d0 = pd.to_datetime(d_iso) + pd.Timedelta(days=1)
+            d1 = d0 + pd.Timedelta(days=6)
+            h = t.history(start=d0.strftime("%Y-%m-%d"), end=d1.strftime("%Y-%m-%d"))
+            px = float(h["Close"].dropna().iloc[0]) if not h.empty else 0.0
+        except Exception:
+            px = 0.0
+        if px > 0: hits += 1
+
+        # shares: närmast datumet (±60d), från SEC shares-serien
+        sh = _nearest_value(shares_series, pd.to_datetime(d_iso), days=60)
+        if sh <= 0:
+            # fallback: Yahoo sharesOutstanding
+            try:
+                _, _, yshares = _yahoo_price_currency_shares(t)
+                sh = yshares
+            except Exception:
+                sh = 0.0
+
+        ps = 0.0
+        if px > 0 and sh > 0 and revenue > 0:
+            ps = (px * float(sh)) / float(revenue)
+        rows.append((d_iso, float(ps), "Computed/Yahoo-revenue+SEC-shares+1d-after"))
+    return rows, hits
+
+# ---------- Offentliga funktioner ----------
+def hamta_live_valutakurser() -> dict:
+    """Hämta USD/NOK/CAD/EUR -> SEK via Yahoo."""
+    out = {"USD": 9.75, "NOK": 0.95, "CAD": 7.05, "EUR": 11.18, "SEK": 1.0}
+    pairs = {"USD": "USDSEK=X", "NOK": "NOKSEK=X", "CAD": "CADSEK=X", "EUR": "EURSEK=X"}
+    for k, y in pairs.items():
+        try:
+            t = yf.Ticker(y)
+            h = t.history(period="5d")
+            if not h.empty:
+                out[k] = round(float(h["Close"].dropna().iloc[-1]), 4)
+        except Exception:
+            pass
     return out
 
-# ---------- CAGR ----------
+def hamta_sec_filing_lankar(ticker: str) -> list[dict]:
+    """Senaste 8-K/10-Q/10-K med iXBRL-länk, arkiv-länk och CIK."""
+    cik = _cik_for_ticker(ticker)
+    if not cik:
+        return []
+    try:
+        sub = _sec_submissions(cik)
+        forms = []
+        for f, acc, date, primary in zip(
+            sub.get("filings", {}).get("recent", {}).get("form", []),
+            sub.get("filings", {}).get("recent", {}).get("accessionNumber", []),
+            sub.get("filings", {}).get("recent", {}).get("filingDate", []),
+            sub.get("filings", {}).get("recent", {}).get("primaryDocument", []),
+        ):
+            if f in ("10-Q","10-K","8-K"):
+                acc_clean = str(acc).replace("-", "")
+                base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}"
+                viewer = f"https://www.sec.gov/ixviewer/doc?action=display&source={base}/{primary}"
+                forms.append({
+                    "form": f, "date": date, "viewer": viewer, "url": f"{base}/{primary}", "cik": cik
+                })
+        return forms[:10]
+    except Exception:
+        return []
+
 def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
     try:
         df_is = getattr(tkr, "income_stmt", None)
+        series = None
         if isinstance(df_is, pd.DataFrame) and not df_is.empty and "Total Revenue" in df_is.index:
             series = df_is.loc["Total Revenue"].dropna()
         else:
             df_fin = getattr(tkr, "financials", None)
             if isinstance(df_fin, pd.DataFrame) and not df_fin.empty and "Total Revenue" in df_fin.index:
                 series = df_fin.loc["Total Revenue"].dropna()
-            else:
-                return 0.0
-        if series.empty or len(series) < 2: return 0.0
+        if series is None or series.empty or len(series) < 2:
+            return 0.0
         series = series.sort_index()
         start = float(series.iloc[0]); end = float(series.iloc[-1]); years = max(1, len(series)-1)
         if start <= 0: return 0.0
-        return round(((end/start)**(1/years)-1)*100, 2)
+        cagr = (end / start) ** (1.0 / years) - 1.0
+        return round(cagr * 100.0, 2)
     except Exception:
         return 0.0
 
-# ---------- SEC helpers ----------
-SEC_BASE = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-
-def _sec_headers():
-    ua = st.secrets.get("SEC_USER_AGENT", "").strip() or "StreamlitApp/1.0 (contact@example.com)"
-    return {"User-Agent": ua, "Accept": "application/json"}
-
-def _secret_bool(name: str, default: bool = False) -> bool:
-    try:
-        v = st.secrets.get(name, default)
-        if isinstance(v, bool): return v
-        if isinstance(v, (int, float)): return bool(v)
-        if isinstance(v, str): return v.strip().lower() in {"1","true","yes","y"}
-    except Exception:
-        pass
-    return default
-
-@st.cache_data(show_spinner=False, ttl=60*60*24)
-def _sec_load_ticker_map() -> dict:
-    try:
-        r = requests.get(SEC_TICKERS_URL, headers=_sec_headers(), timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        out = {}
-        for _, row in data.items():
-            t = str(row.get("ticker","")).upper().strip()
-            cik_str = str(row.get("cik_str","")).strip()
-            if t and cik_str.isdigit():
-                out[t] = str(cik_str).zfill(10)
-        return out
-    except Exception:
-        return {}
-
-def _ticker_to_cik_any(ticker: str) -> str | None:
-    tk = str(ticker).upper().strip()
-    # overrides via secrets
-    try:
-        import json
-        overrides_raw = st.secrets.get("CIK_OVERRIDES", "")
-        if isinstance(overrides_raw, str) and overrides_raw.strip():
-            overrides = json.loads(overrides_raw)
-        elif isinstance(overrides_raw, dict):
-            overrides = overrides_raw
-        else:
-            overrides = {}
-        if tk in overrides:
-            cik = "".join(ch for ch in str(overrides[tk]) if ch.isdigit())
-            if cik: return cik.zfill(10)
-    except Exception:
-        pass
-    # yfinance
-    try:
-        info = yf.Ticker(tk).info or {}
-        cik = str(info.get("cik") or "")
-        cik = "".join(ch for ch in cik if ch.isdigit())
-        if cik: return cik.zfill(10)
-    except Exception:
-        pass
-    # SEC-lista
-    m = _sec_load_ticker_map()
-    return m.get(tk)
-
-@st.cache_data(show_spinner=False, ttl=60*60*6)
-def _fetch_companyfacts(cik: str) -> dict | None:
-    try:
-        url = SEC_BASE.format(cik=cik)
-        r = requests.get(url, headers=_sec_headers(), timeout=20)
-        if r.ok: return r.json()
-    except Exception:
-        return None
-    return None
-
-def _extract_shares_history(facts_json: dict) -> dict:
-    """end_date_iso -> shares"""
-    out = {}
-    try:
-        facts = facts_json.get("facts", {}).get("us-gaap", {})
-        for tag in ["CommonStockSharesOutstanding","EntityCommonStockSharesOutstanding","SharesOutstanding"]:
-            if tag not in facts: continue
-            units = facts[tag].get("units", {})
-            for unit_name, values in units.items():
-                if "share" not in unit_name.lower(): continue
-                for v in values:
-                    end = v.get("end") or v.get("instant")
-                    val = v.get("val")
-                    if end and val is not None:
-                        try: out[pd.to_datetime(end).date().isoformat()] = float(val)
-                        except Exception: pass
-            if out: break
-    except Exception:
-        pass
-    return out
-
-def _nearest_shares_for_date(date_iso: str, shares_map: dict) -> float | None:
-    if not shares_map: return None
-    target = pd.to_datetime(date_iso)
-    items = sorted(((pd.to_datetime(d), v) for d,v in shares_map.items()), key=lambda x: x[0])
-    le = [v for d,v in items if d <= target]
-    if le: return le[-1]
-    return items[0][1] if items else None
-
-# ---------- SEC revenues (companyfacts, kvartal) ----------
-def _extract_sec_quarter_revenues(facts_json: dict) -> list[tuple[pd.Timestamp, float]]:
-    tags = [
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "Revenues",
-        "SalesRevenueNet",
-        "RevenueFromContractWithCustomerIncludingAssessedTax",
-        "SalesRevenueGoodsNet"
-    ]
-    out = []
-    try:
-        facts = facts_json.get("facts", {}).get("us-gaap", {})
-        for tag in tags:
-            if tag not in facts: continue
-            units = facts[tag].get("units", {})
-            for unit_name, values in units.items():
-                if "share" in unit_name.lower(): 
-                    continue
-                for v in values:
-                    val = v.get("val")
-                    end = v.get("end")
-                    start = v.get("start")
-                    fp = (v.get("fp") or "").upper()
-                    frame = (v.get("frame") or "")
-                    if val is None or not end:
-                        continue
-                    is_quarter = False
-                    if fp in {"Q1","Q2","Q3","Q4"}:
-                        is_quarter = True
-                    elif any(q in frame for q in ["Q1","Q2","Q3","Q4"]):
-                        is_quarter = True
-                    else:
-                        try:
-                            sd = pd.to_datetime(start) if start else None
-                            ed = pd.to_datetime(end)
-                            if sd is not None:
-                                days = (ed - sd).days
-                                if 80 <= days <= 100:
-                                    is_quarter = True
-                        except Exception:
-                            pass
-                    if not is_quarter:
-                        continue
-                    try:
-                        ts = _to_naive_ts(end)
-                        if ts is None: 
-                            continue
-                        out.append((ts, float(val)))
-                    except Exception:
-                        pass
-            if out:
-                break
-    except Exception:
-        return []
-    if not out:
-        return []
-    # dedupe + sort nyast->äldst
-    ded = {ts: v for ts, v in out}
-    return sorted(ded.items(), key=lambda x: x[0], reverse=True)
-
-# ---------- Yahoo helpers ----------
-def _try_get_quarterly_revenue_df(t: yf.Ticker) -> pd.DataFrame | None:
-    qfin = getattr(t, "quarterly_income_stmt", None)
-    if not (isinstance(qfin, pd.DataFrame) and not qfin.empty and "Total Revenue" in qfin.index):
-        qfin = getattr(t, "quarterly_financials", None)
-    if isinstance(qfin, pd.DataFrame) and not qfin.empty and "Total Revenue" in qfin.index:
-        return qfin.copy()
-    return None
-
-def _nearest_price_on_or_after(t: yf.Ticker, dt: pd.Timestamp, max_days: int = 30) -> tuple[float | None, str]:
-    """Returnerar (pris, källa-tag). Provar 1d-after, 1d-before, 1wk-after, 1wk-nearest, 6mo-nearest, spot."""
-    try:
-        start1 = dt.strftime("%Y-%m-%d")
-        end1   = (dt + pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
-        h1 = t.history(start=start1, end=end1, auto_adjust=False, interval="1d")
-        h1 = _naive_index(h1)
-        if not h1.empty:
-            after = h1[h1.index >= dt]
-            if not after.empty:
-                return float(after["Close"].iloc[0]), "1d-after"
-
-        start2 = (dt - pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
-        end2   = dt.strftime("%Y-%m-%d")
-        h2 = t.history(start=start2, end=end2, auto_adjust=False, interval="1d")
-        h2 = _naive_index(h2)
-        if not h2.empty:
-            before = h2[h2.index < dt]
-            if not before.empty:
-                return float(before["Close"].iloc[-1]), "1d-before"
-
-        start3 = (dt - pd.Timedelta(days=max_days+20)).strftime("%Y-%m-%d")
-        end3   = (dt + pd.Timedelta(days=max_days+20)).strftime("%Y-%m-%d")
-        hw = t.history(start=start3, end=end3, auto_adjust=False, interval="1wk")
-        hw = _naive_index(hw)
-        if not hw.empty:
-            afterw = hw[hw.index >= dt]
-            if not afterw.empty:
-                return float(afterw["Close"].iloc[0]), "1wk-after"
-            idx = (hw.index - dt).abs().argmin()
-            return float(hw["Close"].iloc[idx]), "1wk-nearest"
-
-        h4 = t.history(period="6mo", auto_adjust=False, interval="1d")
-        h4 = _naive_index(h4)
-        if not h4.empty:
-            idx = (h4.index - dt).abs().argmin()
-            return float(h4["Close"].iloc[idx]), "6mo-nearest"
-
-        info = t.info or {}
-        spot = info.get("regularMarketPrice")
-        if spot: return float(spot), "spot"
-    except Exception:
-        return None, ""
-    return None, ""
-
-# ---------- iXBRL parsing ----------
-def hamta_sec_filing_lankar(ticker: str, forms=("10-Q","10-K","8-K"), limit: int = 6) -> list[dict]:
-    """Senaste filing-länkar för ticker → [{form,date,url,viewer,cik,accession}]"""
-    cik = _ticker_to_cik_any(ticker)
-    if not cik:
-        return []
-    try:
-        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        r = requests.get(url, headers=_sec_headers(), timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        recent = (j.get("filings", {}) or {}).get("recent", {})
-        forms_list = list(recent.get("form", []))
-        dates      = list(recent.get("filingDate", []))
-        acc        = list(recent.get("accessionNumber", []))
-        prim       = list(recent.get("primaryDocument", []))
-        out = []
-        for i, f in enumerate(forms_list):
-            if f not in forms:
-                continue
-            an = str(acc[i]); primdoc = str(prim[i])
-            archive = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{an.replace('-','')}/{primdoc}"
-            viewer  = f"https://www.sec.gov/ixviewer/doc?action=display&source={archive}"
-            out.append({"form": f, "date": str(dates[i]), "url": archive, "viewer": viewer, "cik": cik, "accession": an})
-            if len(out) >= limit:
-                break
-        return out
-    except Exception:
-        return []
-
-def _parse_ixbrl_contexts(html: str) -> dict:
-    """
-    Returnerar {context_id: (start_ts, end_ts, is_duration)} från iXBRL-dokumentet.
-    """
-    ctx = {}
-    for m in re.finditer(r'<xbrli:context[^>]*id="([^"]+)"[^>]*>(.*?)</xbrli:context>', html, flags=re.I|re.S):
-        cid, block = m.group(1), m.group(2)
-        inst = re.search(r'<xbrli:instant>([^<]+)</xbrli:instant>', block, flags=re.I)
-        if inst:
-            try:
-                end = pd.to_datetime(inst.group(1)).tz_localize(None)
-                ctx[cid] = (None, end, False)
-            except Exception:
-                pass
-            continue
-        start = re.search(r'<xbrli:startDate>([^<]+)</xbrli:startDate>', block, flags=re.I)
-        end   = re.search(r'<xbrli:endDate>([^<]+)</xbrli:endDate>', block, flags=re.I)
-        if start and end:
-            try:
-                s = pd.to_datetime(start.group(1)).tz_localize(None)
-                e = pd.to_datetime(end.group(1)).tz_localize(None)
-                ctx[cid] = (s, e, True)
-            except Exception:
-                pass
-    return ctx
-
-def _parse_ixbrl_revenues(html: str) -> list[tuple[pd.Timestamp, float]]:
-    """
-    Plockar kvartalsintäkter ur iXBRL (ix:nonFraction) för vanliga revenue-taggar.
-    Returnerar [(end_ts, value), ...], sorterad nyast->äldst.
-    """
-    tags = [
-        "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
-        "us-gaap:Revenues",
-        "us-gaap:SalesRevenueNet",
-        "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
-        "us-gaap:SalesRevenueGoodsNet",
-    ]
-    name_re = r'(' + "|".join(re.escape(t) for t in tags) + r')'
-    contexts = _parse_ixbrl_contexts(html)
-    out = []
-
-    # fånga ix:nonFraction med value i text eller i value-attribut
-    for m in re.finditer(
-        rf'<ix:nonFraction[^>]*name="(?P<name>{name_re})"[^>]*contextRef="(?P<ctx>[^"]+)"[^>]*([^>]*?scale="(?P<scale>-?\d+)")?[^>]*?(?:value="(?P<val_attr>[^"]+)")?[^>]*>(?P<val_text>.*?)</ix:nonFraction>',
-        html, flags=re.I|re.S
-    ):
-        name = m.group("name")
-        ctx_id = m.group("ctx")
-        scale = int(m.group("scale") or 0)
-        raw = (m.group("val_attr") or m.group("val_text") or "").strip()
-        raw = re.sub(r'<[^>]+>', '', raw)  # ta bort ev. taggar i textnoder
-        # hantera (1,234) och 1,234.56
-        neg = raw.startswith("(") and raw.endswith(")")
-        raw = raw.strip("()").replace("\xa0","").replace(",", "")
-        try:
-            val = float(raw)
-            if neg: val = -val
-            if scale: val = val * (10 ** scale)
-        except Exception:
-            continue
-        if ctx_id not in contexts: 
-            continue
-        s, e, is_dur = contexts[ctx_id]
-        if not is_dur or e is None:
-            continue
-        # kvartalsfilter (ca 90 dagar)
-        days = None if s is None else (e - s).days
-        if days is None or not (80 <= days <= 100):
-            continue
-        out.append((e, float(val)))
-
-    if not out:
-        return []
-    # dedupe per end-date, behåll största värdet (skydd mot dubbletter på flera revenue-taggar)
-    ded = {}
-    for ts, v in out:
-        if (ts not in ded) or (abs(v) > abs(ded[ts])):
-            ded[ts] = v
-    return sorted(ded.items(), key=lambda x: x[0], reverse=True)
-
-def hamta_sec_ixbrl_quarter_revenues(ticker: str, max_docs: int = 6) -> list[tuple[pd.Timestamp, float]]:
-    """
-    Hämtar HTML för senaste 10-Q/10-K (ev. 8-K om iXBRL finns), parser iXBRL och
-    returnerar [(end_ts, revenue)], nyast->äldst.
-    """
-    links = hamta_sec_filing_lankar(ticker, forms=("10-Q","10-K","8-K"), limit=max_docs)
-    all_pairs = []
-    for L in links:
-        try:
-            r = requests.get(L["url"], headers=_sec_headers(), timeout=20)
-            if not r.ok: continue
-            html = r.text
-            pairs = _parse_ixbrl_revenues(html)
-            all_pairs.extend(pairs)
-        except Exception:
-            continue
-    if not all_pairs:
-        return []
-    # dedupe nyast->äldst
-    ded = {}
-    for ts, v in all_pairs:
-        if (ts not in ded) or (abs(v) > abs(ded[ts])):
-            ded[ts] = v
-    return sorted(ded.items(), key=lambda x: x[0], reverse=True)
-
-# ---------- P/S-historik + källor + DEBUG ----------
-def hamta_ps_kvartal(ticker: str) -> dict:
-    """
-    Hämtar/beräknar P/S (TTM) per kvartal för de 4 senaste kvartalen.
-    Prioritet: Yahoo kvartalsdata → SEC iXBRL → SEC companyfacts. Därefter MC/TTM fallback.
-    Cutoff styrs av SEC_CUTOFF_YEARS (default 6). Om SEC_ALLOW_BACKFILL_BEYOND_CUTOFF är True
-    fylls resterande kvartal med äldre data (före cutoff) och källan märks [pre-cutoff].
-    """
-    out = {
-        "P/S": 0.0,
-        "P/S Q1": 0.0, "P/S Q2": 0.0, "P/S Q3": 0.0, "P/S Q4": 0.0,
-        "P/S Q1 datum":"", "P/S Q2 datum":"", "P/S Q3 datum":"", "P/S Q4 datum":"",
-        "Källa P/S":"", "Källa P/S Q1":"", "Källa P/S Q2":"", "Källa P/S Q3":"", "Källa P/S Q4":"",
-        "_DEBUG_PS": {}
-    }
-    try:
-        try:
-            SEC_CUTOFF_YEARS = int(st.secrets.get("SEC_CUTOFF_YEARS", 6))
-        except Exception:
-            SEC_CUTOFF_YEARS = 6
-        ALLOW_BACKFILL = _secret_bool("SEC_ALLOW_BACKFILL_BEYOND_CUTOFF", False)
-
-        cutoff_ts = pd.Timestamp.today().tz_localize(None) - pd.DateOffset(years=SEC_CUTOFF_YEARS)
-        dbg = {"ticker": ticker, "ps_source": "-", "q_cols": 0, "ttm_points": 0, "price_hits": 0,
-               "sec_cik": None, "sec_shares_pts": 0, "sec_rev_pts": 0, "sec_rev_pts_after_cutoff": 0,
-               "sec_ixbrl_pts": 0, "cutoff_years": SEC_CUTOFF_YEARS, "backfill_used": False}
-
-        t = yf.Ticker(ticker)
-        info = {}
-        try: info = t.info or {}
-        except Exception: info = {}
-        shares_now = float(info.get("sharesOutstanding") or 0.0)
-
-        # gemensam fyllare
-        def _fill_from_quarters(seq: list[tuple[pd.Timestamp, float]], base_src: str,
-                                apply_cutoff: bool, mark_old: bool,
-                                shares_map: dict | None, q_already: set[str]) -> int:
-            filled = 0
-            labels = [("P/S Q1","P/S Q1 datum","Källa P/S Q1"),
-                      ("P/S Q2","P/S Q2 datum","Källa P/S Q2"),
-                      ("P/S Q3","P/S Q3 datum","Källa P/S Q3"),
-                      ("P/S Q4","P/S Q4 datum","Källa P/S Q4")]
-            for i, (lab_ps, lab_dt, lab_src) in enumerate(labels):
-                if i >= len(seq): break
-                end_ts, _ = seq[i]
-                if apply_cutoff and end_ts < cutoff_ts: 
-                    continue
-                # bygg TTM-fönster
-                window = seq[i:i+4]
-                if len(window) < 4: 
-                    continue
-                ttm = sum(v for _, v in window)
-                if ttm <= 0: 
-                    continue
-                # pris vid/efter periodslut
-                px, px_src = _nearest_price_on_or_after(t, end_ts)
-                if px is None: 
-                    continue
-                dbg["price_hits"] += 1
-                # aktier (SEC-shares när tillgängligt)
-                end_iso = _clean_iso(end_ts)
-                sh = None
-                if shares_map:
-                    sh = _nearest_shares_for_date(end_iso, shares_map)
-                if not sh or sh <= 0:
-                    sh = shares_now
-                    src = f"{base_src}+Current-shares+{px_src}"
-                else:
-                    src = f"{base_src}+SEC-shares+{px_src}"
-                if end_iso in q_already:
-                    continue
-                ps = round((px * float(sh))/float(ttm), 3)
-                out[lab_ps] = ps
-                out[lab_dt] = end_iso
-                out[lab_src] = src + (" [pre-cutoff]" if mark_old else "")
-                q_already.add(end_iso)
-                dbg["ttm_points"] += 1
-                filled += 1
-            return filled
-
-        used_q_dates = set()
-
-        # ---- 1) Yahoo quarterly primärt ----
-        qfin = _try_get_quarterly_revenue_df(t)
-        if qfin is not None and not qfin.empty and "Total Revenue" in qfin.index:
-            cols_raw = list(qfin.columns)
-            cols = [ _to_naive_ts(c) for c in cols_raw ]
-            cols = [c for c in cols if c is not None]
-            cols = sorted(cols, reverse=True)
-            dbg["q_cols"] = len(cols)
-            rev = qfin.loc["Total Revenue"][cols_raw].astype(float)
-            yahoo_quarters = []
-            for c in cols:
-                try:
-                    v = float(rev[pd.Timestamp(c)])
-                    yahoo_quarters.append((pd.Timestamp(c), v))
-                except Exception:
-                    continue
-
-            # hämta ev. SEC-shares för bättre kvot
-            cik = _ticker_to_cik_any(ticker); dbg["sec_cik"] = cik
-            shares_map = {}
-            if cik:
-                facts = _fetch_companyfacts(cik)
-                if facts:
-                    shares_map = _extract_shares_history(facts)
-                    dbg["sec_shares_pts"] = len(shares_map)
-
-            # fyll med cutoff, sedan backfill om tillåtet
-            _fill_from_quarters(yahoo_quarters, base_src="Computed/Yahoo-revenue", 
-                                apply_cutoff=True, mark_old=False,
-                                shares_map=shares_map, q_already=used_q_dates)
-            if sum(out[k] > 0 for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]) < 4 and ALLOW_BACKFILL:
-                add = _fill_from_quarters(yahoo_quarters, base_src="Computed/Yahoo-revenue",
-                                          apply_cutoff=False, mark_old=True,
-                                          shares_map=shares_map, q_already=used_q_dates)
-                if add > 0: dbg["backfill_used"] = True
-
-        # P/S TTM direkt från Yahoo
-        ps_ttm = info.get("priceToSalesTrailing12Months")
-        if ps_ttm and ps_ttm > 0:
-            out["P/S"] = float(ps_ttm); out["Källa P/S"] = "Yahoo/ps_ttm"; dbg["ps_source"] = "yahoo_ps_ttm"
-
-        # ---- 2) SEC iXBRL fallback (fångar allra senaste kvartalet) ----
-        if sum(out[k] > 0 for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]) < 4:
-            ix_quarters = hamta_sec_ixbrl_quarter_revenues(ticker, max_docs=6)
-            dbg["sec_ixbrl_pts"] = len(ix_quarters)
-            # shares via companyfacts om möjligt
-            cik = dbg.get("sec_cik") or _ticker_to_cik_any(ticker)
-            shares_map = {}
-            if cik:
-                facts = _fetch_companyfacts(cik)
-                if facts:
-                    shares_map = _extract_shares_history(facts)
-                    dbg["sec_shares_pts"] = max(dbg["sec_shares_pts"], len(shares_map))
-            # fyll med cutoff → ev. backfill
-            _fill_from_quarters(ix_quarters, base_src="SEC/ixbrl-revenue",
-                                apply_cutoff=True, mark_old=False,
-                                shares_map=shares_map, q_already=used_q_dates)
-            if sum(out[k] > 0 for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]) < 4 and ALLOW_BACKFILL:
-                add = _fill_from_quarters(ix_quarters, base_src="SEC/ixbrl-revenue",
-                                          apply_cutoff=False, mark_old=True,
-                                          shares_map=shares_map, q_already=used_q_dates)
-                if add > 0: dbg["backfill_used"] = True
-
-        # ---- 3) SEC companyfacts (som tidigare) ----
-        if sum(out[k] > 0 for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]) < 4:
-            cik = dbg.get("sec_cik") or _ticker_to_cik_any(ticker)
-            if cik:
-                facts = _fetch_companyfacts(cik)
-                if facts:
-                    shares_map = _extract_shares_history(facts)
-                    dbg["sec_shares_pts"] = max(dbg["sec_shares_pts"], len(shares_map))
-                    sec_quarters = _extract_sec_quarter_revenues(facts)
-                    dbg["sec_rev_pts"] = len(sec_quarters)
-                    seq_after = [(ts, v) for ts, v in sec_quarters if ts >= cutoff_ts]
-                    dbg["sec_rev_pts_after_cutoff"] = len(seq_after)
-
-                    _fill_from_quarters(seq_after, base_src="SEC/revenue",
-                                        apply_cutoff=False, mark_old=False,
-                                        shares_map=shares_map, q_already=used_q_dates)
-                    if sum(out[k] > 0 for k in ["P/S Q1","P/S Q2","P/S Q3","P/S Q4"]) < 4 and ALLOW_BACKFILL:
-                        add = _fill_from_quarters(sec_quarters, base_src="SEC/revenue",
-                                                  apply_cutoff=False, mark_old=True,
-                                                  shares_map=shares_map, q_already=used_q_dates)
-                        if add > 0: dbg["backfill_used"] = True
-
-                    if (not out["P/S"] or out["P/S"] <= 0) and out["P/S Q1"] and out["P/S Q1"] > 0:
-                        out["P/S"] = float(out["P/S Q1"])
-                        out["Källa P/S"] = "SEC_fallback/q1_ttm" + (" [pre-cutoff]" if dbg["backfill_used"] else "")
-                        dbg["ps_source"] = "sec_fallback"
-
-        # ---- 4) Sista fallback: MC/TTM ----
-        if (not out["P/S"] or out["P/S"] <= 0):
-            try:
-                mc = info.get("marketCap")
-                px_now = info.get("regularMarketPrice")
-                if not mc:
-                    if not px_now:
-                        h = t.history(period="5d"); h = _naive_index(h)
-                        if not h.empty: px_now = float(h["Close"].iloc[-1])
-                    if px_now and shares_now: mc = float(px_now) * float(shares_now)
-                fin = getattr(t, "financials", None)
-                ttm_rev = None
-                if isinstance(fin, pd.DataFrame) and not fin.empty and "Total Revenue" in fin.index:
-                    ttm_rev = float(fin.loc["Total Revenue"].dropna().iloc[-1])
-                if mc and ttm_rev and ttm_rev > 0:
-                    out["P/S"] = round(float(mc)/float(ttm_rev), 3)
-                    out["Källa P/S"] = "Fallback/MC_over_TTM"; dbg["ps_source"] = "fallback_mc_over_ttm"
-            except Exception:
-                pass
-
-        out["_DEBUG_PS"] = dbg
-        return out
-
-    except Exception:
-        return out
-
-# ---------- Yahoo fält + logg ----------
 def hamta_yahoo_fält(ticker: str) -> dict:
+    """
+    Hämtar och beräknar:
+      - Bolagsnamn, Aktuell kurs, Valuta, Årlig utdelning, CAGR 5 år (%)
+      - Utestående aktier (miljoner) (Yahoo/SEC fallback)
+      - P/S (TTM)
+      - P/S Q1...Q4 (+ datum + källrader)
+    Lägger en loggrad i st.session_state["fetch_logs"].
+    """
     out = {
-        "Bolagsnamn":"", "Aktuell kurs":0.0, "Valuta":"USD",
-        "Årlig utdelning":0.0, "CAGR 5 år (%)":0.0,
-        "Utestående aktier":0.0,
-        "Källa Aktuell kurs":"", "Källa Utestående aktier":""
+        "Bolagsnamn": "", "Aktuell kurs": 0.0, "Valuta": "USD", "Årlig utdelning": 0.0,
+        "CAGR 5 år (%)": 0.0, "Utestående aktier": 0.0,
+        "Källa Aktuell kurs": "", "Källa Utestående aktier": "", "Källa P/S": "",
+        "Källa P/S Q1": "", "Källa P/S Q2": "", "Källa P/S Q3": "", "Källa P/S Q4": "",
+        "P/S Q1 datum": "", "P/S Q2 datum": "", "P/S Q3 datum": "", "P/S Q4 datum": "",
     }
-    log = {"ticker": ticker, "ts": now_stamp(), "source": "yahoo+sec", "yahoo": {}, "sec": {}, "ps": {}, "summary": ""}
+    logs = {"ticker": ticker.upper(), "ts": _now_iso(), "ps": {}}
+
+    t = yf.Ticker(ticker)
+
+    # --- Grundfält från Yahoo ---
     try:
-        t = yf.Ticker(ticker)
+        info = t.info or {}
+    except Exception:
         info = {}
+
+    # pris/valuta/shares
+    price, curr, y_shares = _yahoo_price_currency_shares(t)
+    out["Aktuell kurs"] = float(price or 0.0)
+    out["Valuta"] = (curr or "USD").upper()
+    out["Källa Aktuell kurs"] = "Yahoo/info"
+
+    name = info.get("shortName") or info.get("longName") or ""
+    out["Bolagsnamn"] = str(name)
+    out["Årlig utdelning"] = float(info.get("dividendRate") or 0.0)
+    out["CAGR 5 år (%)"] = beräkna_cagr_från_finansiella(t)
+
+    # --- SEC fakta (shares & revenue) ---
+    cik = _cik_for_ticker(ticker)
+    cutoff_years, allow_backfill = _sec_cfg()
+
+    sec_shares = []
+    sec_rev = []
+    if cik:
         try:
-            info = t.info or {}
-            log["yahoo"]["info_keys_sample"] = sorted(list(info.keys()))[:20]
-        except Exception as e:
-            log["yahoo"]["info_error"] = str(e)
+            facts = _sec_companyfacts(cik)
+            sec_shares = _sec_extract_series(
+                facts,
+                tags=["CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding"],
+                unit_keys=["shares"]
+            )
+            sec_rev = _sec_extract_series(
+                facts,
+                tags=["RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet","Revenues"],
+                unit_keys=["USD"]
+            )
+        except Exception:
+            sec_shares, sec_rev = [], []
 
-        pris = info.get("regularMarketPrice")
-        if pris is None:
-            try:
-                h = t.history(period="1d")
-                h = _naive_index(h)
-                if not h.empty and "Close" in h:
-                    pris = float(h["Close"].iloc[-1])
-                    out["Källa Aktuell kurs"] = "Yahoo/history"
-                    log["yahoo"]["got_price_from"] = "history"
-            except Exception as e:
-                log["yahoo"]["history_error"] = str(e)
-        else:
-            out["Källa Aktuell kurs"] = "Yahoo/info"
-            log["yahoo"]["got_price_from"] = "info"
-        if pris is not None:
-            out["Aktuell kurs"] = float(pris)
-
-        valuta = info.get("currency")
-        if valuta: out["Valuta"] = str(valuta).upper()
-        namn = info.get("shortName") or info.get("longName") or ""
-        if namn: out["Bolagsnamn"] = str(namn)
-
-        div_rate = info.get("dividendRate")
-        if div_rate is not None: out["Årlig utdelning"] = float(div_rate)
-
-        shares = info.get("sharesOutstanding")
-        if shares and float(shares) > 0:
-            out["Utestående aktier"] = round(float(shares)/1e6, 2)
+    # Utestående aktier: prioritera SEC senaste, annars Yahoo
+    try:
+        if sec_shares:
+            last = sorted(sec_shares, key=lambda x: x["date"])[-1]
+            out["Utestående aktier"] = round(float(last["val"]) / 1e6, 2)  # miljoner
+            out["Källa Utestående aktier"] = "SEC/companyfacts"
+        elif y_shares > 0:
+            out["Utestående aktier"] = round(float(y_shares) / 1e6, 2)
             out["Källa Utestående aktier"] = "Yahoo/info"
-        log["yahoo"]["has_sharesOutstanding"] = bool(shares)
+    except Exception:
+        pass
 
-        out["CAGR 5 år (%)"] = beräkna_cagr_från_finansiella(t)
+    # --- P/S (TTM) ---
+    ps_ttm, ps_src = _yahoo_ps_ttm_or_marketcap(t, price, y_shares)
+    out["P/S"] = float(round(ps_ttm, 2) if ps_ttm else 0.0)
+    out["Källa P/S"] = ps_src
 
-        ps_data = hamta_ps_kvartal(ticker)
-        out.update(ps_data)
+    # --- Bygg kvartals-P/S (Q1..Q4) ---
+    # Kandidat-revenue: Yahoo + SEC, sortera senaste först
+    yrev = _yahoo_quarterly_revenue_all(t)          # {'YYYY-MM-DD': val}
+    all_rev = {}
+    all_rev.update(sec_rev and {p["date"]: p["val"] for p in sec_rev} or {})
+    all_rev.update(yrev)  # Yahoo får sista ordet för senaste
+    # filter på cutoff: endast de senaste cutoff_years åren
+    if all_rev:
+        cutoff_date = datetime.now() - timedelta(days=365*cutoff_years)
+        rev_items = [(d, v) for d, v in all_rev.items() if datetime.fromisoformat(d) >= cutoff_date]
+        rev_items_sorted = sorted(rev_items, key=lambda x: x[0], reverse=True)
+    else:
+        rev_items_sorted = []
 
-        log["ps"] = ps_data.get("_DEBUG_PS", {})
-        log["sec"]["cik"] = log["ps"].get("sec_cik")
-        log["sec"]["shares_points"] = log["ps"].get("sec_shares_pts", 0)
-        log["sec"]["rev_points"] = log["ps"].get("sec_rev_pts", 0)
-        log["sec"]["rev_points_after_cutoff"] = log["ps"].get("sec_rev_pts_after_cutoff", 0)
-        log["sec"]["ixbrl_points"] = log["ps"].get("sec_ixbrl_pts", 0)
-        log["summary"] = (
-            f"kurs:{log['yahoo'].get('got_price_from','-')}, ps_src:{log['ps'].get('ps_source','-')}, "
-            f"qcols:{log['ps'].get('q_cols',0)}, ttm_pts:{log['ps'].get('ttm_points',0)}, "
-            f"px_hits:{log['ps'].get('price_hits',0)}, sec_ixbrl:{log['ps'].get('sec_ixbrl_pts',0)}, "
-            f"sec_shares:{log['ps'].get('sec_shares_pts',0)}, "
-            f"sec_rev:{log['ps'].get('sec_rev_pts',0)}/{log['ps'].get('sec_rev_pts_after_cutoff',0)} "
-            f"(cutoff {log['ps'].get('cutoff_years',6)}y, backfill={log['ps'].get('backfill_used',False)})"
-        )
-    except Exception as e:
-        log["error"] = str(e)
-    finally:
-        logs = st.session_state.get("fetch_logs", [])
-        logs.append(log)
-        st.session_state["fetch_logs"] = logs[-200:]
+    # om färre än 4 efter cutoff → backfill med äldre kvartal (om tillåtet)
+    rev_after_cutoff = rev_items_sorted.copy()
+    if len(rev_after_cutoff) < 4 and allow_backfill and all_rev:
+        older = [(d, v) for d, v in all_rev.items() if d not in dict(rev_after_cutoff)]
+        older = sorted(older, key=lambda x: x[0], reverse=True)
+        need = 4 - len(rev_after_cutoff)
+        rev_after_cutoff += older[:max(0, need)]
+
+    q_dates_vals = rev_after_cutoff[:4]  # ta senaste 4
+    ps_rows, price_hits = _compute_quarter_ps(t, q_dates_vals, sec_shares)
+
+    # Map till Q1..Q4
+    # Q1 = senaste kvartal, Q4 = fjärde senaste
+    for idx, (d_iso, ps_val, label) in enumerate(ps_rows):
+        qcol = f"P/S Q{idx+1}"
+        out[qcol] = float(round(ps_val, 2) if ps_val else 0.0)
+        out[f"{qcol} datum"] = d_iso
+        # märk om datapunkt låg före cutoff (backfillad)
+        backfill_note = ""
+        try:
+            cut = datetime.now() - timedelta(days=365*cutoff_years)
+            if datetime.fromisoformat(d_iso) < cut:
+                backfill_note = " [pre-cutoff]"
+        except Exception:
+            pass
+        out[f"Källa P/S Q{idx+1}"] = label + backfill_note
+
+    # Fyll 0 på ev. tomma Q-kolumner
+    for q in (1,2,3,4):
+        out.setdefault(f"P/S Q{q}", 0.0)
+        out.setdefault(f"P/S Q{q} datum", "")
+        out.setdefault(f"Källa P/S Q{q}", "")
+
+    # --- Logg ---
+    logs["ps"] = {
+        "ps_source": ps_src,
+        "q_cols": len(q_dates_vals),
+        "price_hits": price_hits,
+        "sec_cik": cik,
+        "sec_ixbrl_pts": 0,                   # (vi använder companyfacts här)
+        "sec_shares_pts": len(sec_shares),
+        "sec_rev_pts": len(sec_rev),
+        "cutoff_years": int(cutoff_years),
+        "backfill_used": bool(allow_backfill)
+    }
+    logs["summary"] = f"Yahoo price/currency/shares, SEC facts shares+revenue, Q1..Q4={len(q_dates_vals)}"
+    st.session_state.setdefault("fetch_logs", []).append(logs)
+
     return out

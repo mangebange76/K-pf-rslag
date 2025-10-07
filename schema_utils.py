@@ -1,6 +1,5 @@
 # schema_utils.py
 import pandas as pd
-import numpy as np
 
 FINAL_COLS = [
     "Ticker","Bolagsnamn","Utestående aktier",
@@ -19,7 +18,15 @@ FINAL_COLS = [
 def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     for kol in FINAL_COLS:
         if kol not in df.columns:
-            if any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs","snitt","utestående"]):
+            # metadata/källor/tidsstämplar ska vara text
+            if kol.startswith("Källa ") or kol.startswith("TS ") or kol in [
+                "Senast manuellt uppdaterad","Senast auto uppdaterad",
+                "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
+                "Ticker","Bolagsnamn","Valuta"
+            ]:
+                df[kol] = ""
+            # numeriska fält
+            elif any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs","snitt","utestående"]):
                 df[kol] = 0.0
             else:
                 df[kol] = ""

@@ -1,12 +1,9 @@
 # views.py
 from __future__ import annotations
 import time
-import json
 import numpy as np
 import pandas as pd
 import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
 
 from data_sources import (
     hamta_yahoo_fält,
@@ -19,6 +16,7 @@ from sheets_utils import (
     spara_valutakurser,
     spara_data,
     hamta_valutakurs,
+    spara_hamtlogg,       # för logg-knappen
 )
 
 # Försök använda din riktiga beräkningsmodul; fallback om den saknas
@@ -95,25 +93,26 @@ def _shares_label(row: pd.Series) -> str:
 def hamta_valutakurser_sidebar() -> dict:
     st.sidebar.header("💱 Valutakurser → SEK")
     saved = las_sparade_valutakurser()
-    usd = st.sidebar.number_input("USD → SEK", value=float(saved.get("USD", 9.75)), step=0.01, format="%.4f")
-    nok = st.sidebar.number_input("NOK → SEK", value=float(saved.get("NOK", 0.95)), step=0.01, format="%.4f")
-    cad = st.sidebar.number_input("CAD → SEK", value=float(saved.get("CAD", 7.05)), step=0.01, format="%.4f")
-    eur = st.sidebar.number_input("EUR → SEK", value=float(saved.get("EUR", 11.18)), step=0.01, format="%.4f")
+    usd = st.sidebar.number_input("USD → SEK", value=float(saved.get("USD", 10.0)), step=0.01, format="%.4f")
+    nok = st.sidebar.number_input("NOK → SEK", value=float(saved.get("NOK", 1.0)), step=0.01, format="%.4f")
+    cad = st.sidebar.number_input("CAD → SEK", value=float(saved.get("CAD", 7.5)), step=0.01, format="%.4f")
+    eur = st.sidebar.number_input("EUR → SEK", value=float(saved.get("EUR", 11.0)), step=0.01, format="%.4f")
     user_rates = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
 
     c1, c2 = st.sidebar.columns(2)
     with c1:
         if st.button("💾 Spara kurser"):
             spara_valutakurser(user_rates)
-            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
             st.sidebar.success("Valutakurser sparade.")
     with c2:
         if st.button("🌐 Live-kurser (Yahoo)"):
             live = hamta_live_valutakurser()
-            spara_valutakurser(live)
-            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
-            st.sidebar.success("Live-kurser hämtade & sparade.")
-            st.rerun()
+            if live:
+                spara_valutakurser(live)
+                st.sidebar.success("Live-kurser hämtade & sparade.")
+                st.rerun()
+            else:
+                st.sidebar.error("Kunde inte hämta live-kurser just nu. Behåller dina sparade värden.")
 
     st.sidebar.markdown("---")
     if st.sidebar.button("↻ Läs om data från Google Sheets"):
@@ -121,6 +120,39 @@ def hamta_valutakurser_sidebar() -> dict:
         st.rerun()
 
     return user_rates
+
+
+def visa_hamtlogg_panel() -> None:
+    """Liten panel i sidbaren som visar senaste nät-hämtloggarna."""
+    logs = st.session_state.get("fetch_logs", [])
+    with st.sidebar.expander("🧾 Hämtlogg", expanded=False):
+        if not logs:
+            st.caption("Ingen logg ännu.")
+        else:
+            st.caption(f"Poster: {len(logs)} (senaste överst)")
+            for it in reversed(logs[-10:]):
+                t = it.get("type", "")
+                tkr = it.get("ticker", "")
+                ps = it.get("ps", {})
+                src = ps.get("ps_source", "")
+                qpts = ps.get("qrev_pts", "")
+                sec_pts = ps.get("sec_shares_pts", "")
+                st.code(f"{t} {tkr} | ps={src}, qrev={qpts}, sec_shares={sec_pts}", language="text")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🧹 Töm logg"):
+                st.session_state["fetch_logs"] = []
+                st.rerun()
+        with c2:
+            if st.button("⬆️ Spara logg"):
+                ok, msg = spara_hamtlogg(st.session_state.get("fetch_logs", []))
+                (st.success if ok else st.error)(msg)
+
+
+def spara_logg_till_sheets() -> None:
+    """Wrapper till appens knapp (kallar sheets_utils.spara_hamtlogg)."""
+    ok, msg = spara_hamtlogg(st.session_state.get("fetch_logs", []))
+    (st.success if ok else st.error)(msg)
 
 
 def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.DataFrame:
@@ -162,7 +194,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
             if not data.get("Valuta"):
                 miss.append(f"{tkr}: Valuta")
 
-            time.sleep(0.3)
+            time.sleep(0.25)
             bar.progress((i+1)/max(1,total))
 
         df = uppdatera_berakningar(df, user_rates) if _UPD_USES_RATES else uppdatera_berakningar(df)
@@ -306,7 +338,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         if logs:
             last = logs[-1]
             meta = last.get("ps", {})
-            q_cols = meta.get("q_cols","?")
+            q_cols = meta.get("qrev_pts","?")
             sec_pts = meta.get("sec_shares_pts","?")
             sec_cik = meta.get("sec_cik","")
             st.caption(f"Debug: ps_source={meta.get('ps_source','?')}, qrev_pts={q_cols}, sec_cik={sec_cik}, sec_shares_pts={sec_pts}")
@@ -353,29 +385,6 @@ def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
 
     st.markdown("### Hela databasen")
     st.dataframe(df, use_container_width=True)
-
-
-def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
-    st.header("📦 Min portfölj")
-    port = df[df["Antal aktier"] > 0].copy()
-    if port.empty:
-        st.info("Du äger inga aktier.")
-        return
-    port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
-    port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
-    total_värde = float(port["Värde (SEK)"].sum())
-    port["Andel (%)"] = round(port["Värde (SEK)"] / total_värde * 100.0, 2)
-    port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
-    tot_utd = float(port["Total årlig utdelning (SEK)"].sum())
-
-    st.markdown(f"**Totalt portföljvärde:** {round(total_värde,2)} SEK")
-    st.markdown(f"**Total kommande utdelning:** {round(tot_utd,2)} SEK")
-    st.markdown(f"**Ungefärlig månadsutdelning:** {round(tot_utd/12.0,2)} SEK")
-
-    st.dataframe(
-        port[["Ticker","Bolagsnamn","Antal aktier","Aktuell kurs","Valuta","Värde (SEK)","Andel (%)","Årlig utdelning","Total årlig utdelning (SEK)"]],
-        use_container_width=True
-    )
 
 
 def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
@@ -454,71 +463,3 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 - **Andel efter köp:** {ny_andel} %
 """
     )
-
-
-# ========================== Hämtlogg (som app.py importerar) ==========================
-
-def visa_hamtlogg_panel() -> None:
-    """Liten loggpanel i sidopanelen. Visar rader som data_sources lägger i st.session_state['fetch_logs']."""
-    st.sidebar.markdown("### 🧪 Hämtlogg")
-    logs = st.session_state.get("fetch_logs", [])
-    if not logs:
-        st.sidebar.caption("Tom logg.")
-        return
-
-    tkr_filter = st.sidebar.text_input("Filter (ticker, valfritt)").strip().upper()
-    show = logs
-    if tkr_filter:
-        show = [x for x in logs if str(x.get("ticker","")).upper().find(tkr_filter) >= 0]
-
-    # visa max 30 senaste
-    for item in list(show)[-30:][::-1]:
-        ts = item.get("ts","")
-        tkr = item.get("ticker","")
-        summary = item.get("summary","")
-        st.sidebar.caption(f"{ts} · {tkr} — {summary}")
-
-
-def spara_logg_till_sheets(sheet_name: str = "Hamtlogg") -> None:
-    """Skriver st.session_state['fetch_logs'] till ett blad 'Hamtlogg' i samma Google Sheet."""
-    logs = st.session_state.get("fetch_logs", [])
-    if not logs:
-        st.warning("Ingen hämtlogg att spara.")
-        return
-
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds_info = st.secrets.get("GOOGLE_CREDENTIALS", {})
-        if not creds_info:
-            raise RuntimeError("Saknar GOOGLE_CREDENTIALS i secrets.")
-        credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
-        client = gspread.authorize(credentials)
-
-        sheet_url = st.secrets.get("SHEET_URL", "")
-        if not sheet_url:
-            raise RuntimeError("Saknar SHEET_URL i secrets.")
-        ss = client.open_by_url(sheet_url)
-
-        try:
-            ws = ss.worksheet(sheet_name)
-        except Exception:
-            ws = ss.add_worksheet(title=sheet_name, rows=2000, cols=10)
-
-        df = pd.DataFrame(logs)
-        # Packa meta (ps) som JSON-sträng om det finns
-        if "ps" in df.columns:
-            df["meta_ps"] = df["ps"].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else ("" if x is None else str(x)))
-        else:
-            df["meta_ps"] = ""
-
-        cols = ["ts", "ticker", "summary", "meta_ps"]
-        for c in cols:
-            if c not in df.columns:
-                df[c] = ""
-        values = [cols] + df[cols].astype(str).values.tolist()
-
-        ws.clear()
-        ws.update(values)
-        st.success(f"Hämtlogg sparad till bladet '{sheet_name}'.")
-    except Exception as e:
-        st.error(f"Kunde inte spara hämtlogg: {e}")

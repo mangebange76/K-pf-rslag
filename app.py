@@ -1,18 +1,17 @@
 # app.py
-import streamlit as st
+from __future__ import annotations
 import pandas as pd
+import streamlit as st
+import numpy as np
 
 from sheets_utils import (
-    hamta_data, spara_data, las_sparade_valutakurser, spara_valutakurser,
-    hamta_valutakurs, skapa_snapshot_om_saknas, now_stamp
+    hamta_data, spara_data, skapa_snapshot_om_saknas,
 )
 from views import (
-    hamta_valutakurser_sidebar, massuppdatera, lagg_till_eller_uppdatera,
-    analysvy, visa_investeringsforslag, visa_hamtlogg_panel, spara_logg_till_sheets
+    hamta_valutakurser_sidebar, visa_hamtlogg_panel, spara_logg_till_sheets,
+    massuppdatera, lagg_till_eller_uppdatera, analysvy, visa_investeringsforslag,
 )
-from calc_and_cache import uppdatera_berakningar
 
-# ---------- Sidinställning ----------
 st.set_page_config(page_title="Aktieanalys och investeringsförslag", layout="wide")
 
 # ---------- Kolumnschema ----------
@@ -23,8 +22,9 @@ FINAL_COLS = [
     # P/S & kvartal
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
     "P/S Q1 datum", "P/S Q2 datum", "P/S Q3 datum", "P/S Q4 datum",
-    "Källa Aktuell kurs", "Källa Utestående aktier", "Källa P/S", "Källa P/S Q1", "Källa P/S Q2", "Källa P/S Q3", "Källa P/S Q4",
-    # Omsättning & riktkurser
+    "Källa Aktuell kurs", "Källa Utestående aktier", "Källa P/S",
+    "Källa P/S Q1", "Källa P/S Q2", "Källa P/S Q3", "Källa P/S Q4",
+    # Omsättning & riktkurser (miljoner och per aktie)
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
     # Derivat/övrigt
@@ -86,37 +86,43 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].astype(str)
     return df
 
-# ---------- Portföljvy (lokal, enkel) ----------
-def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
-    st.header("📦 Min portfölj")
-    port = df[df["Antal aktier"] > 0].copy()
-    if port.empty:
-        st.info("Du äger inga aktier.")
-        return
-    port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
-    port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
-    total_värde = float(port["Värde (SEK)"].sum())
-    port["Andel (%)"] = (port["Värde (SEK)"] / total_värde * 100.0).round(2)
-    port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
+# Minimal fallback för beräkningar om du inte har en calc_and_cache-modul
+def _uppdatera_berakningar(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for i, rad in df.iterrows():
+        ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
+        ps_clean = [float(x) for x in ps_vals if float(x) > 0]
+        ps_snitt = round(float(np.mean(ps_clean)) if ps_clean else 0.0, 2)
+        df.at[i, "P/S-snitt"] = ps_snitt
 
-    st.markdown(f"**Totalt portföljvärde:** {round(total_värde,2)} SEK")
-    tot_utd = float(port["Total årlig utdelning (SEK)"].sum())
-    st.markdown(f"**Total kommande utdelning:** {round(tot_utd,2)} SEK")
-    st.markdown(f"**Ungefärlig månadsutdelning:** {round(tot_utd/12.0,2)} SEK")
+        cagr = float(rad.get("CAGR 5 år (%)", 0.0))
+        just_cagr = 50.0 if cagr > 100.0 else (2.0 if cagr < 0.0 else cagr)
+        g = just_cagr / 100.0
 
-    st.dataframe(
-        port[["Ticker","Bolagsnamn","Antal aktier","Aktuell kurs","Valuta","Värde (SEK)","Andel (%)","Årlig utdelning","Total årlig utdelning (SEK)"]],
-        use_container_width=True
-    )
+        oms_next = float(rad.get("Omsättning nästa år", 0.0))
+        if oms_next > 0:
+            df.at[i, "Omsättning om 2 år"] = round(oms_next * (1.0 + g), 2)
+            df.at[i, "Omsättning om 3 år"] = round(oms_next * ((1.0 + g) ** 2), 2)
 
-# ---------- MAIN ----------
+        ps_use = ps_snitt if ps_snitt > 0 else float(rad.get("P/S", 0.0))
+        aktier_ut_mn = float(rad.get("Utestående aktier", 0.0))
+        if aktier_ut_mn > 0 and ps_use > 0:
+            df.at[i, "Riktkurs idag"]    = round((float(rad.get("Omsättning idag", 0.0))     * ps_use) / aktier_ut_mn, 2)
+            df.at[i, "Riktkurs om 1 år"] = round((float(rad.get("Omsättning nästa år", 0.0)) * ps_use) / aktier_ut_mn, 2)
+            df.at[i, "Riktkurs om 2 år"] = round((float(df.at[i, "Omsättning om 2 år"])      * ps_use) / aktier_ut_mn, 2)
+            df.at[i, "Riktkurs om 3 år"] = round((float(df.at[i, "Omsättning om 3 år"])      * ps_use) / aktier_ut_mn, 2)
+        else:
+            for k in ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"]:
+                df.at[i, k] = 0.0
+    return df
+
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    # Valutakurser + hämtlogg i sidopanelen
+    # Sidopanel: valutakurser + hämtlogg + sheets-status
     user_rates = hamta_valutakurser_sidebar()
     visa_hamtlogg_panel()
-    if st.sidebar.button("🗃️ Spara hämtlogg till Sheets"):
+    if st.sidebar.button("⬆️ Spara hämtlogg"):
         spara_logg_till_sheets()
 
     # Läs data
@@ -134,27 +140,21 @@ def main():
     if "did_bootstrap_snapshot" not in st.session_state:
         ok, msg = skapa_snapshot_om_saknas(df)
         st.session_state["did_bootstrap_snapshot"] = True
-        if ok:
-            st.sidebar.success(msg)
-        else:
-            st.sidebar.caption(msg)
+        st.sidebar.write(msg)
 
     # Global massuppdateringsknapp i sidopanelen
     df = massuppdatera(df, key_prefix="global", user_rates=user_rates)
 
     # Meny
-    meny = st.sidebar.radio("📌 Välj vy", ["Analys","Lägg till / uppdatera bolag","Investeringsförslag","Portfölj"])
+    meny = st.sidebar.radio("📌 Välj vy", ["Analys","Lägg till / uppdatera bolag","Investeringsförslag"])
 
     if meny == "Analys":
         analysvy(df, user_rates)
     elif meny == "Lägg till / uppdatera bolag":
         df = lagg_till_eller_uppdatera(df, user_rates)
     elif meny == "Investeringsförslag":
-        df = uppdatera_berakningar(df, user_rates)
+        df = _uppdatera_berakningar(df)
         visa_investeringsforslag(df, user_rates)
-    elif meny == "Portfölj":
-        df = uppdatera_berakningar(df, user_rates)
-        visa_portfolj(df, user_rates)
 
 if __name__ == "__main__":
     main()

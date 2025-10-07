@@ -1,213 +1,284 @@
 # sheets_utils.py
+# ----------------------------------------------------------
+# Läs/skriv mot Google Sheets med snälla fallbacks lokalt.
+# Kräver st.secrets med antingen:
+#   - gcp_service_account (standard Streamlit-format) OCH
+#   - sheets: { main_id: "<Google Sheet ID>",
+#               data_ws: "Data",
+#               rates_ws: "Rates",
+#               logs_ws: "FetchLog",
+#               snapshots_prefix: "Snap-" }
+# Om inget av detta finns -> jobbar i minnet + enkla lokala filer.
+# ----------------------------------------------------------
+
 from __future__ import annotations
-import time
+import json
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import pandas as pd
 import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
 
-# -------------------- Tid/zon --------------------
-try:
-    import pytz
-    TZ_STHLM = pytz.timezone("Europe/Stockholm")
-    def now_stamp() -> str:
-        return datetime.now(TZ_STHLM).strftime("%Y-%m-%d")
-except Exception:
-    def now_stamp() -> str:
-        return datetime.now().strftime("%Y-%m-%d")
+# ----------------- Konfiguration -----------------
 
-# -------------------- Konfig --------------------
-SHEET_URL = st.secrets.get("SHEET_URL", "")
-SHEET_NAME = st.secrets.get("SHEET_NAME", "Blad1")
-RATES_SHEET_NAME = st.secrets.get("RATES_SHEET_NAME", "Valutakurser")
-
-DEFAULT_RATES = {"USD": 9.75, "EUR": 11.18, "NOK": 0.95, "CAD": 7.05, "SEK": 1.0}
-
-# Viktigt: matchar app.py + nya metadatafält som vyerna använder
-FINAL_COLS = [
-    # Bas
-    "Ticker", "Bolagsnamn", "Valuta", "Aktuell kurs", "Årlig utdelning",
-    "Utestående aktier", "Antal aktier",
-    # P/S & kvartal
-    "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
-    "P/S Q1 datum", "P/S Q2 datum", "P/S Q3 datum", "P/S Q4 datum",
-    "Källa Aktuell kurs", "Källa Utestående aktier", "Källa P/S", "Källa P/S Q1", "Källa P/S Q2", "Källa P/S Q3", "Källa P/S Q4",
-    # Omsättning & riktkurser
-    "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
-    "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    # Derivat/övrigt
-    "CAGR 5 år (%)", "P/S-snitt",
-    # Tidsstämplar & meta
-    "Senast manuellt uppdaterad", "Senast auto uppdaterad",
-    "TS P/S", "TS Utestående aktier", "TS Omsättning",
-]
-
-_STR_COLS = {
-    "Ticker","Bolagsnamn","Valuta",
-    "P/S Q1 datum","P/S Q2 datum","P/S Q3 datum","P/S Q4 datum",
-    "Källa Aktuell kurs","Källa Utestående aktier","Källa P/S","Källa P/S Q1","Källa P/S Q2","Källa P/S Q3","Källa P/S Q4",
-    "Senast manuellt uppdaterad","Senast auto uppdaterad",
-    "TS P/S","TS Utestående aktier","TS Omsättning",
-}
-_NUM_COLS = {
-    "Utestående aktier","Antal aktier",
-    "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
-    "Aktuell kurs","Årlig utdelning","CAGR 5 år (%)",
-    "Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
-    "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
+_DEFAULT_SHEET_CONF = {
+    "main_id": "",
+    "data_ws": "Data",
+    "rates_ws": "Rates",
+    "logs_ws": "FetchLog",
+    "snapshots_prefix": "Snap-",
 }
 
-# -------------------- Google Sheets-klient --------------------
-def _client():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds_info = st.secrets.get("GOOGLE_CREDENTIALS", {})
-    if not creds_info:
-        raise RuntimeError("Saknar GOOGLE_CREDENTIALS i secrets.")
-    credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
-    return gspread.authorize(credentials)
+_LOCAL_DATA = Path("local_data.csv")
+_LOCAL_RATES = Path("local_rates.json")
+_LOCAL_LOGS = Path("local_logs.json")
 
-def _with_backoff(func, *args, **kwargs):
-    delays = [0, 0.5, 1.0, 2.0]
-    last = None
-    for d in delays:
-        if d:
-            time.sleep(d)
+
+# ----------------- Hjälpare: tid -----------------
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+# ----------------- Hjälpare: Sheets -----------------
+
+@st.cache_resource(show_spinner=False)
+def _gspread_client():
+    """Returnera gspread-klient eller None."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        sa = st.secrets.get("gcp_service_account", None)
+        if not sa:
+            return None
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(sa, scopes=scopes)
+        gc = gspread.authorize(creds)
+        return gc
+    except Exception:
+        return None
+
+
+def _sheet_conf() -> dict:
+    try:
+        conf = dict(_DEFAULT_SHEET_CONF)
+        conf.update(st.secrets.get("sheets", {}))
+        return conf
+    except Exception:
+        return dict(_DEFAULT_SHEET_CONF)
+
+
+def _open_sheet():
+    gc = _gspread_client()
+    if not gc:
+        return None
+    conf = _sheet_conf()
+    sid = conf.get("main_id", "")
+    if not sid:
+        return None
+    try:
+        return gc.open_by_key(sid)
+    except Exception:
+        return None
+
+
+def _get_or_create_ws(sh, name: str, rows: int = 1000, cols: int = 40):
+    try:
+        return sh.worksheet(name)
+    except Exception:
         try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            last = e
-    raise last
+            return sh.add_worksheet(title=name, rows=str(rows), cols=str(cols))
+        except Exception:
+            return None
 
-def _spreadsheet():
-    if not SHEET_URL:
-        raise RuntimeError("Saknar SHEET_URL i secrets.")
-    return _with_backoff(_client().open_by_url, SHEET_URL)
 
-def _worksheet(name: str):
-    ss = _spreadsheet()
+def _write_df_to_ws(ws, df: pd.DataFrame):
+    """Skriv DataFrame till worksheet (raderar allt först)."""
     try:
-        return ss.worksheet(name)
+        ws.clear()
+        if df.empty:
+            ws.update("A1", [[""]])
+            return True
+        # Konvertera till listor
+        values = [list(df.columns)]
+        values += df.astype(object).where(pd.notnull(df), "").values.tolist()
+        ws.update("A1", values)
+        return True
     except Exception:
-        ws = ss.add_worksheet(title=name, rows=5000, cols=len(FINAL_COLS) + 5)
-        _with_backoff(ws.update, [FINAL_COLS])
-        return ws
+        return False
 
-def _rates_ws():
-    ss = _spreadsheet()
+
+def _read_ws_to_df(ws) -> pd.DataFrame:
     try:
-        return ss.worksheet(RATES_SHEET_NAME)
+        values = ws.get_all_values()
     except Exception:
-        ws = ss.add_worksheet(title=RATES_SHEET_NAME, rows=20, cols=3)
-        _with_backoff(ws.update, [["Valuta","Kurs"]] + [[k, DEFAULT_RATES[k]] for k in ["USD","EUR","NOK","CAD","SEK"]])
-        return ws
+        return pd.DataFrame()
+    if not values:
+        return pd.DataFrame()
+    header, *rows = values
+    if not header:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, columns=header)
 
-# -------------------- IO: huvudblad --------------------
-def hamta_data() -> pd.DataFrame:
-    ws = _worksheet(SHEET_NAME)
-    rows = _with_backoff(ws.get_all_records)
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return pd.DataFrame({c: [] for c in FINAL_COLS})
-    df = säkerställ_kolumner(df)
-    df = konvertera_typer(df)
-    # håll ordningen
-    for c in FINAL_COLS:
-        if c not in df.columns:
-            df[c] = "" if c in _STR_COLS else 0.0
-    return df[FINAL_COLS]
 
-def spara_data(df: pd.DataFrame) -> None:
-    ws = _worksheet(SHEET_NAME)
-    df = säkerställ_kolumner(df)
-    df = konvertera_typer(df)
-    for c in FINAL_COLS:
-        if c not in df.columns:
-            df[c] = "" if c in _STR_COLS else 0.0
-    df = df[FINAL_COLS]
-    _with_backoff(ws.clear)
-    _with_backoff(ws.update, [df.columns.tolist()] + df.astype(str).values.tolist())
+# ----------------- DATA -----------------
 
-# -------------------- Schemahjälpare --------------------
-def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for kol in FINAL_COLS:
-        if kol not in df.columns:
-            df[kol] = "" if kol in _STR_COLS else 0.0
-    return df
-
-def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for c in _NUM_COLS:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    for c in _STR_COLS:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-    # Heuristik: om Utestående aktier råkat vara i absoluta tal, konvertera till miljoner
-    if "Utestående aktier" in df.columns:
-        df["Utestående aktier"] = df["Utestående aktier"].apply(lambda x: float(x)/1e6 if float(x) > 1e9 else float(x))
-    return df
-
-# -------------------- Valutakurser --------------------
 @st.cache_data(show_spinner=False)
-def las_sparade_valutakurser() -> dict:
-    ws = _rates_ws()
-    rows = _with_backoff(ws.get_all_records)
-    out = {"SEK": 1.0}
-    for r in rows:
-        cur = str(r.get("Valuta","")).upper().strip()
-        val = str(r.get("Kurs","")).replace(",", ".").strip()
+def hamta_data() -> pd.DataFrame:
+    """Läs huvudtabellen från Sheets. Fallback: lokalt/minnet."""
+    sh = _open_sheet()
+    conf = _sheet_conf()
+    if sh:
+        ws = _get_or_create_ws(sh, conf["data_ws"])
+        if ws:
+            df = _read_ws_to_df(ws)
+            if not df.empty:
+                return df
+    # Fallback lokalt
+    if _LOCAL_DATA.exists():
         try:
-            out[cur] = float(val)
+            return pd.read_csv(_LOCAL_DATA)
         except Exception:
             pass
-    for k,v in DEFAULT_RATES.items():
-        out.setdefault(k, v)
-    return out
+    # Fallback minne
+    return st.session_state.get("df_cached", pd.DataFrame())
 
-def spara_valutakurser(rates: dict) -> None:
-    ws = _rates_ws()
-    body = [["Valuta","Kurs"]]
-    for k in ["USD","NOK","CAD","EUR","SEK"]:
-        body.append([k, float(rates.get(k, DEFAULT_RATES.get(k, 1.0)))])
-    _with_backoff(ws.clear)
-    _with_backoff(ws.update, body)
-    st.cache_data.clear()  # reset cache så sidopanelen läser om
 
-def hamta_valutakurs(valuta: str, user_rates: dict | None = None) -> float:
-    if not valuta:
-        return 1.0
-    v = str(valuta).upper().strip()
-    if user_rates and v in user_rates:
-        return float(user_rates[v])
-    saved = las_sparade_valutakurser()
-    return float(saved.get(v, DEFAULT_RATES.get(v, 1.0)))
-
-# -------------------- Snapshot-funktion --------------------
-def skapa_snapshot_om_saknas(df: pd.DataFrame) -> tuple[bool, str]:
-    """
-    Skapar ett nytt blad 'SNAP_YYYY-MM-DD' om det inte redan finns.
-    Returnerar (skapades?, meddelande).
-    """
-    today = now_stamp()
-    snap_name = f"SNAP_{today}"
-    ss = _spreadsheet()
+def spara_data(df: pd.DataFrame) -> bool:
+    """Spara huvudtabellen till Sheets. Fallback: lokalt + minnet."""
+    ok = False
+    sh = _open_sheet()
+    conf = _sheet_conf()
+    if sh:
+        ws = _get_or_create_ws(sh, conf["data_ws"])
+        if ws:
+            ok = _write_df_to_ws(ws, df)
+    # Fallback lokalt + minne oavsett
     try:
-        ss.worksheet(snap_name)
-        return False, f"Snapshot {snap_name} finns redan."
+        df.to_csv(_LOCAL_DATA, index=False)
     except Exception:
         pass
+    st.session_state["df_cached"] = df.copy()
+    return ok
 
-    # skapa nytt blad och skriv DF
-    ws = ss.add_worksheet(title=snap_name, rows= max(1000, len(df) + 10), cols= max(20, len(FINAL_COLS) + 2))
-    # säkerställ schema innan skrivning
-    df2 = säkerställ_kolumner(df)
-    df2 = konvertera_typer(df2)
-    for c in FINAL_COLS:
-        if c not in df2.columns:
-            df2[c] = "" if c in _STR_COLS else 0.0
-    df2 = df2[FINAL_COLS]
 
-    _with_backoff(ws.update, [df2.columns.tolist()] + df2.astype(str).values.tolist())
-    return True, f"Skapade snapshot {snap_name}."
+# ----------------- VALUTOR -----------------
+
+@st.cache_data(show_spinner=False)
+def las_sparade_valutakurser() -> Dict[str, float]:
+    """Läs senaste sparade växelkurser från Sheets, annars lokalt/minnet."""
+    sh = _open_sheet()
+    conf = _sheet_conf()
+    if sh:
+        ws = _get_or_create_ws(sh, conf["rates_ws"])
+        if ws:
+            df = _read_ws_to_df(ws)
+            if not df.empty and "Code" in df.columns and "Rate" in df.columns:
+                try:
+                    d = {r["Code"]: float(r["Rate"]) for _, r in df.iterrows() if r["Code"]}
+                    if d:
+                        return d
+                except Exception:
+                    pass
+    # Fallback lokalt
+    if _LOCAL_RATES.exists():
+        try:
+            return json.loads(_LOCAL_RATES.read_text())
+        except Exception:
+            pass
+    # Fallback minne
+    return st.session_state.get("saved_rates", {"USD": 10.0, "NOK": 1.0, "CAD": 7.5, "EUR": 11.0, "SEK": 1.0})
+
+
+def spara_valutakurser(rates: Dict[str, float]) -> bool:
+    """Spara växelkurser till Sheets. Fallback: lokalt + minnet."""
+    ok = False
+    sh = _open_sheet()
+    conf = _sheet_conf()
+    df = pd.DataFrame(
+        [{"Code": k, "Rate": float(v)} for k, v in sorted(rates.items())]
+    )
+    if sh:
+        ws = _get_or_create_ws(sh, conf["rates_ws"])
+        if ws:
+            ok = _write_df_to_ws(ws, df)
+    # Fallback lokalt + minne oavsett
+    try:
+        _LOCAL_RATES.write_text(json.dumps(rates))
+    except Exception:
+        pass
+    st.session_state["saved_rates"] = dict(rates)
+    return ok
+
+
+def hamta_valutakurs(valuta: str, user_rates: Dict[str, float] | None = None) -> float:
+    """Hämta kurs för given valuta, prioriterar user_rates → sparat → 1.0."""
+    if user_rates and valuta in user_rates:
+        return float(user_rates[valuta])
+    saved = las_sparade_valutakurser()
+    return float(saved.get(valuta, 1.0))
+
+
+# ----------------- SNAPSHOTS -----------------
+
+def skapa_snapshot_om_saknas(df: pd.DataFrame) -> Tuple[bool, str]:
+    """
+    Skapar ett dags-snapshot som ny worksheet "Snap-YYYY-MM-DD" om det saknas.
+    Returnerar (ok, meddelande).
+    """
+    sh = _open_sheet()
+    if not sh:
+        return False, "Snapshot hoppades över (ingen Sheets-anslutning)."
+
+    conf = _sheet_conf()
+    prefix = conf.get("snapshots_prefix", "Snap-")
+    today_name = prefix + datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        # Finns redan?
+        for ws in sh.worksheets():
+            if ws.title == today_name:
+                return False, f"Snapshot '{today_name}' fanns redan."
+
+        ws = _get_or_create_ws(sh, today_name, rows=max(1000, len(df) + 10), cols=max(20, len(df.columns) + 5))
+        if not ws:
+            return False, "Kunde inte skapa snapshot-ark."
+        ok = _write_df_to_ws(ws, df)
+        return (True, f"Snapshot '{today_name}' skapad.") if ok else (False, "Misslyckades skriva snapshot.")
+    except Exception:
+        return False, "Snapshot misslyckades (okänt fel)."
+
+
+# ----------------- LOGG -----------------
+
+def spara_hamtlogg(logs: List[dict]) -> Tuple[bool, str]:
+    """
+    Sparar hämtningslogg (st.session_state['fetch_logs']) till logs_ws.
+    """
+    if not logs:
+        return False, "Ingen logg att spara."
+
+    sh = _open_sheet()
+    conf = _sheet_conf()
+    df = pd.DataFrame(logs)
+
+    if sh:
+        ws = _get_or_create_ws(sh, conf["logs_ws"])
+        if ws:
+            ok = _write_df_to_ws(ws, df)
+            if ok:
+                return True, "Hämtningslogg sparad till Sheets."
+            return False, "Kunde inte skriva logg till Sheets."
+
+    # Fallback lokalt
+    try:
+        _LOCAL_LOGS.write_text(json.dumps(logs))
+        return True, "Hämtningslogg sparad lokalt."
+    except Exception:
+        return False, "Kunde inte spara logg."

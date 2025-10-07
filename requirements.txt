@@ -2,7 +2,8 @@ streamlit
 pandas
 numpy
 gspread
-google-auth
 yfinance
-requests
+google-auth
+google-auth-oauthlib
 pytz
+requests

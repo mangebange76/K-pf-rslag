@@ -25,6 +25,14 @@ def _clean_iso(d):
     try: return pd.to_datetime(d).date().isoformat()
     except Exception: return ""
 
+def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        df = df.copy()
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+    except Exception:
+        pass
+    return df
+
 # ---------- Live FX (Yahoo) ----------
 FX_TICKERS = {"USD":"USDSEK=X","NOK":"NOKSEK=X","CAD":"CADSEK=X","EUR":"EURSEK=X","SEK":None}
 def hamta_live_valutakurser() -> dict:
@@ -160,9 +168,8 @@ def _nearest_shares_for_date(date_iso: str, shares_map: dict) -> float | None:
 def _extract_sec_quarter_revenues(facts_json: dict) -> list[tuple[pd.Timestamp, float]]:
     """
     Hämta kvartalsintäkter från SEC:
-    - prioriterar moderna taggar, men tar vad som finns
-    - filtrerar på fp (Q1..Q4) / frame med Qx / duration 80–100 dagar
-    Returnerar lista [(end_timestamp_naiv, quarter_revenue_float)] (senaste först).
+    - fp (Q1..Q4) eller frame med Qx, annars duration 80–100 dagar
+    Returnerar [(end_timestamp_naiv, quarter_revenue_float)] (senaste först).
     """
     tags = [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -234,46 +241,64 @@ def _try_get_quarterly_revenue_df(t: yf.Ticker) -> pd.DataFrame | None:
         return qfin.copy()
     return None
 
-def _nearest_price_on_or_after(t: yf.Ticker, dt: pd.Timestamp, max_days: int = 30) -> float | None:
+def _nearest_price_on_or_after(t: yf.Ticker, dt: pd.Timestamp, max_days: int = 30) -> tuple[float | None, str]:
     """
-    Hitta ett pris nära 'dt'.
-    1) försök T..T+max_days (dagliga)
-    2) försök T-1..T-max_days (dagliga)
-    3) veckodata i ett bredare fönster, ta första >= T, annars närmast
+    Hitta ett pris nära 'dt'. Returnerar (pris, källa-tag):
+      - 1d-after, 1d-before, 1wk-after, 1wk-nearest, 6mo-nearest, spot
     """
     try:
-        # 1) på/efter
+        # 1) på/efter (daglig)
         start1 = dt.strftime("%Y-%m-%d")
         end1   = (dt + pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
         h1 = t.history(start=start1, end=end1, auto_adjust=False, interval="1d")
+        h1 = _naive_index(h1)
         if not h1.empty:
             after = h1[h1.index >= dt]
             if not after.empty:
-                return float(after["Close"].iloc[0])
+                return float(after["Close"].iloc[0]), "1d-after"
 
-        # 2) före
+        # 2) före (daglig)
         start2 = (dt - pd.Timedelta(days=max_days)).strftime("%Y-%m-%d")
         end2   = dt.strftime("%Y-%m-%d")
         h2 = t.history(start=start2, end=end2, auto_adjust=False, interval="1d")
+        h2 = _naive_index(h2)
         if not h2.empty:
             before = h2[h2.index < dt]
             if not before.empty:
-                return float(before["Close"].iloc[-1])
+                return float(before["Close"].iloc[-1]), "1d-before"
 
         # 3) veckodata
         start3 = (dt - pd.Timedelta(days=max_days+20)).strftime("%Y-%m-%d")
         end3   = (dt + pd.Timedelta(days=max_days+20)).strftime("%Y-%m-%d")
         hw = t.history(start=start3, end=end3, auto_adjust=False, interval="1wk")
+        hw = _naive_index(hw)
         if not hw.empty:
             afterw = hw[hw.index >= dt]
             if not afterw.empty:
-                return float(afterw["Close"].iloc[0])
+                return float(afterw["Close"].iloc[0]), "1wk-after"
+            # närmast i veckan
             idx = (hw.index - dt).abs().argmin()
-            return float(hw["Close"].iloc[idx])
+            return float(hw["Close"].iloc[idx]), "1wk-nearest"
+
+        # 4) brett fönster 6 mån (daglig) – närmast
+        h4 = t.history(period="6mo", auto_adjust=False, interval="1d")
+        h4 = _naive_index(h4)
+        if not h4.empty:
+            idx = (h4.index - dt).abs().argmin()
+            return float(h4["Close"].iloc[idx]), "6mo-nearest"
+
+        # 5) spot från info
+        try:
+            info = t.info or {}
+            spot = info.get("regularMarketPrice")
+            if spot:
+                return float(spot), "spot"
+        except Exception:
+            pass
 
     except Exception:
-        return None
-    return None
+        return None, ""
+    return None, ""
 
 # ---------- P/S-historik + källor + DEBUG ----------
 def hamta_ps_kvartal(ticker: str) -> dict:
@@ -332,7 +357,7 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                 if len(window_vals) < 4 or any(pd.isna(x) for x in window_vals):
                     continue
 
-                px = _nearest_price_on_or_after(t, c)
+                px, px_src = _nearest_price_on_or_after(t, c)
                 if px is None:
                     continue
                 dbg["price_hits"] += 1
@@ -351,9 +376,9 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                 ps = round((px * float(sh))/ttm, 3)
                 out[lab_ps] = ps
                 out[lab_dt] = end_iso
-                out[lab_src] = src
+                out[lab_src] = f"{src}+{px_src}"
                 if i == 0:
-                    used_ps_q1 = (ps, src)
+                    used_ps_q1 = (ps, out[lab_src])
 
         # P/S TTM direkt från Yahoo om tillgängligt
         ps_ttm = info.get("priceToSalesTrailing12Months")
@@ -389,7 +414,7 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                             ttm = sum(v for _, v in window)
                             if ttm <= 0:
                                 continue
-                            px = _nearest_price_on_or_after(t, end_ts)
+                            px, px_src = _nearest_price_on_or_after(t, end_ts)
                             if px is None:
                                 continue
                             dbg["price_hits"] += 1
@@ -406,7 +431,7 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                             ps = round((px * float(sh))/float(ttm), 3)
                             out[lab_ps] = ps
                             out[lab_dt] = end_iso
-                            out[lab_src] = src
+                            out[lab_src] = f"{src}+{px_src}"
 
                         # Om P/S (TTM) saknas helt – använd Q1 TTM från SEC
                         if (not out["P/S"] or out["P/S"] <= 0) and out["P/S Q1"] and out["P/S Q1"] > 0:
@@ -425,6 +450,7 @@ def hamta_ps_kvartal(ticker: str) -> dict:
                 if not mc:
                     if not px_now:
                         h = t.history(period="5d")
+                        h = _naive_index(h)
                         if not h.empty: px_now = float(h["Close"].iloc[-1])
                     if px_now and shares_now:
                         mc = float(px_now) * float(shares_now)
@@ -465,6 +491,7 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         if pris is None:
             try:
                 h = t.history(period="1d")
+                h = _naive_index(h)
                 if not h.empty and "Close" in h:
                     pris = float(h["Close"].iloc[-1])
                     out["Källa Aktuell kurs"] = "Yahoo/history"

@@ -1,9 +1,12 @@
 # views.py
 from __future__ import annotations
 import time
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 from data_sources import (
     hamta_yahoo_fält,
@@ -451,3 +454,71 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 - **Andel efter köp:** {ny_andel} %
 """
     )
+
+
+# ========================== Hämtlogg (som app.py importerar) ==========================
+
+def visa_hamtlogg_panel() -> None:
+    """Liten loggpanel i sidopanelen. Visar rader som data_sources lägger i st.session_state['fetch_logs']."""
+    st.sidebar.markdown("### 🧪 Hämtlogg")
+    logs = st.session_state.get("fetch_logs", [])
+    if not logs:
+        st.sidebar.caption("Tom logg.")
+        return
+
+    tkr_filter = st.sidebar.text_input("Filter (ticker, valfritt)").strip().upper()
+    show = logs
+    if tkr_filter:
+        show = [x for x in logs if str(x.get("ticker","")).upper().find(tkr_filter) >= 0]
+
+    # visa max 30 senaste
+    for item in list(show)[-30:][::-1]:
+        ts = item.get("ts","")
+        tkr = item.get("ticker","")
+        summary = item.get("summary","")
+        st.sidebar.caption(f"{ts} · {tkr} — {summary}")
+
+
+def spara_logg_till_sheets(sheet_name: str = "Hamtlogg") -> None:
+    """Skriver st.session_state['fetch_logs'] till ett blad 'Hamtlogg' i samma Google Sheet."""
+    logs = st.session_state.get("fetch_logs", [])
+    if not logs:
+        st.warning("Ingen hämtlogg att spara.")
+        return
+
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_info = st.secrets.get("GOOGLE_CREDENTIALS", {})
+        if not creds_info:
+            raise RuntimeError("Saknar GOOGLE_CREDENTIALS i secrets.")
+        credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
+        client = gspread.authorize(credentials)
+
+        sheet_url = st.secrets.get("SHEET_URL", "")
+        if not sheet_url:
+            raise RuntimeError("Saknar SHEET_URL i secrets.")
+        ss = client.open_by_url(sheet_url)
+
+        try:
+            ws = ss.worksheet(sheet_name)
+        except Exception:
+            ws = ss.add_worksheet(title=sheet_name, rows=2000, cols=10)
+
+        df = pd.DataFrame(logs)
+        # Packa meta (ps) som JSON-sträng om det finns
+        if "ps" in df.columns:
+            df["meta_ps"] = df["ps"].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else ("" if x is None else str(x)))
+        else:
+            df["meta_ps"] = ""
+
+        cols = ["ts", "ticker", "summary", "meta_ps"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        values = [cols] + df[cols].astype(str).values.tolist()
+
+        ws.clear()
+        ws.update(values)
+        st.success(f"Hämtlogg sparad till bladet '{sheet_name}'.")
+    except Exception as e:
+        st.error(f"Kunde inte spara hämtlogg: {e}")

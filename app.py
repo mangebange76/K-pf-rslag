@@ -107,7 +107,7 @@ def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
         return 1.0
     return user_rates.get(valuta.upper(), STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0))
 
-# === NYTT: Automatisk valutahämtning (Yahoo) =================================
+# === Automatisk valutahämtning (Yahoo) ======================================
 @st.cache_data(show_spinner=False, ttl=3600)
 def hamta_valutakurser_automatiskt() -> dict:
     """
@@ -130,7 +130,6 @@ def hamta_valutakurser_automatiskt() -> dict:
                 if val > 0:
                     res[code] = round(val, 6)
         except Exception:
-            # tyst fail – behåll ev. gamla/sparade värden
             pass
     return res
 
@@ -164,13 +163,13 @@ def auto_update_valutakurser_if_stale() -> bool:
         return False
 # ============================================================================
 
-# --- Kolumnschema ---
+# --- Kolumnschema (NYTT: 'GAV (SEK)') ---
 FINAL_COLS = [
     "Ticker", "Bolagsnamn", "Utestående aktier",
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier", "Valuta", "Årlig utdelning", "Aktuell kurs",
+    "Antal aktier", "GAV (SEK)", "Valuta", "Årlig utdelning", "Aktuell kurs",
     "CAGR 5 år (%)", "P/S-snitt",
     "Senast manuellt uppdaterad"
 ]
@@ -178,7 +177,7 @@ FINAL_COLS = [
 def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     for kol in FINAL_COLS:
         if kol not in df.columns:
-            if any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs"]):
+            if any(x in kol.lower() for x in ["kurs","omsättning","p/s","utdelning","cagr","antal","riktkurs","gav"]):
                 df[kol] = 0.0
             else:
                 df[kol] = ""
@@ -207,7 +206,7 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
         "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
         "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
         "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-        "Antal aktier", "Årlig utdelning", "Aktuell kurs", "CAGR 5 år (%)", "P/S-snitt"
+        "Antal aktier", "GAV (SEK)", "Årlig utdelning", "Aktuell kurs", "CAGR 5 år (%)", "P/S-snitt"
     ]
     for c in num_cols:
         if c in df.columns:
@@ -406,7 +405,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             ticker = st.text_input("Ticker (Yahoo-format)", value=bef.get("Ticker","") if not bef.empty else "").upper()
             utest = st.number_input("Utestående aktier (miljoner)", value=float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0)
             antal = st.number_input("Antal aktier du äger", value=float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0)
-
+            gav_sek = st.number_input("GAV (SEK)", value=float(bef.get("GAV (SEK)",0.0)) if not bef.empty else 0.0)  # NYTT
             ps  = st.number_input("P/S",   value=float(bef.get("P/S",0.0)) if not bef.empty else 0.0)
             ps1 = st.number_input("P/S Q1", value=float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0)
             ps2 = st.number_input("P/S Q2", value=float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0)
@@ -425,6 +424,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     if spar and ticker:
         ny = {
             "Ticker": ticker, "Utestående aktier": utest, "Antal aktier": antal,
+            "GAV (SEK)": gav_sek,
             "P/S": ps, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
             "Omsättning idag": oms_idag, "Omsättning nästa år": oms_next
         }
@@ -491,7 +491,7 @@ def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
         cols = ["Ticker","Bolagsnamn","Valuta","Aktuell kurs","Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
                 "P/S-snitt","Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
                 "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
-                "CAGR 5 år (%)","Antal aktier","Årlig utdelning","Senast manuellt uppdaterad"]
+                "CAGR 5 år (%)","Antal aktier","GAV (SEK)","Årlig utdelning","Senast manuellt uppdaterad"]
         st.dataframe(pd.DataFrame([r[cols].to_dict()]), use_container_width=True)
 
     st.markdown("### Hela databasen")
@@ -504,19 +504,40 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     if port.empty:
         st.info("Du äger inga aktier.")
         return
+    # Växelkurs och marknadsvärde
     port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
     port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
+    # Anskaffningsvärde
+    port["Anskaffningsvärde (SEK)"] = port["Antal aktier"] * port["GAV (SEK)"]
+    # Vinst/förlust
+    port["Vinst/Förlust (SEK)"] = port["Värde (SEK)"] - port["Anskaffningsvärde (SEK)"]
+    port["Vinst/Förlust (%)"] = np.where(
+        port["Anskaffningsvärde (SEK)"] > 0,
+        (port["Vinst/Förlust (SEK)"] / port["Anskaffningsvärde (SEK)"]) * 100.0,
+        0.0
+    )
+    # Andelar och utdelning
     total_värde = float(port["Värde (SEK)"].sum())
-    port["Andel (%)"] = round(port["Värde (SEK)"] / total_värde * 100.0, 2)
+    port["Andel (%)"] = np.where(total_värde > 0, round(port["Värde (SEK)"] / total_värde * 100.0, 2), 0.0)
     port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
     tot_utd = float(port["Total årlig utdelning (SEK)"].sum())
+    tot_ansk = float(port["Anskaffningsvärde (SEK)"].sum())
+    tot_pl = float(port["Vinst/Förlust (SEK)"].sum())
+    tot_pl_pct = (tot_pl / tot_ansk * 100.0) if tot_ansk > 0 else 0.0
 
     st.markdown(f"**Totalt portföljvärde:** {round(total_värde,2)} SEK")
+    st.markdown(f"**Totalt anskaffningsvärde:** {round(tot_ansk,2)} SEK")
+    st.markdown(f"**Orealiserad vinst/förlust:** {round(tot_pl,2)} SEK ({round(tot_pl_pct,2)} %)")
     st.markdown(f"**Total kommande utdelning:** {round(tot_utd,2)} SEK")
     st.markdown(f"**Ungefärlig månadsutdelning:** {round(tot_utd/12.0,2)} SEK")
 
     st.dataframe(
-        port[["Ticker","Bolagsnamn","Antal aktier","Aktuell kurs","Valuta","Värde (SEK)","Andel (%)","Årlig utdelning","Total årlig utdelning (SEK)"]],
+        port[[
+            "Ticker","Bolagsnamn","Antal aktier","GAV (SEK)","Anskaffningsvärde (SEK)",
+            "Aktuell kurs","Valuta","Växelkurs","Värde (SEK)",
+            "Vinst/Förlust (SEK)","Vinst/Förlust (%)",
+            "Årlig utdelning","Total årlig utdelning (SEK)","Andel (%)"
+        ]],
         use_container_width=True
     )
 
@@ -605,9 +626,8 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
 def main():
     st.title("📊 Aktieanalys och investeringsförslag")
 
-    # === NYTT: Automatisk valutahämtning och sparning (tyst) ==========
+    # Automatisk valutahämtning och sparning (tyst)
     auto_update_valutakurser_if_stale()
-    # ================================================================
 
     # Sidopanel: valutakurser → läs sparade och visa inputs
     st.sidebar.header("💱 Valutakurser → SEK")
@@ -628,6 +648,20 @@ def main():
         if st.button("↻ Läs sparade kurser"):
             st.cache_data.clear()
             st.rerun()
+
+    # Manuell hämtning från Yahoo och direkt sparning
+    st.sidebar.markdown("")
+    if st.sidebar.button("🌐 Hämta valutakurser (Yahoo)"):
+        live = hamta_valutakurser_automatiskt()
+        if live and any(k in live for k in ("USD","NOK","CAD","EUR")):
+            merged = las_sparade_valutakurser()
+            merged.update(live)
+            spara_valutakurser(merged)
+            st.session_state["rates_reload"] = st.session_state.get("rates_reload", 0) + 1
+            st.sidebar.success("Valutakurser uppdaterade från Yahoo.")
+            st.rerun()
+        else:
+            st.sidebar.error("Kunde inte hämta kurser just nu (Yahoo). Försök igen senare.")
 
     st.sidebar.markdown("---")
     if st.sidebar.button("↻ Läs om data från Google Sheets"):

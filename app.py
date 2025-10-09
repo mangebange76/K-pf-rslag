@@ -63,9 +63,12 @@ def hamta_data():
     return pd.DataFrame(data)
 
 def spara_data(df: pd.DataFrame):
+    """Skriv DF -> Google Sheets, säkert: ersätt NaN med tomma strängar."""
     sheet = skapa_koppling()
+    safe = df.copy()
+    safe = safe.astype(object).where(pd.notnull(safe), "")  # << FIX: inga "nan"-strängar
     _with_backoff(sheet.clear)
-    _with_backoff(sheet.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
+    _with_backoff(sheet.update, [safe.columns.values.tolist()] + safe.values.tolist())
 
 # --- Standard valutakurser till SEK (används som startvärden) ---
 STANDARD_VALUTAKURSER = {
@@ -324,7 +327,7 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
         status = st.sidebar.empty()
         bar = st.sidebar.progress(0)
         misslyckade = []
-        total = len(df)
+        total = len(df) if len(df) > 0 else 1
         for i, row in df.iterrows():
             tkr = str(row["Ticker"]).strip()
             status.write(f"Uppdaterar {i+1}/{total} – {tkr}")
@@ -428,12 +431,10 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         tkr_norm = df["Ticker"].astype(str).str.strip().str.upper()
 
         if bef.empty:
-            # Ny rad: avbryt om tickern redan finns
             if (tkr_norm == new_tkr).any():
                 st.error(f"Tickern **{new_tkr}** finns redan i databasen. Välj den i listan för att redigera.")
                 st.stop()
         else:
-            # Redigera: om användaren ändrat ticker → avbryt om nya redan finns på annan rad
             if new_tkr != cur_tkr and (tkr_norm == new_tkr).any():
                 st.error(f"Kan inte byta till tickern **{new_tkr}** – den finns redan i en annan rad.")
                 st.stop()
@@ -457,29 +458,32 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                 datum_sätt = True
 
         if not bef.empty:
-            for k,v in ny.items():
-                df.loc[df["Ticker"]==new_tkr, k] = v
-            # Om användaren ändrade ticker, uppdatera även raden som hade cur_tkr
+            # << FIX: uppdatera alltid på RADENS NUVARANDE TICKER (cur_tkr), inte new_tkr
+            mask_cur = tkr_norm == cur_tkr
+            for k, v in ny.items():
+                df.loc[mask_cur, k] = v
             if new_tkr != cur_tkr:
-                df.loc[df["Ticker"]==cur_tkr, "Ticker"] = new_tkr
+                df.loc[mask_cur, "Ticker"] = new_tkr
         else:
             tom = {c: (0.0 if c not in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad"] else "") for c in FINAL_COLS}
             tom.update(ny)
             df = pd.concat([df, pd.DataFrame([tom])], ignore_index=True)
 
         if datum_sätt:
-            df.loc[df["Ticker"]==new_tkr, "Senast manuellt uppdaterad"] = now_stamp()
+            df.loc[df["Ticker"].astype(str).str.strip().str.upper() == new_tkr, "Senast manuellt uppdaterad"] = now_stamp()
 
         data = hamta_yahoo_fält(new_tkr)
-        if data.get("Bolagsnamn"): df.loc[df["Ticker"]==new_tkr, "Bolagsnamn"] = data["Bolagsnamn"]
-        if data.get("Valuta"):     df.loc[df["Ticker"]==new_tkr, "Valuta"] = data["Valuta"]
-        if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"]==new_tkr, "Aktuell kurs"] = data["Aktuell kurs"]
-        if "Årlig utdelning" in data:    df.loc[df["Ticker"]==new_tkr, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
-        if "CAGR 5 år (%)" in data:      df.loc[df["Ticker"]==new_tkr, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
+        mask_new = df["Ticker"].astype(str).str.strip().str.upper() == new_tkr
+        if data.get("Bolagsnamn"): df.loc[mask_new, "Bolagsnamn"] = data["Bolagsnamn"]
+        if data.get("Valuta"):     df.loc[mask_new, "Valuta"] = data["Valuta"]
+        if data.get("Aktuell kurs",0)>0: df.loc[mask_new, "Aktuell kurs"] = data["Aktuell kurs"]
+        if "Årlig utdelning" in data:    df.loc[mask_new, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
+        if "CAGR 5 år (%)" in data:      df.loc[mask_new, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
 
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
         st.success("Sparat och uppdaterat från Yahoo.")
+        st.rerun()  # << FIX: visa direkt att data sparats
 
     st.markdown("### ⏱️ Äldst manuellt uppdaterade (topp 10)")
     df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00")
@@ -573,7 +577,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     subset = st.radio("Vilka bolag?", ["Alla bolag","Endast portfölj"], horizontal=True)
     läge = st.radio("Sortering", ["Störst potential","Närmast riktkurs"], horizontal=True)
 
-    # 🔽 NYTT: filter på P/S vs P/S-snitt
+    # 🔽 P/S vs P/S-snitt filter
     ps_filter = st.selectbox(
         "Filtrera på P/S i förhållande till P/S-snitt",
         ["Alla", "P/S under snitt", "P/S över snitt"],

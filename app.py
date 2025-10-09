@@ -422,8 +422,25 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         spar = st.form_submit_button("💾 Spara & hämta från Yahoo")
 
     if spar and ticker:
+        # === DUBBLETTKONTROLL (case-insensitiv, trim) ===
+        new_tkr = (ticker or "").strip().upper()
+        cur_tkr = (bef.get("Ticker","") if not bef.empty else "").strip().upper()
+        tkr_norm = df["Ticker"].astype(str).str.strip().str.upper()
+
+        if bef.empty:
+            # Ny rad: avbryt om tickern redan finns
+            if (tkr_norm == new_tkr).any():
+                st.error(f"Tickern **{new_tkr}** finns redan i databasen. Välj den i listan för att redigera.")
+                st.stop()
+        else:
+            # Redigera: om användaren ändrat ticker → avbryt om nya redan finns på annan rad
+            if new_tkr != cur_tkr and (tkr_norm == new_tkr).any():
+                st.error(f"Kan inte byta till tickern **{new_tkr}** – den finns redan i en annan rad.")
+                st.stop()
+        # ================================================
+
         ny = {
-            "Ticker": ticker, "Utestående aktier": utest, "Antal aktier": antal,
+            "Ticker": new_tkr, "Utestående aktier": utest, "Antal aktier": antal,
             "GAV (SEK)": gav_sek,
             "P/S": ps, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
             "Omsättning idag": oms_idag, "Omsättning nästa år": oms_next
@@ -441,21 +458,24 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
 
         if not bef.empty:
             for k,v in ny.items():
-                df.loc[df["Ticker"]==ticker, k] = v
+                df.loc[df["Ticker"]==new_tkr, k] = v
+            # Om användaren ändrade ticker, uppdatera även raden som hade cur_tkr
+            if new_tkr != cur_tkr:
+                df.loc[df["Ticker"]==cur_tkr, "Ticker"] = new_tkr
         else:
             tom = {c: (0.0 if c not in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad"] else "") for c in FINAL_COLS}
             tom.update(ny)
             df = pd.concat([df, pd.DataFrame([tom])], ignore_index=True)
 
         if datum_sätt:
-            df.loc[df["Ticker"]==ticker, "Senast manuellt uppdaterad"] = now_stamp()
+            df.loc[df["Ticker"]==new_tkr, "Senast manuellt uppdaterad"] = now_stamp()
 
-        data = hamta_yahoo_fält(ticker)
-        if data.get("Bolagsnamn"): df.loc[df["Ticker"]==ticker, "Bolagsnamn"] = data["Bolagsnamn"]
-        if data.get("Valuta"):     df.loc[df["Ticker"]==ticker, "Valuta"] = data["Valuta"]
-        if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"]==ticker, "Aktuell kurs"] = data["Aktuell kurs"]
-        if "Årlig utdelning" in data:    df.loc[df["Ticker"]==ticker, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
-        if "CAGR 5 år (%)" in data:      df.loc[df["Ticker"]==ticker, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
+        data = hamta_yahoo_fält(new_tkr)
+        if data.get("Bolagsnamn"): df.loc[df["Ticker"]==new_tkr, "Bolagsnamn"] = data["Bolagsnamn"]
+        if data.get("Valuta"):     df.loc[df["Ticker"]==new_tkr, "Valuta"] = data["Valuta"]
+        if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"]==new_tkr, "Aktuell kurs"] = data["Aktuell kurs"]
+        if "Årlig utdelning" in data:    df.loc[df["Ticker"]==new_tkr, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
+        if "CAGR 5 år (%)" in data:      df.loc[df["Ticker"]==new_tkr, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
 
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
@@ -553,12 +573,26 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     subset = st.radio("Vilka bolag?", ["Alla bolag","Endast portfölj"], horizontal=True)
     läge = st.radio("Sortering", ["Störst potential","Närmast riktkurs"], horizontal=True)
 
+    # 🔽 NYTT: filter på P/S vs P/S-snitt
+    ps_filter = st.selectbox(
+        "Filtrera på P/S i förhållande till P/S-snitt",
+        ["Alla", "P/S under snitt", "P/S över snitt"],
+        index=0
+    )
+
     if subset == "Endast portfölj":
         base = df[df["Antal aktier"] > 0].copy()
     else:
         base = df.copy()
 
     base = base[(base[riktkurs_val] > 0) & (base["Aktuell kurs"] > 0)].copy()
+
+    # tillämpa P/S-filter (kräv båda > 0 för meningsfull jämförelse)
+    if ps_filter == "P/S under snitt":
+        base = base[(base["P/S"] > 0) & (base["P/S-snitt"] > 0) & (base["P/S"] < base["P/S-snitt"])].copy()
+    elif ps_filter == "P/S över snitt":
+        base = base[(base["P/S"] > 0) & (base["P/S-snitt"] > 0) & (base["P/S"] > base["P/S-snitt"])].copy()
+
     if base.empty:
         st.info("Inga bolag matchar just nu.")
         return
@@ -611,6 +645,8 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     st.markdown(
         f"""
 - **Aktuell kurs:** {round(rad['Aktuell kurs'],2)} {rad['Valuta']}
+- **Nuvarande P/S (TTM):** {round(rad.get('P/S', 0.0), 2)}
+- **P/S-snitt (Q1–Q4):** {round(rad.get('P/S-snitt', 0.0), 2)}
 - **Riktkurs idag:** {round(rad['Riktkurs idag'],2)} {rad['Valuta']} {"**⬅ vald**" if riktkurs_val=="Riktkurs idag" else ""}
 - **Riktkurs om 1 år:** {round(rad['Riktkurs om 1 år'],2)} {rad['Valuta']} {"**⬅ vald**" if riktkurs_val=="Riktkurs om 1 år" else ""}
 - **Riktkurs om 2 år:** {round(rad['Riktkurs om 2 år'],2)} {rad['Valuta']} {"**⬅ vald**" if riktkurs_val=="Riktkurs om 2 år" else ""}

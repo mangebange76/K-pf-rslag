@@ -63,9 +63,13 @@ def hamta_data():
     return pd.DataFrame(data)
 
 def spara_data(df: pd.DataFrame):
+    """SPARAR NUMERISKT – INTE SOM TEXT. Fixar decimaler i Sheets."""
     sheet = skapa_koppling()
     _with_backoff(sheet.clear)
-    _with_backoff(sheet.update, [df.columns.values.tolist()] + df.astype(str).values.tolist())
+    # Lämna numeriska som numeriska, ersätt NaN med tom sträng
+    values = df.where(pd.notnull(df), "").values.tolist()
+    header = df.columns.values.tolist()
+    _with_backoff(sheet.update, [header] + values)
 
 # --- Standard valutakurser till SEK (används som startvärden) ---
 STANDARD_VALUTAKURSER = {
@@ -98,7 +102,7 @@ def spara_valutakurser(rates: dict):
     body = [["Valuta","Kurs"]]
     for k in ["USD","NOK","CAD","EUR","SEK"]:
         v = rates.get(k, STANDARD_VALUTAKURSER.get(k, 1.0))
-        body.append([k, str(v)])
+        body.append([k, v])  # skriv som numeriskt där det går
     _with_backoff(ws.clear)
     _with_backoff(ws.update, body)
 
@@ -201,6 +205,31 @@ def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
             df = df.drop(columns=[old])
     return df
 
+def _parse_sv_float(val) -> float:
+    """Accepterar '10,61', '1 234,56', '1,234.56', 1061, etc → float."""
+    if isinstance(val, (int, float, np.number)):
+        return float(val)
+    s = str(val).strip()
+    if s == "" or s.lower() in {"nan", "none"}:
+        return 0.0
+    # ta bort mellanslag inkl smala mellanrum
+    s = s.replace(" ", "").replace("\u202f", "")
+    # både komma och punkt → gissa decimalsymbolen som sista separatorn
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            # komma är decimal, punkt tusental
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # punkt är decimal, komma tusental
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    # nu borde python float funka
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
 def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
     num_cols = [
         "Utestående aktier", "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
@@ -210,7 +239,7 @@ def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for c in num_cols:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            df[c] = df[c].apply(_parse_sv_float)
     for c in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad"]:
         if c in df.columns:
             df[c] = df[c].astype(str)
@@ -368,6 +397,15 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
 # Fält som triggar datum "Senast manuellt uppdaterad"
 MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
 
+# ---- Hjälpare för SVE-decimal i formulär ----
+def _show_dec_input(label: str, default_val: float) -> float:
+    """
+    Textfält som accepterar både '10,61' och '10.61'. Visar värdet med komma.
+    """
+    start_text = ("" if pd.isna(default_val) else str(default_val)).replace(".", ",")
+    s = st.text_input(label, value=start_text)
+    return _parse_sv_float(s)
+
 # --- Lägg till / uppdatera bolag ---
 def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     st.header("➕ Lägg till / uppdatera bolag")
@@ -403,17 +441,17 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         c1, c2 = st.columns(2)
         with c1:
             ticker = st.text_input("Ticker (Yahoo-format)", value=bef.get("Ticker","") if not bef.empty else "").upper()
-            utest = st.number_input("Utestående aktier (miljoner)", value=float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0)
-            antal = st.number_input("Antal aktier du äger", value=float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0)
-            gav_sek = st.number_input("GAV (SEK)", value=float(bef.get("GAV (SEK)",0.0)) if not bef.empty else 0.0)  # NYTT
-            ps  = st.number_input("P/S",   value=float(bef.get("P/S",0.0)) if not bef.empty else 0.0)
-            ps1 = st.number_input("P/S Q1", value=float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0)
-            ps2 = st.number_input("P/S Q2", value=float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0)
-            ps3 = st.number_input("P/S Q3", value=float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0)
-            ps4 = st.number_input("P/S Q4", value=float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0)
+            utest = _show_dec_input("Utestående aktier (miljoner)", float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0)
+            antal = _show_dec_input("Antal aktier du äger", float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0)
+            gav_sek = _show_dec_input("GAV (SEK)", float(bef.get("GAV (SEK)",0.0)) if not bef.empty else 0.0)
+            ps  = _show_dec_input("P/S",   float(bef.get("P/S",0.0)) if not bef.empty else 0.0)
+            ps1 = _show_dec_input("P/S Q1", float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0)
+            ps2 = _show_dec_input("P/S Q2", float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0)
+            ps3 = _show_dec_input("P/S Q3", float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0)
+            ps4 = _show_dec_input("P/S Q4", float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0)
         with c2:
-            oms_idag  = st.number_input("Omsättning idag (miljoner)",  value=float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0)
-            oms_next  = st.number_input("Omsättning nästa år (miljoner)", value=float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0)
+            oms_idag  = _show_dec_input("Omsättning idag (miljoner)",  float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0)
+            oms_next  = _show_dec_input("Omsättning nästa år (miljoner)", float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0)
 
             st.markdown("**Uppdateras automatiskt vid spara:**")
             st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%)")
@@ -448,7 +486,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
 
         datum_sätt = False
         if not bef.empty:
-            before = {f: float(bef.get(f,0.0)) for f in MANUELL_FALT_FOR_DATUM}
+            before = {f: float(_parse_sv_float(bef.get(f,0.0))) for f in MANUELL_FALT_FOR_DATUM}
             after  = {f: float(ny.get(f,0.0))  for f in MANUELL_FALT_FOR_DATUM}
             if any(before[k] != after[k] for k in MANUELL_FALT_FOR_DATUM):
                 datum_sätt = True
@@ -457,25 +495,26 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                 datum_sätt = True
 
         if not bef.empty:
+            # uppdatera existerande rad (på ny ticker om den ändrats)
+            target_tkr = new_tkr if new_tkr else cur_tkr
             for k,v in ny.items():
-                df.loc[df["Ticker"]==new_tkr, k] = v
-            # Om användaren ändrade ticker, uppdatera även raden som hade cur_tkr
-            if new_tkr != cur_tkr:
-                df.loc[df["Ticker"]==cur_tkr, "Ticker"] = new_tkr
+                df.loc[df["Ticker"].astype(str).str.upper()==target_tkr, k] = v
+            if new_tkr != cur_tkr and cur_tkr:
+                df.loc[df["Ticker"].astype(str).str.upper()==cur_tkr, "Ticker"] = new_tkr
         else:
             tom = {c: (0.0 if c not in ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad"] else "") for c in FINAL_COLS}
             tom.update(ny)
             df = pd.concat([df, pd.DataFrame([tom])], ignore_index=True)
 
         if datum_sätt:
-            df.loc[df["Ticker"]==new_tkr, "Senast manuellt uppdaterad"] = now_stamp()
+            df.loc[df["Ticker"].astype(str).str.upper()==new_tkr, "Senast manuellt uppdaterad"] = now_stamp()
 
         data = hamta_yahoo_fält(new_tkr)
-        if data.get("Bolagsnamn"): df.loc[df["Ticker"]==new_tkr, "Bolagsnamn"] = data["Bolagsnamn"]
-        if data.get("Valuta"):     df.loc[df["Ticker"]==new_tkr, "Valuta"] = data["Valuta"]
-        if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"]==new_tkr, "Aktuell kurs"] = data["Aktuell kurs"]
-        if "Årlig utdelning" in data:    df.loc[df["Ticker"]==new_tkr, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
-        if "CAGR 5 år (%)" in data:      df.loc[df["Ticker"]==new_tkr, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
+        if data.get("Bolagsnamn"): df.loc[df["Ticker"].astype(str).str.upper()==new_tkr, "Bolagsnamn"] = data["Bolagsnamn"]
+        if data.get("Valuta"):     df.loc[df["Ticker"].astype(str).str.upper()==new_tkr, "Valuta"] = data["Valuta"]
+        if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"].astype(str).str.upper()==new_tkr, "Aktuell kurs"] = data["Aktuell kurs"]
+        if "Årlig utdelning" in data:    df.loc[df["Ticker"].astype(str).str.upper()==new_tkr, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
+        if "CAGR 5 år (%)" in data:      df.loc[df["Ticker"].astype(str).str.upper()==new_tkr, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
 
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
@@ -573,7 +612,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     subset = st.radio("Vilka bolag?", ["Alla bolag","Endast portfölj"], horizontal=True)
     läge = st.radio("Sortering", ["Störst potential","Närmast riktkurs"], horizontal=True)
 
-    # 🔽 P/S vs P/S-snitt filter
+    # 🔽 filter på P/S vs P/S-snitt
     ps_filter = st.selectbox(
         "Filtrera på P/S i förhållande till P/S-snitt",
         ["Alla", "P/S under snitt", "P/S över snitt"],

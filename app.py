@@ -66,19 +66,41 @@ def spara_data(df: pd.DataFrame):
     """SPARAR NUMERISKT – INTE SOM TEXT. Fixar decimaler i Sheets."""
     sheet = skapa_koppling()
     _with_backoff(sheet.clear)
-    # Lämna numeriska som numeriska, ersätt NaN med tom sträng
     values = df.where(pd.notnull(df), "").values.tolist()
     header = df.columns.values.tolist()
     _with_backoff(sheet.update, [header] + values)
 
-# --- Standard valutakurser till SEK (används som startvärden) ---
-STANDARD_VALUTAKURSER = {
-    "USD": 9.75,
-    "NOK": 0.95,
-    "CAD": 7.05,
-    "EUR": 11.18,
-    "SEK": 1.0,
-}
+# --- Standard valutakurser till SEK (startvärden) ---
+STANDARD_VALUTAKURSER = {"USD": 9.75, "NOK": 0.95, "CAD": 7.05, "EUR": 11.18, "SEK": 1.0}
+
+# ---------- SVE-decimalparser (gemensam) ----------
+def _parse_sv_float(val) -> float:
+    """Accepterar '10,61', '1 234,56', '1,234.56', 1061, '' → float."""
+    if isinstance(val, (int, float, np.number)):
+        return float(val)
+    s = str(val).strip()
+    if s == "" or s.lower() in {"nan", "none"}:
+        return 0.0
+    s = s.replace(" ", "").replace("\u202f", "")  # ta bort tusentalsmellanrum
+    if "," in s and "." in s:
+        # sista separatorn betraktas som decimaltecken
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _fmt_sv(val: float, decimals: int = 4) -> str:
+    try:
+        return f"{float(val):.{decimals}f}".replace(".", ",")
+    except Exception:
+        return "0," + "0"*decimals
+# ---------------------------------------------------
 
 @st.cache_data(show_spinner=False)
 def las_sparade_valutakurser_cached(nonce: int):
@@ -87,11 +109,7 @@ def las_sparade_valutakurser_cached(nonce: int):
     out = {}
     for r in rows:
         cur = str(r.get("Valuta", "")).upper().strip()
-        val = str(r.get("Kurs", "")).replace(",", ".").strip()
-        try:
-            out[cur] = float(val)
-        except:
-            pass
+        out[cur] = _parse_sv_float(r.get("Kurs", 0))
     return out
 
 def las_sparade_valutakurser() -> dict:
@@ -101,30 +119,20 @@ def spara_valutakurser(rates: dict):
     ws = skapa_rates_sheet_if_missing()
     body = [["Valuta","Kurs"]]
     for k in ["USD","NOK","CAD","EUR","SEK"]:
-        v = rates.get(k, STANDARD_VALUTAKURSER.get(k, 1.0))
-        body.append([k, v])  # skriv som numeriskt där det går
+        v = float(rates.get(k, STANDARD_VALUTAKURSER.get(k, 1.0)))
+        body.append([k, v])  # skriv numeriskt
     _with_backoff(ws.clear)
     _with_backoff(ws.update, body)
 
 def hamta_valutakurs(valuta: str, user_rates: dict) -> float:
     if not valuta:
         return 1.0
-    return user_rates.get(valuta.upper(), STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0))
+    return float(user_rates.get(valuta.upper(), STANDARD_VALUTAKURSER.get(valuta.upper(), 1.0)))
 
 # === Automatisk valutahämtning (Yahoo) ======================================
 @st.cache_data(show_spinner=False, ttl=3600)
 def hamta_valutakurser_automatiskt() -> dict:
-    """
-    Hämtar USD/NOK/CAD/EUR → SEK från Yahoo Finance (senaste Close).
-    Returnerar dict med { 'USD': x, 'NOK': y, ... , 'SEK': 1.0 }.
-    Cacheas i 1 timme.
-    """
-    par = {
-        "USD": "USDSEK=X",
-        "NOK": "NOKSEK=X",
-        "CAD": "CADSEK=X",
-        "EUR": "EURSEK=X",
-    }
+    par = {"USD": "USDSEK=X", "NOK": "NOKSEK=X", "CAD": "CADSEK=X", "EUR": "EURSEK=X"}
     res = {"SEK": 1.0}
     for code, ysym in par.items():
         try:
@@ -138,10 +146,6 @@ def hamta_valutakurser_automatiskt() -> dict:
     return res
 
 def auto_update_valutakurser_if_stale() -> bool:
-    """
-    Jämför sparade kurser mot live-kurser. Om skillnad (eller tom sparfil),
-    skriv till Google Sheets och bumpa cache-nyckeln.
-    """
     try:
         saved = las_sparade_valutakurser()
         live = hamta_valutakurser_automatiskt()
@@ -167,7 +171,7 @@ def auto_update_valutakurser_if_stale() -> bool:
         return False
 # ============================================================================
 
-# --- Kolumnschema (NYTT: 'GAV (SEK)') ---
+# --- Kolumnschema (inkl. 'GAV (SEK)') ---
 FINAL_COLS = [
     "Ticker", "Bolagsnamn", "Utestående aktier",
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
@@ -188,12 +192,8 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
-    mapping = {
-        "Riktkurs 2026": "Riktkurs om 1 år",
-        "Riktkurs 2027": "Riktkurs om 2 år",
-        "Riktkurs 2028": "Riktkurs om 3 år",
-        "Riktkurs om idag": "Riktkurs idag",
-    }
+    mapping = {"Riktkurs 2026": "Riktkurs om 1 år", "Riktkurs 2027": "Riktkurs om 2 år",
+               "Riktkurs 2028": "Riktkurs om 3 år", "Riktkurs om idag": "Riktkurs idag"}
     for old, new in mapping.items():
         if old in df.columns:
             if new not in df.columns:
@@ -204,31 +204,6 @@ def migrera_gamla_riktkurskolumner(df: pd.DataFrame) -> pd.DataFrame:
             df.loc[mask, new] = old_vals[mask]
             df = df.drop(columns=[old])
     return df
-
-def _parse_sv_float(val) -> float:
-    """Accepterar '10,61', '1 234,56', '1,234.56', 1061, etc → float."""
-    if isinstance(val, (int, float, np.number)):
-        return float(val)
-    s = str(val).strip()
-    if s == "" or s.lower() in {"nan", "none"}:
-        return 0.0
-    # ta bort mellanslag inkl smala mellanrum
-    s = s.replace(" ", "").replace("\u202f", "")
-    # både komma och punkt → gissa decimalsymbolen som sista separatorn
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            # komma är decimal, punkt tusental
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            # punkt är decimal, komma tusental
-            s = s.replace(",", "")
-    elif "," in s:
-        s = s.replace(",", ".")
-    # nu borde python float funka
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
 
 def konvertera_typer(df: pd.DataFrame) -> pd.DataFrame:
     num_cols = [
@@ -259,9 +234,8 @@ def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
                 return 0.0
         if series.empty or len(series) < 2:
             return 0.0
-        series = series.sort_index()  # kronologisk
-        start = float(series.iloc[0])
-        end   = float(series.iloc[-1])
+        series = series.sort_index()
+        start = float(series.iloc[0]); end = float(series.iloc[-1])
         years = max(1, len(series)-1)
         if start <= 0:
             return 0.0
@@ -272,13 +246,7 @@ def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
 
 # --- Hämtning från Yahoo (namn, kurs, valuta, utdelning, CAGR) ---
 def hamta_yahoo_fält(ticker: str) -> dict:
-    out = {
-        "Bolagsnamn": "",
-        "Aktuell kurs": 0.0,
-        "Valuta": "USD",
-        "Årlig utdelning": 0.0,
-        "CAGR 5 år (%)": 0.0,
-    }
+    out = {"Bolagsnamn": "", "Aktuell kurs": 0.0, "Valuta": "USD", "Årlig utdelning": 0.0, "CAGR 5 år (%)": 0.0}
     try:
         t = yf.Ticker(ticker)
         info = {}
@@ -312,21 +280,18 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         pass
     return out
 
-# --- Beräkningar (P/S-snitt, omsättning år2/3 med clamp, riktkurser) ---
+# --- Beräkningar ---
 def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
     for i, rad in df.iterrows():
-        # P/S-snitt: snitt av positiva Q1–Q4
         ps_vals = [rad.get("P/S Q1", 0), rad.get("P/S Q2", 0), rad.get("P/S Q3", 0), rad.get("P/S Q4", 0)]
         ps_clean = [float(x) for x in ps_vals if float(x) > 0]
         ps_snitt = round(np.mean(ps_clean), 2) if ps_clean else 0.0
         df.at[i, "P/S-snitt"] = ps_snitt
 
-        # CAGR clamp: >100% → 50%, <0% → 2%
         cagr = float(rad.get("CAGR 5 år (%)", 0.0))
         just_cagr = 50.0 if cagr > 100.0 else (2.0 if cagr < 0.0 else cagr)
         g = just_cagr / 100.0
 
-        # Omsättning om 2 & 3 år från "Omsättning nästa år"
         oms_next = float(rad.get("Omsättning nästa år", 0.0))
         if oms_next > 0:
             df.at[i, "Omsättning om 2 år"] = round(oms_next * (1.0 + g), 2)
@@ -335,18 +300,17 @@ def uppdatera_berakningar(df: pd.DataFrame, user_rates: dict) -> pd.DataFrame:
             df.at[i, "Omsättning om 2 år"] = float(rad.get("Omsättning om 2 år", 0.0))
             df.at[i, "Omsättning om 3 år"] = float(rad.get("Omsättning om 3 år", 0.0))
 
-        # Riktkurser (kräver Utestående aktier > 0 och P/S-snitt > 0)
         aktier_ut = float(rad.get("Utestående aktier", 0.0))
         if aktier_ut > 0 and ps_snitt > 0:
-            df.at[i, "Riktkurs idag"]    = round((float(rad.get("Omsättning idag", 0.0))      * ps_snitt) / aktier_ut, 2)
-            df.at[i, "Riktkurs om 1 år"] = round((float(rad.get("Omsättning nästa år", 0.0))  * ps_snitt) / aktier_ut, 2)
-            df.at[i, "Riktkurs om 2 år"] = round((float(df.at[i, "Omsättning om 2 år"])       * ps_snitt) / aktier_ut, 2)
-            df.at[i, "Riktkurs om 3 år"] = round((float(df.at[i, "Omsättning om 3 år"])       * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs idag"]    = round((float(rad.get("Omsättning idag", 0.0)) * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs om 1 år"] = round((float(rad.get("Omsättning nästa år", 0.0)) * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs om 2 år"] = round((float(df.at[i, "Omsättning om 2 år"]) * ps_snitt) / aktier_ut, 2)
+            df.at[i, "Riktkurs om 3 år"] = round((float(df.at[i, "Omsättning om 3 år"]) * ps_snitt) / aktier_ut, 2)
         else:
             df.at[i, "Riktkurs idag"] = df.at[i, "Riktkurs om 1 år"] = df.at[i, "Riktkurs om 2 år"] = df.at[i, "Riktkurs om 3 år"] = 0.0
     return df
 
-# --- Massuppdatera från Yahoo (1s delay, kopierbar felrapport) ---
+# --- Massuppdatera från Yahoo ---
 def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.DataFrame:
     st.sidebar.markdown("---")
     if st.sidebar.button("🔄 Uppdatera alla från Yahoo", key=f"{key_prefix}_massupd_btn"):
@@ -391,18 +355,13 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
         if misslyckade:
             st.sidebar.warning("Vissa fält kunde inte hämtas. Kopiera listan nedan:")
             st.sidebar.text_area("Misslyckade fält", "\n".join(misslyckade), height=160, key=f"{key_prefix}_miss")
-
     return df
 
-# Fält som triggar datum "Senast manuellt uppdaterad"
 MANUELL_FALT_FOR_DATUM = ["P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]
 
 # ---- Hjälpare för SVE-decimal i formulär ----
-def _show_dec_input(label: str, default_val: float) -> float:
-    """
-    Textfält som accepterar både '10,61' och '10.61'. Visar värdet med komma.
-    """
-    start_text = ("" if pd.isna(default_val) else str(default_val)).replace(".", ",")
+def _show_dec_input(label: str, default_val: float, decimals: int = 2) -> float:
+    start_text = _fmt_sv(default_val, decimals)
     s = st.text_input(label, value=start_text)
     return _parse_sv_float(s)
 
@@ -411,11 +370,9 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     st.header("➕ Lägg till / uppdatera bolag")
 
     sort_val = st.selectbox("Sortera för redigering", ["A–Ö (bolagsnamn)","Äldst manuell uppdatering först"])
+    vis_df = df.sort_values(by=["_sort_datum","Bolagsnamn"]) if sort_val.startswith("Äldst") else df.sort_values(by=["Bolagsnamn","Ticker"])
     if sort_val.startswith("Äldst"):
         df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00")
-        vis_df = df.sort_values(by=["_sort_datum","Bolagsnamn"])
-    else:
-        vis_df = df.sort_values(by=["Bolagsnamn","Ticker"])
 
     namn_map = {f"{r['Bolagsnamn']} ({r['Ticker']})": r['Ticker'] for _, r in vis_df.iterrows()}
     val_lista = [""] + list(namn_map.keys())
@@ -452,7 +409,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         with c2:
             oms_idag  = _show_dec_input("Omsättning idag (miljoner)",  float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0)
             oms_next  = _show_dec_input("Omsättning nästa år (miljoner)", float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0)
-
             st.markdown("**Uppdateras automatiskt vid spara:**")
             st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%)")
             st.write("- Omsättning om 2 & 3 år, Riktkurser och P/S-snitt beräknas om")
@@ -460,22 +416,19 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         spar = st.form_submit_button("💾 Spara & hämta från Yahoo")
 
     if spar and ticker:
-        # === DUBBLETTKONTROLL (case-insensitiv, trim) ===
+        # === DUBBLETTKONTROLL ===
         new_tkr = (ticker or "").strip().upper()
         cur_tkr = (bef.get("Ticker","") if not bef.empty else "").strip().upper()
         tkr_norm = df["Ticker"].astype(str).str.strip().str.upper()
-
         if bef.empty:
-            # Ny rad: avbryt om tickern redan finns
             if (tkr_norm == new_tkr).any():
                 st.error(f"Tickern **{new_tkr}** finns redan i databasen. Välj den i listan för att redigera.")
                 st.stop()
         else:
-            # Redigera: om användaren ändrat ticker → avbryt om nya redan finns på annan rad
             if new_tkr != cur_tkr and (tkr_norm == new_tkr).any():
                 st.error(f"Kan inte byta till tickern **{new_tkr}** – den finns redan i en annan rad.")
                 st.stop()
-        # ================================================
+        # ========================
 
         ny = {
             "Ticker": new_tkr, "Utestående aktier": utest, "Antal aktier": antal,
@@ -495,7 +448,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                 datum_sätt = True
 
         if not bef.empty:
-            # uppdatera existerande rad (på ny ticker om den ändrats)
             target_tkr = new_tkr if new_tkr else cur_tkr
             for k,v in ny.items():
                 df.loc[df["Ticker"].astype(str).str.upper()==target_tkr, k] = v
@@ -524,7 +476,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     df["_sort_datum"] = df["Senast manuellt uppdaterad"].replace("", "0000-00-00")
     tips = df.sort_values(by=["_sort_datum","Bolagsnamn"]).head(10)
     st.dataframe(tips[["Ticker","Bolagsnamn","Senast manuellt uppdaterad","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","Omsättning idag","Omsättning nästa år"]], use_container_width=True)
-
     return df
 
 # --- Analysvy ---
@@ -561,21 +512,15 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     st.header("📦 Min portfölj")
     port = df[df["Antal aktier"] > 0].copy()
     if port.empty:
-        st.info("Du äger inga aktier.")
-        return
-    # Växelkurs och marknadsvärde
+        st.info("Du äger inga aktier."); return
     port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
     port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
-    # Anskaffningsvärde
     port["Anskaffningsvärde (SEK)"] = port["Antal aktier"] * port["GAV (SEK)"]
-    # Vinst/förlust
     port["Vinst/Förlust (SEK)"] = port["Värde (SEK)"] - port["Anskaffningsvärde (SEK)"]
     port["Vinst/Förlust (%)"] = np.where(
         port["Anskaffningsvärde (SEK)"] > 0,
-        (port["Vinst/Förlust (SEK)"] / port["Anskaffningsvärde (SEK)"]) * 100.0,
-        0.0
+        (port["Vinst/Förlust (SEK)"] / port["Anskaffningsvärde (SEK)"]) * 100.0, 0.0
     )
-    # Andelar och utdelning
     total_värde = float(port["Värde (SEK)"].sum())
     port["Andel (%)"] = np.where(total_värde > 0, round(port["Värde (SEK)"] / total_värde * 100.0, 2), 0.0)
     port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
@@ -591,12 +536,9 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     st.markdown(f"**Ungefärlig månadsutdelning:** {round(tot_utd/12.0,2)} SEK")
 
     st.dataframe(
-        port[[
-            "Ticker","Bolagsnamn","Antal aktier","GAV (SEK)","Anskaffningsvärde (SEK)",
-            "Aktuell kurs","Valuta","Växelkurs","Värde (SEK)",
-            "Vinst/Förlust (SEK)","Vinst/Förlust (%)",
-            "Årlig utdelning","Total årlig utdelning (SEK)","Andel (%)"
-        ]],
+        port[["Ticker","Bolagsnamn","Antal aktier","GAV (SEK)","Anskaffningsvärde (SEK)",
+              "Aktuell kurs","Valuta","Växelkurs","Värde (SEK)","Vinst/Förlust (SEK)","Vinst/Förlust (%)",
+              "Årlig utdelning","Total årlig utdelning (SEK)","Andel (%)"]],
         use_container_width=True
     )
 
@@ -606,27 +548,17 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     kapital_sek = st.number_input("Tillgängligt kapital (SEK)", value=500.0, step=100.0)
 
     riktkurs_val = st.selectbox("Vilken riktkurs ska användas?",
-                                ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"],
-                                index=1)
+                                ["Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år"], index=1)
 
     subset = st.radio("Vilka bolag?", ["Alla bolag","Endast portfölj"], horizontal=True)
     läge = st.radio("Sortering", ["Störst potential","Närmast riktkurs"], horizontal=True)
 
-    # 🔽 filter på P/S vs P/S-snitt
-    ps_filter = st.selectbox(
-        "Filtrera på P/S i förhållande till P/S-snitt",
-        ["Alla", "P/S under snitt", "P/S över snitt"],
-        index=0
-    )
+    ps_filter = st.selectbox("Filtrera på P/S i förhållande till P/S-snitt",
+                             ["Alla", "P/S under snitt", "P/S över snitt"], index=0)
 
-    if subset == "Endast portfölj":
-        base = df[df["Antal aktier"] > 0].copy()
-    else:
-        base = df.copy()
-
+    base = df[df["Antal aktier"] > 0].copy() if subset == "Endast portfölj" else df.copy()
     base = base[(base[riktkurs_val] > 0) & (base["Aktuell kurs"] > 0)].copy()
 
-    # tillämpa P/S-filter (kräv båda > 0 för meningsfull jämförelse)
     if ps_filter == "P/S under snitt":
         base = base[(base["P/S"] > 0) & (base["P/S-snitt"] > 0) & (base["P/S"] < base["P/S-snitt"])].copy()
     elif ps_filter == "P/S över snitt":
@@ -704,13 +636,13 @@ def main():
     # Automatisk valutahämtning och sparning (tyst)
     auto_update_valutakurser_if_stale()
 
-    # Sidopanel: valutakurser → läs sparade och visa inputs
+    # Sidopanel: valutakurser – SV-decimal inputs
     st.sidebar.header("💱 Valutakurser → SEK")
     saved_rates = las_sparade_valutakurser()
-    usd = st.sidebar.number_input("USD → SEK", value=float(saved_rates.get("USD", STANDARD_VALUTAKURSER["USD"])), step=0.01, format="%.4f")
-    nok = st.sidebar.number_input("NOK → SEK", value=float(saved_rates.get("NOK", STANDARD_VALUTAKURSER["NOK"])), step=0.01, format="%.4f")
-    cad = st.sidebar.number_input("CAD → SEK", value=float(saved_rates.get("CAD", STANDARD_VALUTAKURSER["CAD"])), step=0.01, format="%.4f")
-    eur = st.sidebar.number_input("EUR → SEK", value=float(saved_rates.get("EUR", STANDARD_VALUTAKURSER["EUR"])), step=0.01, format="%.4f")
+    usd = _parse_sv_float(st.sidebar.text_input("USD → SEK", _fmt_sv(saved_rates.get("USD", STANDARD_VALUTAKURSER["USD"])) ))
+    nok = _parse_sv_float(st.sidebar.text_input("NOK → SEK", _fmt_sv(saved_rates.get("NOK", STANDARD_VALUTAKURSER["NOK"])) ))
+    cad = _parse_sv_float(st.sidebar.text_input("CAD → SEK", _fmt_sv(saved_rates.get("CAD", STANDARD_VALUTAKURSER["CAD"])) ))
+    eur = _parse_sv_float(st.sidebar.text_input("EUR → SEK", _fmt_sv(saved_rates.get("EUR", STANDARD_VALUTAKURSER["EUR"])) ))
     user_rates = {"USD": usd, "NOK": nok, "CAD": cad, "EUR": eur, "SEK": 1.0}
 
     col_rates1, col_rates2 = st.sidebar.columns(2)
@@ -724,7 +656,6 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
-    # Manuell hämtning från Yahoo och direkt sparning
     st.sidebar.markdown("")
     if st.sidebar.button("🌐 Hämta valutakurser (Yahoo)"):
         live = hamta_valutakurser_automatiskt()

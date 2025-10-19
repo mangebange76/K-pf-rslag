@@ -461,23 +461,63 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         bef = pd.Series({}, dtype=object)
         row_idx = None
 
+    # ⇩ NYTT: reset av formulär-state vid byte av valt bolag
+    sel_token = namn_map.get(valt_label, "__NEW__")
+    if st.session_state.get("form_row_token") != sel_token:
+        st.session_state["form_row_token"] = sel_token
+        st.session_state["ti_ticker"]  = bef.get("Ticker","") if not bef.empty else ""
+        st.session_state["ni_utest"]   = float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_antal"]   = float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_gav"]     = float(bef.get("GAV (SEK)",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_fair"]    = float(bef.get("Fair value",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps"]      = float(bef.get("P/S",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps1"]     = float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps2"]     = float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps3"]     = float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps4"]     = float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_oms_idag"]= float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_oms_next"]= float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0
+
     with st.form("form_bolag"):
         c1, c2 = st.columns(2)
         with c1:
-            # VIKTIG ÄNDRING: ingen .upper().strip() i widget-anropet, och stabila keys
-            ticker_raw = st.text_input("Ticker (Yahoo-format)", value=bef.get("Ticker","") if not bef.empty else "", key="ti_ticker")
-            utest = st.number_input("Utestående aktier (miljoner)", value=float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0, key="ni_utest")
-            antal = st.number_input("Antal aktier du äger", value=float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0, key="ni_antal")
-            gav_sek = st.number_input("GAV (SEK)", value=float(bef.get("GAV (SEK)",0.0)) if not bef.empty else 0.0, key="ni_gav")
-            fair_value = st.number_input("Fair value", value=float(bef.get("Fair value",0.0)) if not bef.empty else 0.0, key="ni_fair")
-            ps  = st.number_input("P/S",   value=float(bef.get("P/S",0.0)) if not bef.empty else 0.0, key="ni_ps")
-            ps1 = st.number_input("P/S Q1", value=float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0, key="ni_ps1")
-            ps2 = st.number_input("P/S Q2", value=float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0, key="ni_ps2")
-            ps3 = st.number_input("P/S Q3", value=float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0, key="ni_ps3")
-            ps4 = st.number_input("P/S Q4", value=float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0, key="ni_ps4")
+            ticker_raw = st.text_input("Ticker (Yahoo-format)",
+                                       value=st.session_state.get("ti_ticker",""),
+                                       key="ti_ticker")
+            utest = st.number_input("Utestående aktier (miljoner)",
+                                    value=float(st.session_state.get("ni_utest",0.0)),
+                                    key="ni_utest")
+            antal = st.number_input("Antal aktier du äger",
+                                    value=float(st.session_state.get("ni_antal",0.0)),
+                                    key="ni_antal")
+            gav_sek = st.number_input("GAV (SEK)",
+                                      value=float(st.session_state.get("ni_gav",0.0)),
+                                      key="ni_gav")
+            fair_value = st.number_input("Fair value",
+                                         value=float(st.session_state.get("ni_fair",0.0)),
+                                         key="ni_fair")
+            ps  = st.number_input("P/S",
+                                  value=float(st.session_state.get("ni_ps",0.0)),
+                                  key="ni_ps")
+            ps1 = st.number_input("P/S Q1",
+                                  value=float(st.session_state.get("ni_ps1",0.0)),
+                                  key="ni_ps1")
+            ps2 = st.number_input("P/S Q2",
+                                  value=float(st.session_state.get("ni_ps2",0.0)),
+                                  key="ni_ps2")
+            ps3 = st.number_input("P/S Q3",
+                                  value=float(st.session_state.get("ni_ps3",0.0)),
+                                  key="ni_ps3")
+            ps4 = st.number_input("P/S Q4",
+                                  value=float(st.session_state.get("ni_ps4",0.0)),
+                                  key="ni_ps4")
         with c2:
-            oms_idag  = st.number_input("Omsättning idag (miljoner)",  value=float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0, key="ni_oms_idag")
-            oms_next  = st.number_input("Omsättning nästa år (miljoner)", value=float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0, key="ni_oms_next")
+            oms_idag  = st.number_input("Omsättning idag (miljoner)",
+                                        value=float(st.session_state.get("ni_oms_idag",0.0)),
+                                        key="ni_oms_idag")
+            oms_next  = st.number_input("Omsättning nästa år (miljoner)",
+                                        value=float(st.session_state.get("ni_oms_next",0.0)),
+                                        key="ni_oms_next")
 
             st.markdown("**Uppdateras automatiskt vid spara:**")
             st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%)")
@@ -486,10 +526,9 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         spar = st.form_submit_button("💾 Spara & hämta från Yahoo")
 
     if spar and ticker_raw:
-        # Formatera ticker först NU (efter submit) → stör inte skrivandet
         new_tkr = (ticker_raw or "").strip().upper()
 
-        # === DUBBLETTKONTROLL ===
+        # DUBBLETTKONTROLL
         tkr_norm = df["Ticker"].astype(str).str.strip().str.upper()
         cur_tkr = (bef.get("Ticker","") if not bef.empty else "").strip().upper()
         if bef.empty:
@@ -500,7 +539,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             if new_tkr != cur_tkr and (tkr_norm == new_tkr).any():
                 st.error(f"Kan inte byta till tickern **{new_tkr}** – den finns redan i en annan rad.")
                 st.stop()
-        # ========================
 
         ny = {
             "Ticker": new_tkr, "Utestående aktier": utest, "Antal aktier": antal,

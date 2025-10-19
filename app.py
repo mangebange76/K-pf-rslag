@@ -728,6 +728,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     st.markdown(
         f"""
 - **Aktuell kurs:** {round(rad['Aktuell kurs'],2)} {rad['Valuta']}
+- **Fair value:** {round(rad.get('Fair value', 0.0), 2)} {rad['Valuta']}
 - **Nuvarande P/S (TTM):** {round(rad.get('P/S', 0.0), 2)}
 - **P/S-snitt (Q1–Q4):** {round(rad.get('P/S-snitt', 0.0), 2)}
 - **Riktkurs idag:** {round(rad['Riktkurs idag'],2)} {rad['Valuta']} {"**⬅ vald**" if riktkurs_val=="Riktkurs idag" else ""}

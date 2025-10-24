@@ -629,15 +629,23 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     if port.empty:
         st.info("Du äger inga aktier.")
         return
+
+    # Växelkurs och marknadsvärde
     port["Växelkurs"] = port["Valuta"].apply(lambda v: hamta_valutakurs(v, user_rates))
     port["Värde (SEK)"] = port["Antal aktier"] * port["Aktuell kurs"] * port["Växelkurs"]
+
+    # Anskaffningsvärde (köpt för): Antal × GAV
     port["Anskaffningsvärde (SEK)"] = port["Antal aktier"] * port["GAV (SEK)"]
+
+    # Vinst/förlust
     port["Vinst/Förlust (SEK)"] = port["Värde (SEK)"] - port["Anskaffningsvärde (SEK)"]
     port["Vinst/Förlust (%)"] = np.where(
         port["Anskaffningsvärde (SEK)"] > 0,
         (port["Vinst/Förlust (SEK)"] / port["Anskaffningsvärde (SEK)"]) * 100.0,
         0.0
     )
+
+    # Andelar och utdelning
     total_värde = float(port["Värde (SEK)"].sum())
     port["Andel (%)"] = np.where(total_värde > 0, round(port["Värde (SEK)"] / total_värde * 100.0, 2), 0.0)
     port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
@@ -646,12 +654,51 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     tot_pl = float(port["Vinst/Förlust (SEK)"].sum())
     tot_pl_pct = (tot_pl / tot_ansk * 100.0) if tot_ansk > 0 else 0.0
 
+    # Sammanfattning
     st.markdown(f"**Totalt portföljvärde:** {round(total_värde,2)} SEK")
     st.markdown(f"**Totalt anskaffningsvärde:** {round(tot_ansk,2)} SEK")
     st.markdown(f"**Orealiserad vinst/förlust:** {round(tot_pl,2)} SEK ({round(tot_pl_pct,2)} %)")
     st.markdown(f"**Total kommande utdelning:** {round(tot_utd,2)} SEK")
     st.markdown(f"**Ungefärlig månadsutdelning:** {round(tot_utd/12.0,2)} SEK")
 
+    # Sorteringsreglage (nytt)
+    sort_val = st.radio("Sortera efter anskaffningsvärde", ["Störst först","Minst först"], horizontal=True)
+    ascending = (sort_val == "Minst först")
+    port = port.sort_values(by="Anskaffningsvärde (SEK)", ascending=ascending).reset_index(drop=True)
+
+    # Bläddring (nytt)
+    if "port_idx" not in st.session_state:
+        st.session_state.port_idx = 0
+    st.session_state.port_idx = min(st.session_state.port_idx, len(port)-1)
+
+    col_prev, col_mid, col_next = st.columns([1,2,1])
+    with col_prev:
+        if st.button("⬅️ Föregående innehav"):
+            st.session_state.port_idx = max(0, st.session_state.port_idx - 1)
+    with col_mid:
+        st.write(f"Post {st.session_state.port_idx+1}/{len(port)}")
+    with col_next:
+        if st.button("➡️ Nästa innehav"):
+            st.session_state.port_idx = min(len(port)-1, st.session_state.port_idx + 1)
+
+    r = port.iloc[st.session_state.port_idx]
+    st.subheader(f"{r['Bolagsnamn']} ({r['Ticker']})")
+    st.markdown(
+        f"""
+- **Antal aktier:** {int(r['Antal aktier'])}
+- **GAV (SEK):** {round(r['GAV (SEK)'],2)}
+- **Anskaffningsvärde (SEK):** {round(r['Anskaffningsvärde (SEK)'],2)}
+- **Aktuell kurs:** {round(r['Aktuell kurs'],2)} {r['Valuta']}
+- **Växelkurs:** {round(r['Växelkurs'],6)}
+- **Värde (SEK):** {round(r['Värde (SEK)'],2)}
+- **Vinst/Förlust (SEK):** {round(r['Vinst/Förlust (SEK)'],2)} ({round(r['Vinst/Förlust (%)'],2)} %)
+- **Andel av portfölj:** {r['Andel (%)']} %
+- **Årlig utdelning per aktie:** {round(r['Årlig utdelning'],2)} {r['Valuta']}
+- **Total årlig utdelning (SEK):** {round(r['Total årlig utdelning (SEK)'],2)}
+"""
+    )
+
+    # Hela tabellen (oförändrad)
     st.dataframe(
         port[[
             "Ticker","Bolagsnamn","Antal aktier","GAV (SEK)","Anskaffningsvärde (SEK)",

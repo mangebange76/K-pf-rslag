@@ -111,7 +111,7 @@ FINAL_COLS = [
     "Antal aktier", "GAV (SEK)", "Valuta", "Årlig utdelning", "Aktuell kurs",
     "CAGR 5 år (%)", "P/S-snitt",
     "Senast manuellt uppdaterad",
-    "Fair value",  # nytt fält
+    "Fair value",
 ]
 
 NUMERIC_COLS = [
@@ -440,7 +440,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         vis_df = df.sort_values(by=["Bolagsnamn","Ticker"])
 
     namn_map = {f"{r['Bolagsnamn']} ({r['Ticker']})": r['Ticker'] for _, r in vis_df.iterrows()}
-    val_lista = [""] + list(namn_map.keys())
+    val_lista = [""] + list(namn_map.keys()]
     if "edit_index" not in st.session_state: st.session_state.edit_index = 0
 
     valt_label = st.selectbox("Välj bolag (lämna tomt för nytt)", val_lista, index=min(st.session_state.edit_index, len(val_lista)-1))
@@ -461,7 +461,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         bef = pd.Series({}, dtype=object)
         row_idx = None
 
-    # ⇩ NYTT: reset av formulär-state vid byte av valt bolag
+    # reset av formulär-state vid byte av valt bolag
     sel_token = namn_map.get(valt_label, "__NEW__")
     if st.session_state.get("form_row_token") != sel_token:
         st.session_state["form_row_token"] = sel_token
@@ -661,12 +661,12 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     st.markdown(f"**Total kommande utdelning:** {round(tot_utd,2)} SEK")
     st.markdown(f"**Ungefärlig månadsutdelning:** {round(tot_utd/12.0,2)} SEK")
 
-    # Sorteringsreglage (nytt)
+    # Sorteringsreglage
     sort_val = st.radio("Sortera efter anskaffningsvärde", ["Störst först","Minst först"], horizontal=True)
     ascending = (sort_val == "Minst först")
     port = port.sort_values(by="Anskaffningsvärde (SEK)", ascending=ascending).reset_index(drop=True)
 
-    # Bläddring (nytt)
+    # Bläddring
     if "port_idx" not in st.session_state:
         st.session_state.port_idx = 0
     st.session_state.port_idx = min(st.session_state.port_idx, len(port)-1)
@@ -698,7 +698,7 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
 """
     )
 
-    # Hela tabellen (oförändrad)
+    # Hela tabellen
     st.dataframe(
         port[[
             "Ticker","Bolagsnamn","Antal aktier","GAV (SEK)","Anskaffningsvärde (SEK)",
@@ -791,11 +791,21 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     nuv_andel = round((nuv_innehav / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
     ny_andel  = round((ny_total   / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
 
+    # --- NY UTRÄKNING FÖR UTDELNING ---
+    utd_per_aktie = float(rad.get("Årlig utdelning", 0.0))  # i bolagets valuta
+    utd_per_aktie_sek = utd_per_aktie * vx                  # omräknad till SEK
+    if rad["Aktuell kurs"] > 0:
+        direktavkastning_pct = (utd_per_aktie / rad["Aktuell kurs"]) * 100.0
+    else:
+        direktavkastning_pct = 0.0
+
     st.subheader(f"{rad['Bolagsnamn']} ({rad['Ticker']})")
     st.markdown(
         f"""
 - **Aktuell kurs:** {round(rad['Aktuell kurs'],2)} {rad['Valuta']}
 - **Fair value:** {round(rad.get('Fair value', 0.0), 2)} {rad['Valuta']}
+- **Årlig utdelning per aktie:** {round(utd_per_aktie,2)} {rad['Valuta']} (~{round(utd_per_aktie_sek,2)} SEK)
+- **Direktavkastning på aktuell kurs:** {round(direktavkastning_pct,2)} %
 - **Nuvarande P/S (TTM):** {round(rad.get('P/S', 0.0), 2)}
 - **P/S-snitt (Q1–Q4):** {round(rad.get('P/S-snitt', 0.0), 2)}
 - **Riktkurs idag:** {round(rad['Riktkurs idag'],2)} {rad['Valuta']} {"**⬅ vald**" if riktkurs_val=="Riktkurs idag" else ""}

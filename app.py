@@ -1,4 +1,3 @@
-# app.py
 from __future__ import annotations
 import re
 import time
@@ -108,7 +107,7 @@ FINAL_COLS = [
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier", "GAV (SEK)", "Valuta", "Årlig utdelning", "Aktuell kurs",
+    "Antal aktier", "Bucket", "GAV (SEK)", "Valuta", "Årlig utdelning", "Aktuell kurs",
     "CAGR 5 år (%)", "P/S-snitt",
     "Senast manuellt uppdaterad",
     "Fair value",
@@ -123,7 +122,7 @@ NUMERIC_COLS = [
     "Fair value",
 ]
 
-TEXT_COLS = ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad"]
+TEXT_COLS = ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Bucket"]
 
 def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -440,7 +439,6 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         vis_df = df.sort_values(by=["Bolagsnamn","Ticker"])
 
     namn_map = {f"{r['Bolagsnamn']} ({r['Ticker']})": r['Ticker'] for _, r in vis_df.iterrows()}
-    # FIXAD RAD ↓↓↓
     val_lista = [""] + list(namn_map.keys())
 
     if "edit_index" not in st.session_state:
@@ -469,59 +467,107 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
     sel_token = namn_map.get(valt_label, "__NEW__")
     if st.session_state.get("form_row_token") != sel_token:
         st.session_state["form_row_token"] = sel_token
-        st.session_state["ti_ticker"]  = bef.get("Ticker","") if not bef.empty else ""
-        st.session_state["ni_utest"]   = float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_antal"]   = float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_gav"]     = float(bef.get("GAV (SEK)",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_fair"]    = float(bef.get("Fair value",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_ps"]      = float(bef.get("P/S",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_ps1"]     = float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_ps2"]     = float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_ps3"]     = float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_ps4"]     = float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_oms_idag"]= float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0
-        st.session_state["ni_oms_next"]= float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0
+        st.session_state["ti_ticker"]   = bef.get("Ticker","") if not bef.empty else ""
+        st.session_state["ni_utest"]    = float(bef.get("Utestående aktier",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_antal"]    = float(bef.get("Antal aktier",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_bucket"]   = bef.get("Bucket","") if not bef.empty else ""
+        st.session_state["ni_gav"]      = float(bef.get("GAV (SEK)",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_fair"]     = float(bef.get("Fair value",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps"]       = float(bef.get("P/S",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps1"]      = float(bef.get("P/S Q1",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps2"]      = float(bef.get("P/S Q2",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps3"]      = float(bef.get("P/S Q3",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_ps4"]      = float(bef.get("P/S Q4",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_oms_idag"] = float(bef.get("Omsättning idag",0.0)) if not bef.empty else 0.0
+        st.session_state["ni_oms_next"] = float(bef.get("Omsättning nästa år",0.0)) if not bef.empty else 0.0
 
     with st.form("form_bolag"):
         c1, c2 = st.columns(2)
+
+        # --- kolumn 1 ---
         with c1:
-            ticker_raw = st.text_input("Ticker (Yahoo-format)",
-                                       value=st.session_state.get("ti_ticker",""),
-                                       key="ti_ticker")
-            utest = st.number_input("Utestående aktier (miljoner)",
-                                    value=float(st.session_state.get("ni_utest",0.0)),
-                                    key="ni_utest")
-            antal = st.number_input("Antal aktier du äger",
-                                    value=float(st.session_state.get("ni_antal",0.0)),
-                                    key="ni_antal")
-            gav_sek = st.number_input("GAV (SEK)",
-                                      value=float(st.session_state.get("ni_gav",0.0)),
-                                      key="ni_gav")
-            fair_value = st.number_input("Fair value",
-                                         value=float(st.session_state.get("ni_fair",0.0)),
-                                         key="ni_fair")
-            ps  = st.number_input("P/S",
-                                  value=float(st.session_state.get("ni_ps",0.0)),
-                                  key="ni_ps")
-            ps1 = st.number_input("P/S Q1",
-                                  value=float(st.session_state.get("ni_ps1",0.0)),
-                                  key="ni_ps1")
-            ps2 = st.number_input("P/S Q2",
-                                  value=float(st.session_state.get("ni_ps2",0.0)),
-                                  key="ni_ps2")
-            ps3 = st.number_input("P/S Q3",
-                                  value=float(st.session_state.get("ni_ps3",0.0)),
-                                  key="ni_ps3")
-            ps4 = st.number_input("P/S Q4",
-                                  value=float(st.session_state.get("ni_ps4",0.0)),
-                                  key="ni_ps4")
+            ticker_raw = st.text_input(
+                "Ticker (Yahoo-format)",
+                value=st.session_state.get("ti_ticker",""),
+                key="ti_ticker"
+            )
+
+            utest = st.number_input(
+                "Utestående aktier (miljoner)",
+                value=float(st.session_state.get("ni_utest",0.0)),
+                key="ni_utest"
+            )
+
+            antal = st.number_input(
+                "Antal aktier du äger",
+                value=float(st.session_state.get("ni_antal",0.0)),
+                key="ni_antal"
+            )
+
+            bucket_choices = [
+                "",
+                "Bucket Tillväxt A","Bucket Tillväxt B","Bucket Tillväxt C",
+                "Bucket Utdelning A","Bucket Utdelning B","Bucket Utdelning C",
+            ]
+            bucket_default = st.session_state.get("ni_bucket","")
+            bucket_index = bucket_choices.index(bucket_default) if bucket_default in bucket_choices else 0
+            bucket_val = st.selectbox(
+                "Bucket",
+                bucket_choices,
+                index=bucket_index,
+                key="ni_bucket"
+            )
+
+            gav_sek = st.number_input(
+                "GAV (SEK)",
+                value=float(st.session_state.get("ni_gav",0.0)),
+                key="ni_gav"
+            )
+
+            fair_value = st.number_input(
+                "Fair value",
+                value=float(st.session_state.get("ni_fair",0.0)),
+                key="ni_fair"
+            )
+
+            ps  = st.number_input(
+                "P/S",
+                value=float(st.session_state.get("ni_ps",0.0)),
+                key="ni_ps"
+            )
+            ps1 = st.number_input(
+                "P/S Q1",
+                value=float(st.session_state.get("ni_ps1",0.0)),
+                key="ni_ps1"
+            )
+            ps2 = st.number_input(
+                "P/S Q2",
+                value=float(st.session_state.get("ni_ps2",0.0)),
+                key="ni_ps2"
+            )
+            ps3 = st.number_input(
+                "P/S Q3",
+                value=float(st.session_state.get("ni_ps3",0.0)),
+                key="ni_ps3"
+            )
+            ps4 = st.number_input(
+                "P/S Q4",
+                value=float(st.session_state.get("ni_ps4",0.0)),
+                key="ni_ps4"
+            )
+
+        # --- kolumn 2 ---
         with c2:
-            oms_idag  = st.number_input("Omsättning idag (miljoner)",
-                                        value=float(st.session_state.get("ni_oms_idag",0.0)),
-                                        key="ni_oms_idag")
-            oms_next  = st.number_input("Omsättning nästa år (miljoner)",
-                                        value=float(st.session_state.get("ni_oms_next",0.0)),
-                                        key="ni_oms_next")
+            oms_idag  = st.number_input(
+                "Omsättning idag (miljoner)",
+                value=float(st.session_state.get("ni_oms_idag",0.0)),
+                key="ni_oms_idag"
+            )
+            oms_next  = st.number_input(
+                "Omsättning nästa år (miljoner)",
+                value=float(st.session_state.get("ni_oms_next",0.0)),
+                key="ni_oms_next"
+            )
 
             st.markdown("**Uppdateras automatiskt vid spara:**")
             st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%)")
@@ -545,11 +591,19 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
                 st.stop()
 
         ny = {
-            "Ticker": new_tkr, "Utestående aktier": utest, "Antal aktier": antal,
+            "Ticker": new_tkr,
+            "Utestående aktier": utest,
+            "Antal aktier": antal,
+            "Bucket": bucket_val,
             "GAV (SEK)": gav_sek,
             "Fair value": fair_value,
-            "P/S": ps, "P/S Q1": ps1, "P/S Q2": ps2, "P/S Q3": ps3, "P/S Q4": ps4,
-            "Omsättning idag": oms_idag, "Omsättning nästa år": oms_next
+            "P/S": ps,
+            "P/S Q1": ps1,
+            "P/S Q2": ps2,
+            "P/S Q3": ps3,
+            "P/S Q4": ps4,
+            "Omsättning idag": oms_idag,
+            "Omsättning nästa år": oms_next,
         }
 
         datum_sätt = False
@@ -621,7 +675,7 @@ def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
         cols = ["Ticker","Bolagsnamn","Valuta","Aktuell kurs","Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
                 "P/S-snitt","Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
                 "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
-                "CAGR 5 år (%)","Antal aktier","GAV (SEK)","Årlig utdelning","Senast manuellt uppdaterad"]
+                "CAGR 5 år (%)","Antal aktier","GAV (SEK)","Årlig utdelning","Senast manuellt uppdaterad","Bucket"]
         st.dataframe(pd.DataFrame([r[cols].to_dict()]), use_container_width=True)
 
     st.markdown("### Hela databasen")
@@ -650,13 +704,34 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     )
 
     # Andelar och utdelning
-    total_värde = float(port["Värde (SEK)"].sum())
-    port["Andel (%)"] = np.where(total_värde > 0, round(port["Värde (SEK)"] / total_värde * 100.0, 2), 0.0)
     port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
-    tot_utd = float(port["Total årlig utdelning (SEK)"].sum())
-    tot_ansk = float(port["Anskaffningsvärde (SEK)"].sum())
-    tot_pl = float(port["Vinst/Förlust (SEK)"].sum())
+
+    # Bucketfilter
+    bucket_filter_choices = [
+        "Alla",
+        "Bucket Tillväxt A","Bucket Tillväxt B","Bucket Tillväxt C",
+        "Bucket Utdelning A","Bucket Utdelning B","Bucket Utdelning C",
+    ]
+    bucket_val = st.selectbox("Filtrera på bucket", bucket_filter_choices, index=0)
+    if bucket_val != "Alla":
+        port = port[port["Bucket"] == bucket_val].copy()
+
+    # Sortera i värde (nuvarande värde), minsta först
+    port = port.sort_values(by="Värde (SEK)", ascending=True).reset_index(drop=True)
+
+    # Summera baserat på (eventuellt filtrerad) port
+    total_värde = float(port["Värde (SEK)"].sum()) if not port.empty else 0.0
+    tot_ansk = float(port["Anskaffningsvärde (SEK)"].sum()) if not port.empty else 0.0
+    tot_pl = float(port["Vinst/Förlust (SEK)"].sum()) if not port.empty else 0.0
     tot_pl_pct = (tot_pl / tot_ansk * 100.0) if tot_ansk > 0 else 0.0
+    tot_utd = float(port["Total årlig utdelning (SEK)"].sum()) if not port.empty else 0.0
+
+    # Andel (%) behöver total_värde på filtrerad portfölj
+    port["Andel (%)"] = np.where(
+        total_värde > 0,
+        round(port["Värde (SEK)"] / total_värde * 100.0, 2),
+        0.0
+    )
 
     # Sammanfattning
     st.markdown(f"**Totalt portföljvärde:** {round(total_värde,2)} SEK")
@@ -664,11 +739,6 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     st.markdown(f"**Orealiserad vinst/förlust:** {round(tot_pl,2)} SEK ({round(tot_pl_pct,2)} %)")
     st.markdown(f"**Total kommande utdelning:** {round(tot_utd,2)} SEK")
     st.markdown(f"**Ungefärlig månadsutdelning:** {round(tot_utd/12.0,2)} SEK")
-
-    # Sorteringsreglage
-    sort_val = st.radio("Sortera efter anskaffningsvärde", ["Störst först","Minst först"], horizontal=True)
-    ascending = (sort_val == "Minst först")
-    port = port.sort_values(by="Anskaffningsvärde (SEK)", ascending=ascending).reset_index(drop=True)
 
     # Bläddring
     if "port_idx" not in st.session_state:
@@ -685,11 +755,13 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
         if st.button("➡️ Nästa innehav"):
             st.session_state.port_idx = min(len(port)-1, st.session_state.port_idx + 1)
 
-    r = port.iloc[st.session_state.port_idx]
-    st.subheader(f"{r['Bolagsnamn']} ({r['Ticker']})")
-    st.markdown(
-        f"""
+    if len(port) > 0:
+        r = port.iloc[st.session_state.port_idx]
+        st.subheader(f"{r['Bolagsnamn']} ({r['Ticker']})")
+        st.markdown(
+            f"""
 - **Antal aktier:** {int(r['Antal aktier'])}
+- **Bucket:** {r.get('Bucket','')}
 - **GAV (SEK):** {round(r['GAV (SEK)'],2)}
 - **Anskaffningsvärde (SEK):** {round(r['Anskaffningsvärde (SEK)'],2)}
 - **Aktuell kurs:** {round(r['Aktuell kurs'],2)} {r['Valuta']}
@@ -700,12 +772,12 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
 - **Årlig utdelning per aktie:** {round(r['Årlig utdelning'],2)} {r['Valuta']}
 - **Total årlig utdelning (SEK):** {round(r['Total årlig utdelning (SEK)'],2)}
 """
-    )
+        )
 
     # Hela tabellen
     st.dataframe(
         port[[
-            "Ticker","Bolagsnamn","Antal aktier","GAV (SEK)","Anskaffningsvärde (SEK)",
+            "Ticker","Bolagsnamn","Antal aktier","Bucket","GAV (SEK)","Anskaffningsvärde (SEK)",
             "Aktuell kurs","Valuta","Växelkurs","Värde (SEK)",
             "Vinst/Förlust (SEK)","Vinst/Förlust (%)",
             "Årlig utdelning","Total årlig utdelning (SEK)","Andel (%)"

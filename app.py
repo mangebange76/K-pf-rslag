@@ -440,10 +440,14 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
         vis_df = df.sort_values(by=["Bolagsnamn","Ticker"])
 
     namn_map = {f"{r['Bolagsnamn']} ({r['Ticker']})": r['Ticker'] for _, r in vis_df.iterrows()}
-    val_lista = [""] + list(namn_map.keys()]
-    if "edit_index" not in st.session_state: st.session_state.edit_index = 0
+    # FIXAD RAD ↓↓↓
+    val_lista = [""] + list(namn_map.keys())
 
-    valt_label = st.selectbox("Välj bolag (lämna tomt för nytt)", val_lista, index=min(st.session_state.edit_index, len(val_lista)-1))
+    if "edit_index" not in st.session_state:
+        st.session_state.edit_index = 0
+
+    valt_label = st.selectbox("Välj bolag (lämna tomt för nytt)", val_lista,
+                              index=min(st.session_state.edit_index, len(val_lista)-1))
     col_prev, col_pos, col_next = st.columns([1,2,1])
     with col_prev:
         if st.button("⬅️ Föregående"):
@@ -791,7 +795,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     nuv_andel = round((nuv_innehav / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
     ny_andel  = round((ny_total   / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
 
-    # --- NY UTRÄKNING FÖR UTDELNING ---
+    # Utdelning & direktavkastning
     utd_per_aktie = float(rad.get("Årlig utdelning", 0.0))  # i bolagets valuta
     utd_per_aktie_sek = utd_per_aktie * vx                  # omräknad till SEK
     if rad["Aktuell kurs"] > 0:

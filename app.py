@@ -342,7 +342,7 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         if namn:
             out["Bolagsnamn"] = str(namn)
 
-        div_rate = info.get("dividendRate", None)  # årsutdelning/aktie
+        div_rate = info.get("dividendRate", None)  # årsutdelning per aktie (forward)
         if div_rate is not None:
             out["Årlig utdelning"] = float(div_rate)
 
@@ -350,7 +350,7 @@ def hamta_yahoo_fält(ticker: str) -> dict:
         if last_div_val is not None:
             out["Nästa utdelning per aktie"] = float(last_div_val)
 
-        # dividendDate = utbetalningsdatum (ej X-dag)
+        # dividendDate = betalningsdatum för utdelningen (inte X-dag)
         div_pay_ts = info.get("dividendDate", None)
         if div_pay_ts:
             try:
@@ -725,7 +725,6 @@ def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
 
     if len(vis_df) > 0:
         r = vis_df.iloc[st.session_state.analys_idx]
-        st.subheader(f"{r['Bolagsnamn']} ({r['Ticker']})")
         cols = [
             "Ticker","Bolagsnamn","Valuta","Aktuell kurs","Utestående aktier",
             "P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4","P/S-snitt",
@@ -793,15 +792,15 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     )
 
     # =====================
-    # Nästa utdelning / innehav (efter källskatt)
+    # Nästa utdelning / innehav (efter källskatt, i SEK)
     # =====================
     def skatt_factor(valuta: str) -> float:
         v = (valuta or "").upper()
         if v == "NOK":
             return 1.0 - 0.25  # 25% källskatt
-        if v == "USD":
+        if v in ("USD", "CAD"):
             return 1.0 - 0.15  # 15% källskatt
-        return 1.0  # antar 0% annars
+        return 1.0  # antar 0% annars (t.ex. SEK)
 
     port["Källskatt faktor"] = port["Valuta"].apply(skatt_factor)
 
@@ -879,27 +878,23 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
     )
 
     # =====================
-    # Kommande utdelningsdatum-lista
+    # Kommande utdelningsutbetalningar
     # =====================
     st.markdown("### Kommande utdelningsutbetalningar")
 
-    # Gör datum jämförbart
     today_date = datetime.now().date()
 
     tmp = port.copy()
     tmp["UtdDatum"] = pd.to_datetime(tmp["Nästa utdelningsdatum"], errors="coerce").dt.date
 
-    # Filtrera:
-    # - giltigt datum
-    # - datum idag eller i framtiden
-    # - nästa utdelning per aktie > 0 (dvs faktiskt utdelande bolag)
+    # Filtrera till framtida/aktuella betalningsdatum och faktiska utdelningsbolag
     tmp = tmp[
         (tmp["UtdDatum"].notna()) &
         (tmp["UtdDatum"] >= today_date) &
         (tmp["Nästa utdelning per aktie"] > 0)
     ].copy()
 
-    # Räkna vad som betalas nästa gång, efter källskatt, SEK
+    # SEK efter källskatt (vi har redan 'Källskatt faktor' och 'Växelkurs' i port)
     tmp["Förväntad nästa utd (SEK efter källskatt)"] = (
         tmp["Nästa utdelning per aktie"]
         * tmp["Antal aktier"]
@@ -1000,8 +995,7 @@ def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     nuv_andel = round((nuv_innehav / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
     ny_andel  = round((ny_total   / port_värde) * 100.0, 2) if port_värde > 0 else 0.0
 
-    # Utdelning & direktavkastning (baserat på Årlig utdelning)
-    utd_per_aktie = float(rad.get("Årlig utdelning", 0.0))  # i bolagets valuta (årsbas)
+    utd_per_aktie = float(rad.get("Årlig utdelning", 0.0))  # årsutdelning/aktie i bolagets valuta
     utd_per_aktie_sek = utd_per_aktie * vx                  # omräknad till SEK/aktie/år
     if rad["Aktuell kurs"] > 0:
         direktavkastning_pct = (utd_per_aktie / rad["Aktuell kurs"]) * 100.0

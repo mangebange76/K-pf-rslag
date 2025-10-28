@@ -107,7 +107,7 @@ FINAL_COLS = [
     "P/S", "P/S Q1", "P/S Q2", "P/S Q3", "P/S Q4",
     "Omsättning idag", "Omsättning nästa år", "Omsättning om 2 år", "Omsättning om 3 år",
     "Riktkurs idag", "Riktkurs om 1 år", "Riktkurs om 2 år", "Riktkurs om 3 år",
-    "Antal aktier", "Bucket", "GAV (SEK)", "Valuta", "Årlig utdelning", "Aktuell kurs",
+    "Antal aktier", "Bucket", "GAV (SEK)", "Valuta", "Årlig utdelning", "Nästa utdelningsdatum", "Aktuell kurs",
     "CAGR 5 år (%)", "P/S-snitt",
     "Senast manuellt uppdaterad",
     "Fair value",
@@ -122,7 +122,7 @@ NUMERIC_COLS = [
     "Fair value",
 ]
 
-TEXT_COLS = ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Bucket"]
+TEXT_COLS = ["Ticker","Bolagsnamn","Valuta","Senast manuellt uppdaterad","Bucket","Nästa utdelningsdatum"]
 
 def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -308,7 +308,14 @@ def beräkna_cagr_från_finansiella(tkr: yf.Ticker) -> float:
         return 0.0
 
 def hamta_yahoo_fält(ticker: str) -> dict:
-    out = {"Bolagsnamn": "","Aktuell kurs": 0.0,"Valuta": "USD","Årlig utdelning": 0.0,"CAGR 5 år (%)": 0.0}
+    out = {
+        "Bolagsnamn": "",
+        "Aktuell kurs": 0.0,
+        "Valuta": "USD",
+        "Årlig utdelning": 0.0,
+        "Nästa utdelningsdatum": "",
+        "CAGR 5 år (%)": 0.0,
+    }
     try:
         t = yf.Ticker(ticker)
         info = {}
@@ -316,6 +323,7 @@ def hamta_yahoo_fält(ticker: str) -> dict:
             info = t.info or {}
         except Exception:
             info = {}
+
         pris = info.get("regularMarketPrice", None)
         if pris is None:
             h = t.history(period="1d")
@@ -323,16 +331,29 @@ def hamta_yahoo_fält(ticker: str) -> dict:
                 pris = float(h["Close"].iloc[-1])
         if pris is not None:
             out["Aktuell kurs"] = float(pris)
+
         valuta = info.get("currency", None)
         if valuta:
             out["Valuta"] = str(valuta).upper()
+
         namn = info.get("shortName") or info.get("longName") or ""
         if namn:
             out["Bolagsnamn"] = str(namn)
+
         div_rate = info.get("dividendRate", None)
         if div_rate is not None:
             out["Årlig utdelning"] = float(div_rate)
+
+        # Nästa utdelningsdatum (betalningsdatum, ej X-dag)
+        div_pay_ts = info.get("dividendDate", None)
+        if div_pay_ts:
+            try:
+                out["Nästa utdelningsdatum"] = datetime.utcfromtimestamp(div_pay_ts).strftime("%Y-%m-%d")
+            except Exception:
+                out["Nästa utdelningsdatum"] = ""
+
         out["CAGR 5 år (%)"] = beräkna_cagr_från_finansiella(t)
+
     except Exception:
         pass
     return out
@@ -386,19 +407,30 @@ def massuppdatera(df: pd.DataFrame, key_prefix: str, user_rates: dict) -> pd.Dat
             data = hamta_yahoo_fält(tkr)
             failed_fields = []
 
-            if data.get("Bolagsnamn"): df.at[i, "Bolagsnamn"] = data["Bolagsnamn"]
-            else: failed_fields.append("Bolagsnamn")
+            if data.get("Bolagsnamn"):
+                df.at[i, "Bolagsnamn"] = data["Bolagsnamn"]
+            else:
+                failed_fields.append("Bolagsnamn")
 
-            if data.get("Aktuell kurs", 0) > 0: df.at[i, "Aktuell kurs"] = data["Aktuell kurs"]
-            else: failed_fields.append("Aktuell kurs")
+            if data.get("Aktuell kurs", 0) > 0:
+                df.at[i, "Aktuell kurs"] = data["Aktuell kurs"]
+            else:
+                failed_fields.append("Aktuell kurs")
 
-            if data.get("Valuta"): df.at[i, "Valuta"] = data["Valuta"]
-            else: failed_fields.append("Valuta")
+            if data.get("Valuta"):
+                df.at[i, "Valuta"] = data["Valuta"]
+            else:
+                failed_fields.append("Valuta")
 
             if "Årlig utdelning" in data:
                 df.at[i, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
             else:
                 failed_fields.append("Årlig utdelning")
+
+            if "Nästa utdelningsdatum" in data:
+                df.at[i, "Nästa utdelningsdatum"] = data.get("Nästa utdelningsdatum","")
+            else:
+                failed_fields.append("Nästa utdelningsdatum")
 
             if "CAGR 5 år (%)" in data:
                 df.at[i, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
@@ -570,7 +602,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             )
 
             st.markdown("**Uppdateras automatiskt vid spara:**")
-            st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, CAGR 5 år (%)")
+            st.write("- Bolagsnamn, Valuta, Aktuell kurs, Årlig utdelning, Nästa utdelningsdatum, CAGR 5 år (%)")
             st.write("- Omsättning om 2 & 3 år, Riktkurser och P/S-snitt beräknas om")
 
         spar = st.form_submit_button("💾 Spara & hämta från Yahoo")
@@ -630,11 +662,18 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame, user_rates: dict) -> pd.DataFram
             df.loc[df["Ticker"]==new_tkr, "Senast manuellt uppdaterad"] = now_stamp()
 
         data = hamta_yahoo_fält(new_tkr)
-        if data.get("Bolagsnamn"): df.loc[df["Ticker"]==new_tkr, "Bolagsnamn"] = data["Bolagsnamn"]
-        if data.get("Valuta"):     df.loc[df["Ticker"]==new_tkr, "Valuta"] = data["Valuta"]
-        if data.get("Aktuell kurs",0)>0: df.loc[df["Ticker"]==new_tkr, "Aktuell kurs"] = data["Aktuell kurs"]
-        if "Årlig utdelning" in data:    df.loc[df["Ticker"]==new_tkr, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
-        if "CAGR 5 år (%)" in data:      df.loc[df["Ticker"]==new_tkr, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
+        if data.get("Bolagsnamn"):
+            df.loc[df["Ticker"]==new_tkr, "Bolagsnamn"] = data["Bolagsnamn"]
+        if data.get("Valuta"):
+            df.loc[df["Ticker"]==new_tkr, "Valuta"] = data["Valuta"]
+        if data.get("Aktuell kurs",0)>0:
+            df.loc[df["Ticker"]==new_tkr, "Aktuell kurs"] = data["Aktuell kurs"]
+        if "Årlig utdelning" in data:
+            df.loc[df["Ticker"]==new_tkr, "Årlig utdelning"] = float(data.get("Årlig utdelning") or 0.0)
+        if "Nästa utdelningsdatum" in data:
+            df.loc[df["Ticker"]==new_tkr, "Nästa utdelningsdatum"] = data.get("Nästa utdelningsdatum","")
+        if "CAGR 5 år (%)" in data:
+            df.loc[df["Ticker"]==new_tkr, "CAGR 5 år (%)"] = float(data.get("CAGR 5 år (%)") or 0.0)
 
         df = uppdatera_berakningar(df, user_rates)
         spara_data(df)
@@ -675,7 +714,7 @@ def analysvy(df: pd.DataFrame, user_rates: dict) -> None:
         cols = ["Ticker","Bolagsnamn","Valuta","Aktuell kurs","Utestående aktier","P/S","P/S Q1","P/S Q2","P/S Q3","P/S Q4",
                 "P/S-snitt","Omsättning idag","Omsättning nästa år","Omsättning om 2 år","Omsättning om 3 år",
                 "Riktkurs idag","Riktkurs om 1 år","Riktkurs om 2 år","Riktkurs om 3 år",
-                "CAGR 5 år (%)","Antal aktier","GAV (SEK)","Årlig utdelning","Senast manuellt uppdaterad","Bucket"]
+                "CAGR 5 år (%)","Antal aktier","GAV (SEK)","Årlig utdelning","Senast manuellt uppdaterad","Bucket","Nästa utdelningsdatum"]
         st.dataframe(pd.DataFrame([r[cols].to_dict()]), use_container_width=True)
 
     st.markdown("### Hela databasen")
@@ -703,7 +742,7 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
         0.0
     )
 
-    # Andelar och utdelning
+    # Utdelning (SEK totalt per innehav)
     port["Total årlig utdelning (SEK)"] = port["Antal aktier"] * port["Årlig utdelning"] * port["Växelkurs"]
 
     # Bucketfilter
@@ -771,19 +810,28 @@ def visa_portfolj(df: pd.DataFrame, user_rates: dict) -> None:
 - **Andel av portfölj:** {r['Andel (%)']} %
 - **Årlig utdelning per aktie:** {round(r['Årlig utdelning'],2)} {r['Valuta']}
 - **Total årlig utdelning (SEK):** {round(r['Total årlig utdelning (SEK)'],2)}
+- **Nästa utdelningsdatum:** {r.get('Nästa utdelningsdatum','')}
 """
         )
 
-    # Hela tabellen
+    # Hela tabellen (nuvarande vy)
     st.dataframe(
         port[[
             "Ticker","Bolagsnamn","Antal aktier","Bucket","GAV (SEK)","Anskaffningsvärde (SEK)",
             "Aktuell kurs","Valuta","Växelkurs","Värde (SEK)",
             "Vinst/Förlust (SEK)","Vinst/Förlust (%)",
-            "Årlig utdelning","Total årlig utdelning (SEK)","Andel (%)"
+            "Årlig utdelning","Total årlig utdelning (SEK)","Andel (%)","Nästa utdelningsdatum"
         ]],
         use_container_width=True
     )
+
+    # Lista över kommande utdelningsdatum längst ner
+    st.markdown("### Kommande utdelningsdatum")
+    utd_tab = port[["Bolagsnamn","Ticker","Nästa utdelningsdatum"]].copy()
+    utd_tab = utd_tab[utd_tab["Nästa utdelningsdatum"].astype(str).str.strip() != ""]
+    if not utd_tab.empty:
+        utd_tab = utd_tab.sort_values(by="Nästa utdelningsdatum", ascending=True)
+    st.dataframe(utd_tab.reset_index(drop=True), use_container_width=True)
 
 def visa_investeringsforslag(df: pd.DataFrame, user_rates: dict) -> None:
     st.header("💡 Investeringsförslag")
